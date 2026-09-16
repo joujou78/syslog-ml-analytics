@@ -1,0 +1,88 @@
+{
+  "title": "Syslog ML Overview",
+  "uid": "syslog-ml-overview",
+  "schemaVersion": 39,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Log volume by severity",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "format": 1,
+          "rawSql": "SELECT minute AS time, severity, sum(event_count) AS value FROM syslog_ml.events_by_minute WHERE minute BETWEEN $__fromTime AND $__toTime GROUP BY minute, severity ORDER BY minute"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Log volume by predicted category",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "format": 1,
+          "rawSql": "SELECT minute AS time, predicted_category, sum(event_count) AS value FROM syslog_ml.events_by_minute WHERE minute BETWEEN $__fromTime AND $__toTime GROUP BY minute, predicted_category ORDER BY minute"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Anomalies (last 15m)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "format": 0,
+          "rawSql": "SELECT sum(anomaly_count) AS anomalies FROM syslog_ml.events_by_minute WHERE minute >= now() - INTERVAL 15 MINUTE"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Device identity resolution (last 1h)",
+      "type": "piechart",
+      "description": "Share of events resolving to a verified hostname (snmp) vs. a self-reported one (syslog_reported) vs. source IP only (unresolved). The unresolved/syslog_reported slices are your onboarding backlog for snmp_credentials.csv.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
+      "datasource": { "type": "grafana-clickhouse-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "format": 0,
+          "rawSql": "SELECT resolution_method, count() AS events FROM syslog_ml.events WHERE event_time >= now() - INTERVAL 1 HOUR GROUP BY resolution_method"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Top hosts by error+ volume (last 1h)",
+      "type": "table",
+      "gridPos": { "h": 10, "w": 18, "x": 0, "y": 16 },
+      "datasource": { "type": "grafana-clickhouse-datasource" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "format": 0,
+          "rawSql": "SELECT hostname, vendor, resolution_method, predicted_category, count() AS events FROM syslog_ml.events WHERE event_time >= now() - INTERVAL 1 HOUR AND severity IN ('err','crit','alert','emerg') GROUP BY hostname, vendor, resolution_method, predicted_category ORDER BY events DESC LIMIT 25"
+        }
+      ]
+    }
+  ]
+}

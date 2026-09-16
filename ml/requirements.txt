@@ -1,0 +1,7 @@
+clickhouse-connect==0.7.19
+drain3==0.9.11
+scikit-learn==1.5.1
+joblib==1.4.2
+numpy==1.26.4
+psycopg2-binary==2.9.9
+cryptography==43.0.1

@@ -1,0 +1,22 @@
+[Unit]
+Description=Syslog ML Analytics web API (FastAPI via gunicorn/uvicorn workers)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=syslog-ml
+Group=syslog-ml
+WorkingDirectory=/opt/syslog-ml/web/backend
+ExecStart=/opt/syslog-ml/web/backend/.venv/bin/gunicorn app.main:app \
+  --workers 4 \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --bind 127.0.0.1:8000 \
+  --access-logfile - \
+  --error-logfile -
+EnvironmentFile=/etc/syslog-ml/web-api.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
