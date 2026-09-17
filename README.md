@@ -71,7 +71,7 @@ sudo groupadd --system syslog-ml
 sudo useradd --system --gid syslog-ml --home /opt/syslog-ml --shell /usr/sbin/nologin syslog-ml
 
 sudo mkdir -p /opt/syslog-ml /etc/syslog-ml /var/lib/syslog-ml
-sudo mkdir -p -m 2750 /var/log/syslog-ml   # setgid so files rsyslog creates inherit this group
+sudo mkdir -p -m 2770 /var/log/syslog-ml   # setgid + group-write, so rsyslog (in the syslog-ml group) can create files here
 sudo chown syslog-ml:syslog-ml /var/lib/syslog-ml
 sudo chown root:syslog-ml /var/log/syslog-ml /etc/syslog-ml
 ```
