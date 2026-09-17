@@ -189,6 +189,17 @@ pipeline (ingestion, classification) works fine without it.
 
 ## Step 5 — wire up rsyslog and the systemd services
 
+On Debian/Ubuntu, rsyslog normally runs as the `syslog` user (group
+`syslog`), not root -- it needs to actually be a member of the
+`syslog-ml` group to write into the setgid directory Step 1 created, or
+its `omfile` action fails silently into a suspend/retry loop (`journalctl
+-u rsyslog` would show `open error: Permission denied` on `raw.jsonl` if
+you skip this):
+
+```bash
+sudo usermod -aG syslog-ml syslog
+```
+
 ```bash
 sudo cp rsyslog/60-syslog-ml.conf /etc/rsyslog.d/
 sudo systemctl restart rsyslog
