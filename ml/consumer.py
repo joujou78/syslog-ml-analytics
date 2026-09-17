@@ -120,8 +120,11 @@ def load_classifier():
 
 
 def build_template_miner():
+    # TemplateMinerConfig()'s defaults are already sensible on their own;
+    # .load(path) is only for overriding from an actual INI file, and
+    # (unlike what its docstring might suggest) does not accept None --
+    # configparser.read(None) raises, so just skip calling it entirely.
     config = TemplateMinerConfig()
-    config.load(None)
     config.profiling_enabled = False
     return TemplateMiner(config=config)
 
