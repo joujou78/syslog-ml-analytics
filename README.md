@@ -78,16 +78,9 @@ sudo chown root:syslog-ml /var/log/syslog-ml /etc/syslog-ml
 
 ## Step 2 — install ClickHouse (official repo)
 
-> **I could not re-verify these exact commands before you run them.**
-> `packages.clickhouse.com` and `clickhouse.com` are both blocked by this
-> session's network sandbox, so I'm relying on training data, not a live
-> check. The GPG key line below points at a `/rpm/...` path even though
-> it's used for the `.deb` repo — that matches a documented ClickHouse
-> quirk (they reuse one key file for both), not a typo, but I can't
-> confirm it's still accurate today. **If `apt-get update` fails on the
-> clickhouse.list repo** (signature error, 404), that's your signal to
-> check ClickHouse's current install docs and paste me the corrected
-> command — I'll fix this file.
+The repo/key setup below is confirmed working (verified live during initial
+setup — the `/rpm/...` key path really is correct for the `.deb` repo too,
+a documented ClickHouse quirk, not a typo):
 
 ```bash
 sudo apt-get update
@@ -95,13 +88,54 @@ sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
 curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
 sudo apt-get update
+```
+
+**CPU compatibility warning:** the latest ClickHouse (26.x at time of
+writing) crashes with `Illegal instruction (core dumped)` on VMs whose
+CPU lacks `avx2` — common on hypervisors that expose a conservative
+"compatibility" CPU model for live-migration support, even on genuinely
+modern hardware. Check first:
+
+```bash
+grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(sse4_2|ssse3|avx|avx2)$'
+```
+
+If `avx2` is missing, install a pinned older version instead of latest
+(23.8.16.40 is confirmed working on such a VM — pin all three packages
+together or apt will pull `clickhouse-common-static` at the newer,
+incompatible version):
+
+```bash
+sudo apt-get install -y clickhouse-server=23.8.16.40 clickhouse-client=23.8.16.40 clickhouse-common-static=23.8.16.40
+```
+
+If `avx2` **is** present, just install normally:
+```bash
 sudo apt-get install -y clickhouse-server clickhouse-client
+```
+
+Either way:
+```bash
 sudo systemctl enable --now clickhouse-server
 ```
 
-Apply the schema:
+During install you'll be prompted to set a password for the `default`
+user. This project's scripts default to **no password** (simplest for a
+single VM where ClickHouse only listens on localhost) — if you don't want
+to manage a password, reset it to empty instead of typing one:
+```bash
+sudo rm -f /etc/clickhouse-server/users.d/default-password.xml
+sudo systemctl restart clickhouse-server
+clickhouse-client --query "SELECT 1"   # should print 1, no password needed
+```
+If you'd rather keep a real password, that's supported too — see
+`systemd/clickhouse.env.example` and `web/systemd/web-api.env.example`
+for where to set `CLICKHOUSE_PASSWORD` / `SYSLOG_ML_CLICKHOUSE_PASSWORD`.
+
+Apply the schema (run from inside the repo directory):
 
 ```bash
+cd ~/syslog-ml-analytics   # wherever you cloned it -- this must be your cwd
 sudo cp clickhouse/init.sql /tmp/init.sql
 clickhouse-client --multiquery < /tmp/init.sql
 clickhouse-client --query "SHOW TABLES FROM syslog_ml"

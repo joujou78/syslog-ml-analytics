@@ -38,6 +38,8 @@ OFFSET_FILE = os.environ.get("SYSLOG_ML_OFFSET_FILE", "/var/lib/syslog-ml/consum
 STATE_DB_PATH = os.environ.get("STATE_DB", "/var/lib/syslog-ml/state.db")
 CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "localhost")
 CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
 MODEL_PATH = os.environ.get("MODEL_PATH", "/var/lib/syslog-ml/classifier.joblib")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500"))
 BATCH_FLUSH_SECONDS = float(os.environ.get("BATCH_FLUSH_SECONDS", "2"))
@@ -238,7 +240,9 @@ def main():
     state_conn = state_db.connect(STATE_DB_PATH)
     seen_unresolved = set()
 
-    ch_client = clickhouse_connect.get_client(host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT)
+    ch_client = clickhouse_connect.get_client(
+        host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT, username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD
+    )
     inventory = InventoryCache(ch_client)
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)

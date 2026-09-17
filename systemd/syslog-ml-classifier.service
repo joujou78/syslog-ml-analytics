@@ -9,6 +9,7 @@ User=syslog-ml
 Group=syslog-ml
 WorkingDirectory=/opt/syslog-ml/ml
 ExecStart=/opt/syslog-ml/venv/bin/python consumer.py
+EnvironmentFile=-/etc/syslog-ml/clickhouse.env
 Environment=SYSLOG_ML_LOG_FILE=/var/log/syslog-ml/raw.jsonl
 Environment=SYSLOG_ML_OFFSET_FILE=/var/lib/syslog-ml/consumer.offset
 Environment=STATE_DB=/var/lib/syslog-ml/state.db

@@ -9,6 +9,7 @@ Group=syslog-ml
 WorkingDirectory=/opt/syslog-ml/ml
 ExecStart=/opt/syslog-ml/venv/bin/python resolve_pending.py
 EnvironmentFile=/etc/syslog-ml/resolver.env
+EnvironmentFile=-/etc/syslog-ml/clickhouse.env
 Environment=STATE_DB=/var/lib/syslog-ml/state.db
 Environment=CLICKHOUSE_HOST=localhost
 Environment=CLICKHOUSE_PORT=8123

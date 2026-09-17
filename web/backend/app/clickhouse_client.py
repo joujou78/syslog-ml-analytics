@@ -10,6 +10,9 @@ def get_clickhouse_client() -> Client:
     global _client
     if _client is None:
         _client = clickhouse_connect.get_client(
-            host=settings.clickhouse_host, port=settings.clickhouse_port
+            host=settings.clickhouse_host,
+            port=settings.clickhouse_port,
+            username=settings.clickhouse_user,
+            password=settings.clickhouse_password,
         )
     return _client

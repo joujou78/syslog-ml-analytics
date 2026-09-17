@@ -29,6 +29,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 CREDENTIAL_ENCRYPTION_KEY = os.environ["CREDENTIAL_ENCRYPTION_KEY"]
 CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "localhost")
 CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
 
 MAX_ATTEMPTS_BEFORE_BACKOFF = 5
 NO_CREDENTIAL_RETRY_HOURS = 24
@@ -68,7 +70,9 @@ def main():
     credentials = load_credentials(DATABASE_URL, CREDENTIAL_ENCRYPTION_KEY)
     log.info("Loaded %d SNMP credential entries from the credentials database", len(credentials))
 
-    ch_client = clickhouse_connect.get_client(host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT)
+    ch_client = clickhouse_connect.get_client(
+        host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT, username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD
+    )
 
     due_rows = fetch_due_rows(conn)
     log.info("%d IP(s) due for a resolution attempt", len(due_rows))
