@@ -286,16 +286,64 @@ everything else.
 ```bash
 sudo apt-get install -y snmptrapd
 sudo cp snmptrapd/snmptrapd.conf.example /etc/snmp/snmptrapd.conf
-sudo $EDITOR /etc/snmp/snmptrapd.conf   # add a line per community your devices actually use -- never a permissive catch-all
+sudo nano /etc/snmp/snmptrapd.conf   # add a line per community your devices actually use -- never a permissive catch-all; $EDITOR is unlikely to be set
 sudo ufw allow 162/udp
 ```
 
-Then make it log via syslog instead of its own log file -- see
-`snmptrapd/snmptrapd-override.conf.example` for the systemd override
-(`sudo systemctl edit snmptrapd`, paste its contents, then
-`daemon-reload` + `restart snmptrapd`). That file also explains why I
-couldn't verify the package's exact default startup options from this
-session.
+On Ubuntu 22.04, `snmptrapd` is **socket-activated** (`snmptrapd.socket`
+triggers `snmptrapd.service` on demand) and runs as an unprivileged
+`Debian-snmp` user, not root. Two things confirmed only by actually
+running this on a real VM, neither obvious from the package alone:
+
+**1. A directory ownership bug in the Ubuntu package itself.**
+`/var/lib/snmp/cert_indexes` (used for TLS transport support, unrelated
+to plain v1/v2c traps) gets created owned by `root:root` with `700`
+permissions, while everything else in `/var/lib/snmp/` correctly belongs
+to `Debian-snmp`. `snmptrapd` still touches this path at startup even
+without TLS, so it fails immediately with a bare `fopen: Permission
+denied` (no filename in the message) until this is fixed:
+
+```bash
+sudo chown -R Debian-snmp:Debian-snmp /var/lib/snmp/cert_indexes
+```
+
+**2. Making it log via syslog** needs a systemd override that changes
+*only* the logging flag, keeping everything else identical to the
+package's own `ExecStart` (check yours with `systemctl cat snmptrapd`
+first -- don't assume it matches):
+
+```bash
+sudo mkdir -p /etc/systemd/system/snmptrapd.service.d
+sudo tee /etc/systemd/system/snmptrapd.service.d/override.conf > /dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/snmptrapd -Lsd -f udp:162 udp6:162
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart snmptrapd.socket
+```
+
+Do **not** add a `-p <pidfile>` flag to that `ExecStart` -- the packaged
+unit uses `Type=notify` with no `PIDFile=`, and `Debian-snmp` can't write
+one to `/run/` anyway; adding one reproduces the same bare permission
+error as the `cert_indexes` issue and is easy to misdiagnose as the same
+bug.
+
+**Checkpoint:**
+
+```bash
+sudo systemctl status snmptrapd.service --no-pager   # expect: active (running)
+snmptrap -v2c -c public localhost '' 1.3.6.1.4.1.8072.2.3.0.1
+sleep 2
+sudo tail -3 /var/log/syslog-ml/raw.jsonl             # expect a line with program "snmptrapd"
+clickhouse-client --query "SELECT count() FROM syslog_ml.events WHERE program LIKE '%snmptrapd%'"
+```
+
+If `systemctl start snmptrapd.socket` ever fails with `Address already
+in use` after an earlier failed attempt, check for a leftover manual
+test process still holding port 162 (`ps aux | grep snmptrapd`) before
+assuming it's the same bug again -- `kill %1` on a backgrounded job
+doesn't reliably work across separate pasted command blocks.
 
 **Same identity caveat applies, worse:** `snmptrapd` re-emits traps via
 the *local* syslog socket, so `fromhost-ip` for every trap-derived event
