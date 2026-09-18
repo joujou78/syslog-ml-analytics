@@ -200,6 +200,23 @@ you skip this):
 sudo usermod -aG syslog-ml syslog
 ```
 
+**If this VM needs to actually receive syslog from the network** (rather
+than only mirroring its own local logs), rsyslog also needs a listener --
+by default it only processes messages generated on the box itself:
+
+```bash
+sudo cp rsyslog/10-network-listener.conf /etc/rsyslog.d/
+```
+
+Then open the port(s) in whatever firewall(s) sit in front of this VM --
+both the OS firewall and, if the VM is hosted rather than on hardware you
+control, any security-group/network-ACL layer above the OS:
+
+```bash
+sudo ufw allow 514/udp
+sudo ufw allow 514/tcp
+```
+
 ```bash
 sudo cp rsyslog/60-syslog-ml.conf /etc/rsyslog.d/
 sudo systemctl restart rsyslog
@@ -227,6 +244,67 @@ sudo journalctl -u syslog-ml-classifier -f              # confirm it's processin
 clickhouse-client --query "SELECT count() FROM syslog_ml.events"
 ```
 
+### If syslog arrives relayed through another server, not directly from devices
+
+If devices send to an existing collector (e.g. the LogAnalyzer setup)
+which then forwards a copy to this VM, rather than devices sending here
+directly, **device identity resolution does not work out of the box** --
+this is a real limitation, not a bug to file:
+
+- `source_ip`/`fromhost-ip` will be the **relay's** IP for every event,
+  not the originating device's -- the network-layer signal our design
+  relies on collapses to one value.
+- If the relay doesn't preserve each device's original hostname in the
+  forwarded message either, there's no usable in-message signal to fall
+  back on.
+- The SNMP resolver polls by IP, so it ends up polling the relay itself,
+  not the actual devices.
+
+Every event in this setup will show `resolution_method = 'unresolved'`
+with the relay's IP as `hostname` -- correct given what the pipeline can
+actually observe, but not useful for per-device analytics. Real fixes,
+in order of how much they preserve of the original design:
+
+1. **Point devices at this VM directly** (in addition to or instead of
+   the existing collector) -- restores the original network-layer signal
+   this design assumes.
+2. **Reconfigure the relay to preserve/inject per-device identity** --
+   e.g. have it forward using RFC 5424 with structured data carrying the
+   original source IP, if your relay's syslog daemon supports that.
+3. **Build a static hostname/IP inventory** you maintain yourself, and
+   adjust `device_resolver.py` to consult it -- more manual upkeep, but
+   works with the relay topology as-is.
+
+### Optional: receive SNMP traps too (separate from syslog)
+
+SNMP traps are a different protocol (default UDP 162, not 514) and need
+their own receiver (`snmptrapd`, from net-snmp) -- rsyslog can't receive
+them directly. The simplest integration: point `snmptrapd` at the local
+syslog socket, so traps flow into the same `raw.jsonl` pipeline as
+everything else.
+
+```bash
+sudo apt-get install -y snmptrapd
+sudo cp snmptrapd/snmptrapd.conf.example /etc/snmp/snmptrapd.conf
+sudo $EDITOR /etc/snmp/snmptrapd.conf   # add a line per community your devices actually use -- never a permissive catch-all
+sudo ufw allow 162/udp
+```
+
+Then make it log via syslog instead of its own log file -- see
+`snmptrapd/snmptrapd-override.conf.example` for the systemd override
+(`sudo systemctl edit snmptrapd`, paste its contents, then
+`daemon-reload` + `restart snmptrapd`). That file also explains why I
+couldn't verify the package's exact default startup options from this
+session.
+
+**Same identity caveat applies, worse:** `snmptrapd` re-emits traps via
+the *local* syslog socket, so `fromhost-ip` for every trap-derived event
+will be `127.0.0.1`/this VM, regardless of relay topology. The originating
+device's address is only present as text inside the trap's rendered
+message body (snmptrapd's default format includes it), not in a
+structured field -- something a future improvement could parse out, not
+built yet.
+
 ## Step 6 — train the real classifier (after a few hours/days of traffic)
 
 ```bash
@@ -243,7 +321,9 @@ prefers a real `category` field over the weak-supervision guess.
 ## Files
 
 - `clickhouse/init.sql` — `device_inventory`, `events`, and the per-minute rollup.
+- `rsyslog/10-network-listener.conf` — enables rsyslog to receive syslog over the network (UDP/TCP 514), not just local messages.
 - `rsyslog/60-syslog-ml.conf` — mirrors rsyslog's feed to a local JSON file.
+- `snmptrapd/` — optional SNMP trap receiver config, feeding traps into the same pipeline via local syslog.
 - `ml/consumer.py` — tails the file, resolves identity, classifies, writes to ClickHouse.
 - `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver (reads credentials from Postgres, see `web/`).
 - `ml/labeling_rules.py` — weak-supervision category rules (tune for your vendors).

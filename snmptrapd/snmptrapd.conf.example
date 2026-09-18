@@ -1,0 +1,23 @@
+# net-snmp's snmptrapd config. Copy to /etc/snmp/snmptrapd.conf.
+#
+# By default snmptrapd DROPS every trap unless a matching authCommunity
+# (v1/v2c) or matching v3 user is configured -- same "never guess a
+# credential" principle as the SNMP poller: add a line per community your
+# devices actually send traps with, don't add a permissive catch-all.
+#
+# "log" writes the trap to snmptrapd's own log; "execute" additionally
+# lets exec/traphandle directives below fire for it. We use "log" only --
+# the trap gets logged via syslog (see /etc/default/snmptrapd or the
+# systemd unit's ExecStart, which adds -Lsd) and rsyslog picks it up from
+# there like anything else, flowing into raw.jsonl the same as normal
+# syslog does.
+
+# authCommunity log,execute <community>
+authCommunity log public
+
+# One line per additional community your devices use:
+# authCommunity log another-community-here
+
+# SNMPv3 traps (if any devices send these instead of v1/v2c):
+# createUser <username> <authProto> <authPass> <privProto> <privPass>
+# authUser log <username>

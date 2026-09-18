@@ -1,0 +1,21 @@
+# systemd override for the packaged snmptrapd.service, so traps get
+# logged via syslog (-Lsd) instead of snmptrapd's default log file --
+# that's what makes them show up in /var/log/syslog-ml/raw.jsonl.
+#
+# Usage:
+#   sudo systemctl edit snmptrapd
+# paste this into the editor that opens (it creates a drop-in, doesn't
+# touch the package's own unit file), then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart snmptrapd
+#
+# I could not verify this package's exact default ExecStart/options from
+# this session (no live access to check net-snmp's current Ubuntu 22.04
+# packaging) -- run `systemctl cat snmptrapd` first and compare; if its
+# ExecStart already looks substantially different from a plain
+# `snmptrapd` invocation, adjust the [Service] block below to match
+# rather than assuming this override is a clean fit.
+
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/snmptrapd -f -Lsd -p /run/snmptrapd.pid
