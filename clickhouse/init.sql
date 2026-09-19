@@ -37,7 +37,18 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
     predicted_category  LowCardinality(String),
     predicted_confidence Float32,
     is_anomaly          UInt8 DEFAULT 0,
-    raw                 String
+    raw                 String,
+
+    -- Secondary (skip) indexes: `events` is a *columnar* store ordered by
+    -- (event_time, hostname, severity), so a query that filters on other
+    -- columns without a time range -- e.g. the planned log-search UI
+    -- filtering by program or free-text keyword -- would otherwise have to
+    -- scan every granule. These let ClickHouse skip granules that can't
+    -- match, without a second database or a separate search engine.
+    INDEX idx_message message TYPE tokenbf_v1(4096, 3, 0) GRANULARITY 4,
+    INDEX idx_program program TYPE set(0) GRANULARITY 4,
+    INDEX idx_category predicted_category TYPE set(0) GRANULARITY 4,
+    INDEX idx_source_ip source_ip TYPE bloom_filter() GRANULARITY 4
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(event_time)

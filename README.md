@@ -64,6 +64,34 @@ service to operate.
   refresh, etc.) are reasonable starting points, not measured against your
   actual traffic — watch resource usage and adjust.
 
+### Why ClickHouse, and not a separate time-series database
+
+`raw.jsonl` is a transient hand-off file between rsyslog and the
+classifier; it's never queried, so it isn't what needs to scale. The data
+that actually needs fast writes and fast search is `syslog_ml.events`, and
+that's already in ClickHouse: a column-oriented, time-partitioned database
+built for exactly this kind of workload (it's the engine behind large-scale
+log pipelines such as Cloudflare's and Uber's, at far higher volume than
+one VM will see). `events` is already partitioned by day (`PARTITION BY
+toYYYYMMDD(event_time)`), has a 90-day TTL, has an `events_by_minute`
+rollup for fast dashboards, and now has skip indexes on `message`,
+`program`, `predicted_category`, and `source_ip` (see
+`clickhouse/init.sql` and `clickhouse/migrations/001_search_indexes.sql`)
+to keep the upcoming log-search feature fast.
+
+A dedicated time-series database (TimescaleDB, InfluxDB, VictoriaMetrics)
+was not introduced, because those are built for narrow
+timestamp-plus-numeric-value data (CPU%, request latency), not rows that
+mix free-text `message`, categorical fields, and keyword search, which is
+what log events are. I cannot point to a benchmark comparing this exact
+workload across all three run on this VM's hardware, so this is an
+architectural judgment, not a measured result: flag it if you want it
+verified before relying on it further. One caveat that is a fact rather
+than a judgment call: this VM runs a single ClickHouse node with no
+replication or sharding. If ingest volume ever outgrows one machine,
+ClickHouse's own clustering (distributed tables, sharding) is the scale-out
+path, not a rewrite to a different database.
+
 ## Step 1 — create the service account and directories
 
 ```bash
