@@ -92,7 +92,13 @@ class Credential:
                 "-a", self.v3_auth_proto, "-A", self.v3_auth_pass,
                 "-x", self.v3_priv_proto, "-X", self.v3_priv_pass,
             ]
-        return ["-v", self.version, "-c", self.community]
+        # net-snmp's -v flag takes exactly "1", "2c", or "3" -- not "v1"/
+        # "v2c" as stored in the DB/UI (confirmed against a real local
+        # snmpd: "-v v2c" fails with "Invalid version specified after -v
+        # flag: v2c", exit 1, indistinguishable from a wrong community in
+        # the logs -- this silently broke every v1/v2c resolution attempt
+        # since the resolver was first written).
+        return ["-v", self.version.lstrip("v"), "-c", self.community]
 
 
 def load_credentials(database_url, encryption_key):

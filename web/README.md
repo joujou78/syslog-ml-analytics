@@ -227,13 +227,22 @@ then log in with the admin account from Step 2.
   relying on it.
 - The credential pool's bulk import, the fast-path/discovery/auto-save
   logic in `device_resolver.py`, and the upsert-on-rotation behavior in
-  `save_discovered_credential()` were all verified end to end against a
-  real local Postgres, with SNMP itself mocked (no real network devices
-  reachable from this sandbox) to simulate a pool where only one of
-  several candidates responds. The actual `snmpget` calls against your
-  real devices are unverified until you run this against them — if
-  resolution behaves unexpectedly, check `journalctl -u syslog-ml-resolver`
-  for which credential(s) were tried.
+  `save_discovered_credential()` were verified end to end against a real
+  local Postgres and, since finding and fixing a real bug during initial
+  net-flow testing (below), a real local `snmpd` agent too — not against
+  your specific real devices' network paths/firmware, so if resolution
+  behaves unexpectedly, check `journalctl -u syslog-ml-resolver` for which
+  credential(s) were tried.
+- **A real bug, found and fixed during initial deployment**: `snmpget_args()`
+  was passing `-v v2c`/`-v v1` to the `snmpget` CLI (matching how the
+  version is stored in the database), but net-snmp's `-v` flag only
+  accepts `1`/`2c`/`3` without the `v` prefix — `-v v2c` fails immediately
+  with "Invalid version specified", indistinguishable in the logs from a
+  wrong community. This silently broke every v1/v2c SNMP resolution
+  attempt since the resolver was first written, not something introduced
+  by the credential-pool work — it just took a real multi-candidate pool
+  test against a real device to surface clearly. Confirmed against a real
+  local `snmpd`: `-v v2c` fails with exit code 1, `-v 2c` succeeds.
 - Password reset / account recovery isn't built — the only way to regain
   access if the sole admin's password is lost is `scripts/create_admin.py`
   won't help (it refuses existing usernames) or a manual DB update.
