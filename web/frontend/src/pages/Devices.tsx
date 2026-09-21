@@ -64,7 +64,15 @@ export function Devices() {
             <tr key={d.ip}>
               <td>{d.hostname}</td>
               <td className="mono">{d.ip}</td>
-              <td>{d.vendor}</td>
+              <td>
+                {d.vendor}
+                {d.vendor_source === 'passive' && (
+                  <span className="vendor-hint" title="Guessed from the syslog message format, not SNMP-verified">
+                    {' '}
+                    (pattern-detected)
+                  </span>
+                )}
+              </td>
               <td>
                 <ResolutionBadge method={d.resolution_method} />
               </td>

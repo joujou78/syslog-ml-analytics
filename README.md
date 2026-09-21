@@ -317,6 +317,29 @@ POST). There's no email delivery in this version — a webhook was the
 simplest channel to build and test without requiring SMTP credentials;
 point it at a service that turns webhooks into email/SMS if you need that.
 
+### Passive vendor detection (no SNMP credential needed)
+
+Real vendor identification uses SNMP (`sysObjectID`), which -- like
+hostname resolution -- only runs for an IP that has a credential in
+`snmp_credentials`. For everything else, `ml/vendor_signatures.py` makes a
+best-effort guess at vendor from the syslog message's own format: Cisco's
+`%FACILITY-SEVERITY-MNEMONIC:` convention, Junos's `junos@2636.` structured
+data, FortiOS's `devname=`/`logid=` key-value style, Palo Alto's CSV
+`TRAFFIC`/`THREAT`/... header, RouterOS's `topic,severity` prefix. This
+runs automatically in the classifier for every event that doesn't already
+have an SNMP-verified identity -- no configuration needed.
+
+**This is a format guess, not identity verification**, and every event
+carries `vendor_source` (`snmp` | `passive` | `unknown`) so the Devices
+page can show the difference (a "(pattern-detected)" hint next to the
+vendor name) rather than presenting a guess as fact. Two honest limits:
+a device configured to log in a non-default format won't match anything,
+and Arista/HP/Dell often deliberately mimic Cisco's exact format for CLI
+compatibility, so that pattern lands in a `cisco_like` bucket rather than
+claiming a specific one of those four. Add an SNMP credential for a device
+whenever you want its vendor (and hostname) actually confirmed rather than
+guessed.
+
 ### If syslog arrives relayed through another server, not directly from devices
 
 If devices send to an existing collector (e.g. the LogAnalyzer setup)
@@ -447,8 +470,10 @@ prefers a real `category` field over the weak-supervision guess.
 - `snmptrapd/` — optional SNMP trap receiver config, feeding traps into the same pipeline via local syslog.
 - `ml/consumer.py` — tails the file, resolves identity, classifies, writes to ClickHouse.
 - `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver (reads credentials from Postgres, see `web/`).
+- `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.
 - `ml/labeling_rules.py` — weak-supervision category rules (tune for your vendors).
 - `ml/train_classifier.py` — trains the TF-IDF + linear SVM classifier.
-- `systemd/` — unit files for the classifier and the resolver timer.
+- `ml/evaluate_alerts.py` — evaluates alert rules against ClickHouse, fires webhooks.
+- `systemd/` — unit files for the classifier, resolver timer, and alert evaluator timer.
 - `grafana/` — provisioned datasource + starter dashboard.
 - `web/` — FastAPI + React admin app for managing SNMP credentials and viewing device status (see `web/README.md`).

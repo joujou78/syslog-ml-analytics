@@ -35,11 +35,13 @@ export interface CredentialInput {
 }
 
 export type ResolutionMethod = 'snmp' | 'syslog_reported' | 'unresolved'
+export type VendorSource = 'snmp' | 'passive' | 'unknown'
 
 export interface Device {
   ip: string
   hostname: string
   vendor: string
+  vendor_source: VendorSource
   model: string
   resolution_method: ResolutionMethod
   first_seen_in_window: string

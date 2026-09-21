@@ -11,6 +11,7 @@ class DeviceRead(BaseModel):
     ip: str
     hostname: str
     vendor: str
+    vendor_source: str
     model: str
     resolution_method: str
     first_seen_in_window: datetime

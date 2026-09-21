@@ -30,6 +30,7 @@ from drain3.template_miner_config import TemplateMinerConfig
 
 import state_db
 from labeling_rules import weak_label, severity_rank
+from vendor_signatures import detect_vendor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("consumer")
@@ -56,7 +57,7 @@ DRAIN3_SNAPSHOT_INTERVAL_MINUTES = float(os.environ.get("DRAIN3_SNAPSHOT_INTERVA
 ANOMALY_RARE_THRESHOLD = int(os.environ.get("ANOMALY_RARE_THRESHOLD", "5"))
 
 INSERT_COLUMNS = [
-    "event_time", "source_ip", "hostname", "reported_hostname", "vendor", "model",
+    "event_time", "source_ip", "hostname", "reported_hostname", "vendor", "vendor_source", "model",
     "resolution_method", "facility", "severity", "severity_num", "program", "pid",
     "message", "template_id", "template", "predicted_category", "predicted_confidence",
     "is_anomaly", "raw",
@@ -191,7 +192,7 @@ def resolve_identity(record, inventory, state_conn, seen_unresolved):
     known = inventory.lookup(source_ip)
     if known is not None:
         hostname, vendor, model, resolution_method = known
-        return source_ip, hostname, reported_hostname, vendor, model, resolution_method
+        return source_ip, hostname, reported_hostname, vendor, model, resolution_method, "snmp"
 
     # No SNMP-verified identity yet. Use the device's self-reported hostname
     # as a best-effort fallback if it looks meaningful, otherwise fall back
@@ -207,7 +208,14 @@ def resolve_identity(record, inventory, state_conn, seen_unresolved):
         seen_unresolved.add(source_ip)
         state_db.mark_seen(state_conn, source_ip)
 
-    return source_ip, hostname, reported_hostname, "unknown", "", resolution_method
+    # Vendor is still worth a best-effort passive guess even when hostname
+    # isn't resolved -- see vendor_signatures.py. vendor_source distinguishes
+    # this from an SNMP-verified vendor so nothing downstream treats a
+    # message-format guess as confirmed identity.
+    detected_vendor = detect_vendor(record.get("message", ""))
+    vendor_source = "passive" if detected_vendor != "unknown" else "unknown"
+
+    return source_ip, hostname, reported_hostname, detected_vendor, "", resolution_method, vendor_source
 
 
 def to_row(record, miner, model, inventory, state_conn, seen_unresolved):
@@ -228,14 +236,14 @@ def to_row(record, miner, model, inventory, state_conn, seen_unresolved):
     except (TypeError, ValueError):
         pid = None
 
-    source_ip, hostname, reported_hostname, vendor, dev_model, resolution_method = resolve_identity(
+    source_ip, hostname, reported_hostname, vendor, dev_model, resolution_method, vendor_source = resolve_identity(
         record, inventory, state_conn, seen_unresolved
     )
 
     is_anomaly = 1 if cluster["cluster_size"] <= ANOMALY_RARE_THRESHOLD else 0
 
     return [
-        event_time, source_ip, hostname, reported_hostname, vendor, dev_model, resolution_method,
+        event_time, source_ip, hostname, reported_hostname, vendor, vendor_source, dev_model, resolution_method,
         record.get("facility", "unknown"), severity, severity_rank(severity),
         record.get("program", "unknown"), pid, message,
         str(cluster["cluster_id"]), cluster["template_mined"],

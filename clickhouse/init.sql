@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
     hostname            String,             -- best-known identity: see resolution_method
     reported_hostname   String,             -- raw hostname string the device put in the syslog message, unverified
     vendor              LowCardinality(String) DEFAULT 'unknown',
+    vendor_source       LowCardinality(String) DEFAULT 'unknown', -- 'snmp' (verified) | 'passive' (guessed from message format, see ml/vendor_signatures.py) | 'unknown'
     model               String DEFAULT '',
     resolution_method   LowCardinality(String),
     facility            LowCardinality(String),

@@ -269,6 +269,11 @@ label {
   padding: 4px 10px;
 }
 
+.vendor-hint {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
 .log-message {
   max-width: 480px;
   overflow: hidden;

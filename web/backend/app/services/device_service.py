@@ -17,6 +17,7 @@ def list_devices(client: Client, window: str = DEFAULT_WINDOW, limit: int = 500)
             source_ip,
             argMax(hostname, event_time) AS hostname,
             argMax(vendor, event_time) AS vendor,
+            argMax(vendor_source, event_time) AS vendor_source,
             argMax(model, event_time) AS model,
             argMax(resolution_method, event_time) AS resolution_method,
             min(event_time) AS first_seen_in_window,
@@ -31,8 +32,8 @@ def list_devices(client: Client, window: str = DEFAULT_WINDOW, limit: int = 500)
     result = client.query(query)
     return [
         DeviceRead(
-            ip=row[0], hostname=row[1], vendor=row[2], model=row[3], resolution_method=row[4],
-            first_seen_in_window=row[5], last_seen=row[6], event_count=row[7],
+            ip=row[0], hostname=row[1], vendor=row[2], vendor_source=row[3], model=row[4],
+            resolution_method=row[5], first_seen_in_window=row[6], last_seen=row[7], event_count=row[8],
         )
         for row in result.result_rows
     ]
