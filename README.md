@@ -323,11 +323,17 @@ Real vendor identification uses SNMP (`sysObjectID`), which -- like
 hostname resolution -- only runs for an IP that has a credential in
 `snmp_credentials`. For everything else, `ml/vendor_signatures.py` makes a
 best-effort guess at vendor from the syslog message's own format: Cisco's
-`%FACILITY-SEVERITY-MNEMONIC:` convention, Junos's `junos@2636.` structured
-data, FortiOS's `devname=`/`logid=` key-value style, Palo Alto's CSV
-`TRAFFIC`/`THREAT`/... header, RouterOS's `topic,severity` prefix. This
-runs automatically in the classifier for every event that doesn't already
-have an SNMP-verified identity -- no configuration needed.
+`%FACILITY-SEVERITY-MNEMONIC:` convention (matched anywhere in the
+message, since real IOS devices usually prefix it with a sequence number
+and timestamp), Junos's `junos@2636.` structured data, FortiOS's
+`devname=`/`logid=` key-value style, Palo Alto's CSV `TRAFFIC`/`THREAT`/...
+header, and RouterOS's interface up/down and wireless scan-list message
+formats. This runs automatically in the classifier for every event that
+doesn't already have an SNMP-verified identity -- no configuration needed.
+The Cisco and RouterOS patterns were corrected against real messages
+sampled from this deployment's own traffic, not just vendor
+documentation -- see the comment at the top of `vendor_signatures.py` for
+what changed and why.
 
 **This is a format guess, not identity verification**, and every event
 carries `vendor_source` (`snmp` | `passive` | `unknown`) so the Devices

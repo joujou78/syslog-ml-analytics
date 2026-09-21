@@ -10,13 +10,23 @@ with vendor_source="passive" (vs "snmp" for a sysObjectID-verified vendor)
 specifically so nothing downstream mistakes a format guess for a fact.
 Two honest limitations:
   - A device can be configured to log in a non-default format, or a
-    vendor can change its format across firmware versions -- these
-    patterns are drawn from each vendor's commonly documented/observed
-    syslog format, not verified against your specific devices.
+    vendor can change its format across firmware versions.
   - Several vendors (Arista, HP, Dell) deliberately mimic Cisco's
     "%FACILITY-SEVERITY-MNEMONIC:" convention for CLI/tooling
     compatibility, so that pattern alone can't distinguish them --
     matches land in the "cisco_like" bucket rather than a specific vendor.
+
+The cisco_like and mikrotik patterns below were corrected against real
+messages sampled from this deployment's own traffic (not just vendor
+docs): real Cisco IOS messages carry a sequence-number and timestamp
+prefix before the "%FACILITY-..." marker (e.g. "023543: *Mar 22
+12:06:38.718: %SW_MATM-4-MACFLAP_NOTIF: ..."), so the original version of
+this pattern -- anchored to the start of the message -- never matched.
+RouterOS's own default "topic,severity: message" prefix also isn't
+present in the `message` field as delivered by this pipeline (rsyslog's
+parsing already splits that off into other fields), so the interface/
+wireless-log patterns below match the message *content* observed on real
+MikroTik devices instead.
 """
 import re
 
@@ -25,8 +35,11 @@ _SIGNATURES = [
     ("juniper", re.compile(r"junos@2636\.1\.1\.1\.2"), "Junos structured-data field (2636 = Juniper's IANA enterprise number)"),
     ("paloalto", re.compile(r"^\d+,\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2},\d+,(TRAFFIC|THREAT|SYSTEM|CONFIG|HIPMATCH|GLOBALPROTECT|CORRELATION)"), "PAN-OS CSV log header"),
     ("fortinet", re.compile(r"\bdevname=\S+.*\blogid=\"?\d+\"?"), "FortiOS key=value log line with devname/logid fields"),
-    ("mikrotik", re.compile(r"^[a-z0-9]+(,[a-z0-9]+)*,(info|warning|error|critical|debug)\b"), "RouterOS topic(s),severity prefix"),
-    ("cisco_like", re.compile(r"^%[A-Z0-9_]+-\d-[A-Z0-9_]+:"), "%FACILITY-SEVERITY-MNEMONIC: convention (Cisco, and often mimicked by Arista/HP/Dell)"),
+    ("mikrotik", re.compile(r"^ether\d+ link (up|down)\b"), "RouterOS interface up/down message"),
+    ("mikrotik", re.compile(r"\bon \d+ AP: (yes|no) SSID\b"), "RouterOS wireless scan-list entry"),
+    ("mikrotik", re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}@wlan\d+\b", re.I), "RouterOS wireless client MAC associating on a wlan interface"),
+    ("mikrotik", re.compile(r"^[a-z0-9]+(,[a-z0-9]+)*,(info|warning|error|critical|debug)\b"), "RouterOS topic(s),severity prefix (if not split into a separate field upstream)"),
+    ("cisco_like", re.compile(r"%[A-Z0-9_]+-\d-[A-Z0-9_]+:"), "%FACILITY-SEVERITY-MNEMONIC: convention (Cisco, and often mimicked by Arista/HP/Dell) -- not anchored to message start since real devices often prefix a sequence number/timestamp first"),
 ]
 
 
