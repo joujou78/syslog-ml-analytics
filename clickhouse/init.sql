@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
     predicted_category  LowCardinality(String),
     predicted_confidence Float32,
     is_anomaly          UInt8 DEFAULT 0,
+    anomaly_reasons     Array(LowCardinality(String)) DEFAULT [], -- which signal(s) fired: rare_template | always_severe | severity_spike | security_content | volume_spike -- see ml/anomaly_signals.py and consumer.py's DeviceBaselineCache
     raw                 String,
 
     -- Secondary (skip) indexes: `events` is a *columnar* store ordered by

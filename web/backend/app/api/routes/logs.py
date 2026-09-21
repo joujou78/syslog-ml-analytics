@@ -26,6 +26,7 @@ async def search_logs(
     severity: str | None = None,
     predicted_category: str | None = None,
     q: str | None = Query(default=None, description="Case-insensitive substring match on the log message"),
+    only_anomalies: bool = False,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ):
@@ -39,6 +40,7 @@ async def search_logs(
         severity=severity,
         predicted_category=predicted_category,
         keyword=q,
+        only_anomalies=only_anomalies,
         limit=limit,
         offset=offset,
     )

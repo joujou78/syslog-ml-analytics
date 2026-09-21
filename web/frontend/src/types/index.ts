@@ -73,6 +73,7 @@ export interface LogEntry {
   predicted_category: string
   predicted_confidence: number
   is_anomaly: boolean
+  anomaly_reasons: string[]
   resolution_method: ResolutionMethod
 }
 
@@ -85,6 +86,7 @@ export interface LogSearchFilters {
   severity?: string
   predicted_category?: string
   q?: string
+  only_anomalies?: boolean
   limit?: number
   offset?: number
 }

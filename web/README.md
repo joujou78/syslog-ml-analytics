@@ -7,11 +7,13 @@ feedback/correction loop planned as a later phase (see "Roadmap" below).
 **Log search** (`GET /api/logs/search`, "Log Search" in the nav) is a
 filtered, paginated query straight over `syslog_ml.events` in ClickHouse —
 no new database, no new data path. Filters: time range (defaults to the
-last 24h), hostname, source IP, program, severity, category, and a
-case-insensitive keyword match on the message. It fetches one row past the
-page size to derive "more results exist" instead of running `COUNT(*)`
-over the match set, since an unbounded count on a table sized for
-high-volume retention is the expensive query the skip indexes in
+last 24h), hostname, source IP, program, severity, category, an
+"anomalies only" toggle, and a case-insensitive keyword match on the
+message. Each result row shows which anomaly signal(s) fired (see the
+pipeline README's "Anomaly flagging" section). It fetches one row past
+the page size to derive "more results exist" instead of running
+`COUNT(*)` over the match set, since an unbounded count on a table sized
+for high-volume retention is the expensive query the skip indexes in
 `clickhouse/init.sql` exist to help you avoid, not something to run on
 every search.
 
@@ -243,6 +245,17 @@ then log in with the admin account from Step 2.
   by the credential-pool work — it just took a real multi-candidate pool
   test against a real device to surface clearly. Confirmed against a real
   local `snmpd`: `-v v2c` fails with exit code 1, `-v 2c` succeeds.
+- The multi-signal anomaly detection (`always_severe`, `security_content`,
+  `severity_spike`, `volume_spike`, plus the pre-existing `rare_template`)
+  was verified with real inputs run through the actual `to_row()`/
+  `DeviceBaselineCache` code — including the trickier stateful cases (a
+  device's in-memory "worst severity" baseline updating after a spike so
+  the same severity doesn't re-trigger, and a volume-spike signal
+  correctly clearing once traffic returns to normal) — but against
+  synthetic ClickHouse responses, since real ClickHouse isn't reachable
+  from this sandbox. The `GROUP BY source_ip` baseline query itself is
+  unverified against your real `events` table size; if it looks slow,
+  widen `ANOMALY_BASELINE_REFRESH_SECONDS` before widening the window.
 - Password reset / account recovery isn't built — the only way to regain
   access if the sole admin's password is lost is `scripts/create_admin.py`
   won't help (it refuses existing usernames) or a manual DB update.

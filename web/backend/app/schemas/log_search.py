@@ -15,6 +15,7 @@ class LogEntry(BaseModel):
     predicted_category: str
     predicted_confidence: float
     is_anomaly: bool
+    anomaly_reasons: list[str]
     resolution_method: str
 
 

@@ -29,6 +29,7 @@ from drain3.file_persistence import FilePersistence
 from drain3.template_miner_config import TemplateMinerConfig
 
 import state_db
+from anomaly_signals import is_always_severe, is_security_content
 from labeling_rules import weak_label, severity_rank
 from vendor_signatures import detect_vendor
 
@@ -56,11 +57,21 @@ DRAIN3_SNAPSHOT_INTERVAL_MINUTES = float(os.environ.get("DRAIN3_SNAPSHOT_INTERVA
 # Unsupervised on purpose: no labeled anomaly data exists yet (see README).
 ANOMALY_RARE_THRESHOLD = int(os.environ.get("ANOMALY_RARE_THRESHOLD", "5"))
 
+# How far back DeviceBaselineCache looks to decide what's "normal" for a
+# device (severity_spike, volume_spike). A GROUP BY over this whole window
+# runs on every refresh, so it's a real ClickHouse query cost, not a free
+# lookup like InventoryCache's -- refreshed far less often as a result.
+BASELINE_WINDOW_DAYS = int(os.environ.get("ANOMALY_BASELINE_WINDOW_DAYS", "7"))
+BASELINE_REFRESH_SECONDS = float(os.environ.get("ANOMALY_BASELINE_REFRESH_SECONDS", "600"))
+# A device is "volume spiking" while its rate since the last baseline
+# refresh is at least this many times its historical average rate.
+VOLUME_SPIKE_MULTIPLIER = float(os.environ.get("ANOMALY_VOLUME_SPIKE_MULTIPLIER", "5"))
+
 INSERT_COLUMNS = [
     "event_time", "source_ip", "hostname", "reported_hostname", "vendor", "vendor_source", "model",
     "resolution_method", "facility", "severity", "severity_num", "program", "pid",
     "message", "template_id", "template", "predicted_category", "predicted_confidence",
-    "is_anomaly", "raw",
+    "is_anomaly", "anomaly_reasons", "raw",
 ]
 
 
@@ -185,6 +196,91 @@ class InventoryCache:
         return self._cache.get(ip)
 
 
+class DeviceBaselineCache:
+    """
+    Per-device (keyed by source_ip, not hostname -- stable across a device
+    going from unresolved to SNMP-verified, unlike its display hostname)
+    baselines for two anomaly signals:
+
+      - severity_spike: this device's severity is worse than anything it
+        has logged in the baseline window. `_min_severity_rank` tracks the
+        lowest (most severe) severity_num seen per device; a new low is
+        both flagged AND immediately folded in-memory, so a burst of
+        equally-severe events doesn't all re-trigger "new worst" past the
+        first one.
+      - volume_spike: this device is currently logging far above its own
+        historical average rate. Compares the count seen since the last
+        refresh against that device's baseline rate, then resets the
+        counter -- coarse (per refresh window, not per message) but simple
+        and bounded (O(1) state per device).
+
+    A brand-new device has no baseline yet and triggers neither signal
+    until it survives at least one refresh cycle -- "unusual for this
+    device" is meaningless before we know anything about it.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        self._min_severity_rank = {}
+        self._baseline_rate_per_min = {}
+        self._recent_count = {}
+        self._spiking = set()
+        self._last_refresh = 0.0
+
+    def refresh_if_stale(self):
+        if time.monotonic() - self._last_refresh < BASELINE_REFRESH_SECONDS:
+            return
+        try:
+            result = self.client.query(f"""
+                SELECT
+                    source_ip,
+                    min(severity_num) AS min_severity_rank,
+                    count() / greatest(dateDiff('minute', min(event_time), max(event_time)), 1) AS rate_per_min
+                FROM syslog_ml.events
+                WHERE event_time >= now() - INTERVAL {BASELINE_WINDOW_DAYS} DAY
+                GROUP BY source_ip
+            """)
+            new_min_severity = {}
+            new_rate = {}
+            for source_ip, min_sev, rate in result.result_rows:
+                new_min_severity[source_ip] = min_sev
+                new_rate[source_ip] = rate
+
+            elapsed_minutes = (
+                (time.monotonic() - self._last_refresh) / 60.0 if self._last_refresh else BASELINE_REFRESH_SECONDS / 60.0
+            )
+            spiking = set()
+            for source_ip, count in self._recent_count.items():
+                baseline = self._baseline_rate_per_min.get(source_ip)
+                if baseline and elapsed_minutes > 0 and (count / elapsed_minutes) >= baseline * VOLUME_SPIKE_MULTIPLIER:
+                    spiking.add(source_ip)
+
+            self._min_severity_rank = new_min_severity
+            self._baseline_rate_per_min = new_rate
+            self._recent_count = {}
+            self._spiking = spiking
+            self._last_refresh = time.monotonic()
+            log.info(
+                "Refreshed device baseline cache: %d device(s), %d currently volume-spiking",
+                len(new_min_severity), len(spiking),
+            )
+        except Exception:
+            log.exception("Failed to refresh device baseline cache, keeping previous snapshot")
+
+    def record_event(self, source_ip):
+        self._recent_count[source_ip] = self._recent_count.get(source_ip, 0) + 1
+
+    def is_severity_spike(self, source_ip, severity_rank_value):
+        prior_min = self._min_severity_rank.get(source_ip)
+        if prior_min is None or severity_rank_value >= prior_min:
+            return False
+        self._min_severity_rank[source_ip] = severity_rank_value
+        return True
+
+    def is_volume_spiking(self, source_ip):
+        return source_ip in self._spiking
+
+
 def resolve_identity(record, inventory, state_conn, seen_unresolved):
     source_ip = record.get("source_ip", "unknown")
     reported_hostname = record.get("reported_hostname", "") or ""
@@ -218,7 +314,7 @@ def resolve_identity(record, inventory, state_conn, seen_unresolved):
     return source_ip, hostname, reported_hostname, detected_vendor, "", resolution_method, vendor_source
 
 
-def to_row(record, miner, model, inventory, state_conn, seen_unresolved):
+def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolved):
     message = record.get("message", "")
     cluster = miner.add_log_message(message)
     timestamp = record.get("timestamp")
@@ -239,15 +335,29 @@ def to_row(record, miner, model, inventory, state_conn, seen_unresolved):
     source_ip, hostname, reported_hostname, vendor, dev_model, resolution_method, vendor_source = resolve_identity(
         record, inventory, state_conn, seen_unresolved
     )
+    severity_num = severity_rank(severity)
 
-    is_anomaly = 1 if cluster["cluster_size"] <= ANOMALY_RARE_THRESHOLD else 0
+    reasons = []
+    if cluster["cluster_size"] <= ANOMALY_RARE_THRESHOLD:
+        reasons.append("rare_template")
+    if is_always_severe(severity):
+        reasons.append("always_severe")
+    if is_security_content(message):
+        reasons.append("security_content")
+    if baselines.is_severity_spike(source_ip, severity_num):
+        reasons.append("severity_spike")
+    if baselines.is_volume_spiking(source_ip):
+        reasons.append("volume_spike")
+    baselines.record_event(source_ip)
+
+    is_anomaly = 1 if reasons else 0
 
     return [
         event_time, source_ip, hostname, reported_hostname, vendor, vendor_source, dev_model, resolution_method,
-        record.get("facility", "unknown"), severity, severity_rank(severity),
+        record.get("facility", "unknown"), severity, severity_num,
         record.get("program", "unknown"), pid, message,
         str(cluster["cluster_id"]), cluster["template_mined"],
-        category, confidence, is_anomaly, record.get("raw", message),
+        category, confidence, is_anomaly, reasons, record.get("raw", message),
     ]
 
 
@@ -275,6 +385,7 @@ def main():
         host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT, username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD
     )
     inventory = InventoryCache(ch_client)
+    baselines = DeviceBaselineCache(ch_client)
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)
 
@@ -285,13 +396,14 @@ def main():
 
     while True:
         inventory.refresh_if_stale()
+        baselines.refresh_if_stale()
         lines = tailer.readlines()
 
         for line in lines:
             record = parse_record(line)
             if record is None:
                 continue
-            batch.append(to_row(record, miner, model, inventory, state_conn, seen_unresolved))
+            batch.append(to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolved))
 
         should_flush = len(batch) >= BATCH_SIZE or (time.monotonic() - last_flush) >= BATCH_FLUSH_SECONDS
         if should_flush and batch:

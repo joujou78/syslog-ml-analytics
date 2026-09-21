@@ -288,23 +288,59 @@ sudo journalctl -u syslog-ml-alert-evaluator -f         # confirm it runs every 
 ### Anomaly flagging
 
 `events.is_anomaly` is populated by the classifier itself (`ml/consumer.py`),
-not a separate process: every message is mined into a Drain3 template as
-before, and a row is flagged anomalous while its template's `cluster_size`
-is still small (`ANOMALY_RARE_THRESHOLD`, default 5) — i.e. it's new or
-still rare for that traffic, not yet part of the routine pattern. This is
-deliberately unsupervised (no labeled anomaly data exists to train on yet)
-and reuses infrastructure that was already running; it does not detect
-anything Drain3 itself couldn't already distinguish as a "new" or
-"still-forming" template.
+not a separate process. It's actually five independent signals
+(`ml/anomaly_signals.py` for the stateless two, `DeviceBaselineCache` in
+`consumer.py` for the two that need per-device history) — any one firing
+sets `is_anomaly = 1`, and `events.anomaly_reasons` (an array column)
+records *which* one(s) did, the same "always label the reason, not just a
+verdict" principle already used for `resolution_method` and
+`vendor_source`:
 
-Drain3's cluster state now persists to `DRAIN3_STATE_FILE`
+- **`rare_template`**: the message's Drain3 template has matched
+  `ANOMALY_RARE_THRESHOLD` (default 5) times or fewer in its whole
+  lifetime — new or still-rare for this traffic, not yet routine.
+- **`always_severe`**: severity is `emerg`/`alert`/`crit`, unconditionally.
+- **`security_content`**: the message matches the same `SECURITY` category
+  weak-supervision rule the classifier already uses (see
+  `labeling_rules.py`) — reused, not duplicated, so tuning one tunes both.
+- **`severity_spike`**: this specific device just logged something worse
+  than anything it's logged in the last `ANOMALY_BASELINE_WINDOW_DAYS`
+  (default 7) — a device that's only ever logged info/notice suddenly
+  logging `err` gets flagged even though `err` isn't unconditionally
+  severe.
+- **`volume_spike`**: this specific device is currently logging at
+  `ANOMALY_VOLUME_SPIKE_MULTIPLIER` (default 5x) or more its own historical
+  average rate — catches things like a flapping interface flooding the
+  same (non-rare) message.
+
+The last two are per-device, not global thresholds, since "unusual" only
+means something relative to what's normal *for that device* — a device
+that always logs at `err` isn't anomalous for continuing to do so, and a
+naturally chatty device isn't anomalous for being chatty. A brand-new
+device has no baseline yet and can't trigger either signal until it
+survives at least one baseline refresh — there's nothing to compare
+against yet, so it's correctly silent rather than guessing.
+
+**Honest cost caveat**: unlike the device inventory cache (a cheap
+lookup), the per-device baseline is a `GROUP BY source_ip` aggregate over
+`ANOMALY_BASELINE_WINDOW_DAYS` of `events` — a real query cost on a table
+sized for high-volume retention, which is why it refreshes far less often
+(`ANOMALY_BASELINE_REFRESH_SECONDS`, default 600s) than the inventory
+cache's 60s. Widening the window or shortening the refresh interval
+trades ClickHouse load for fresher baselines.
+
+Drain3's cluster state persists to `DRAIN3_STATE_FILE`
 (`/var/lib/syslog-ml/drain3_state.bin` by default, snapshotted every
-`DRAIN3_SNAPSHOT_INTERVAL_MINUTES`) specifically so this survives a
-classifier restart — without it, every template would look "new" again
-after each restart and you'd see a burst of false anomalies. One honest
-caveat: on this VM's very first run (no snapshot file yet), that startup
-burst is expected and one-time, not a bug — give it a few minutes of
-traffic before trusting `is_anomaly` counts.
+`DRAIN3_SNAPSHOT_INTERVAL_MINUTES`) specifically so `rare_template`
+survives a classifier restart — without it, every template would look
+"new" again after each restart and you'd see a burst of false anomalies.
+One honest caveat: on this VM's very first run (no snapshot file yet, no
+baseline history yet), a startup burst across all five signals is
+expected and one-time, not a bug — give it some real traffic (and at
+least one baseline refresh interval) before trusting `is_anomaly` counts.
+
+In the web app, search "Anomalies only" on the Log Search page to see
+everything currently flagged, with the reason(s) shown per row.
 
 ### Alerting
 
@@ -523,7 +559,8 @@ prefers a real `category` field over the weak-supervision guess.
 - `rsyslog/10-network-listener.conf` — enables rsyslog to receive syslog over the network (UDP/TCP 514), not just local messages.
 - `rsyslog/60-syslog-ml.conf` — mirrors rsyslog's feed to a local JSON file.
 - `snmptrapd/` — optional SNMP trap receiver config, feeding traps into the same pipeline via local syslog.
-- `ml/consumer.py` — tails the file, resolves identity, classifies, writes to ClickHouse.
+- `ml/consumer.py` — tails the file, resolves identity, classifies, flags anomalies, writes to ClickHouse.
+- `ml/anomaly_signals.py` — stateless anomaly signals (always_severe, security_content); the per-device ones (severity_spike, volume_spike) live in `consumer.py`'s `DeviceBaselineCache`.
 - `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver, including credential-pool discovery/auto-save (reads credentials from Postgres, see `web/`).
 - `ml/reverify_devices.py` — twice-daily re-check of already-resolved devices; self-heals an auto-discovered credential if its community rotates.
 - `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.

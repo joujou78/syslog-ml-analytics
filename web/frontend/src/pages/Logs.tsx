@@ -50,6 +50,10 @@ export function Logs() {
     setPendingFilters((prev) => ({ ...prev, [field]: value || undefined }))
   }
 
+  function toggleOnlyAnomalies(checked: boolean) {
+    setPendingFilters((prev) => ({ ...prev, only_anomalies: checked || undefined }))
+  }
+
   return (
     <div>
       <h2>Log search</h2>
@@ -108,6 +112,16 @@ export function Logs() {
             End
             <input type="datetime-local" value={pendingFilters.end ?? ''} onChange={(e) => updateField('end', e.target.value)} />
           </label>
+          <label>
+            Anomalies only
+            <select
+              value={pendingFilters.only_anomalies ? 'true' : 'false'}
+              onChange={(e) => toggleOnlyAnomalies(e.target.value === 'true')}
+            >
+              <option value="false">No — show everything</option>
+              <option value="true">Yes — only flagged events</option>
+            </select>
+          </label>
         </div>
         <div className="form-actions">
           <button type="submit">Search</button>
@@ -129,6 +143,7 @@ export function Logs() {
             <th>Severity</th>
             <th>Program</th>
             <th>Category</th>
+            <th>Anomaly</th>
             <th>Message</th>
           </tr>
         </thead>
@@ -143,12 +158,19 @@ export function Logs() {
               </td>
               <td>{entry.program}</td>
               <td>{entry.predicted_category}</td>
+              <td>
+                {entry.anomaly_reasons.map((reason) => (
+                  <span key={reason} className="badge badge-anomaly" title={reason}>
+                    {reason.replace('_', ' ')}
+                  </span>
+                ))}
+              </td>
               <td className="mono log-message">{entry.message}</td>
             </tr>
           ))}
           {items?.length === 0 && !loading && (
             <tr>
-              <td colSpan={7}>No log entries match these filters.</td>
+              <td colSpan={8}>No log entries match these filters.</td>
             </tr>
           )}
         </tbody>

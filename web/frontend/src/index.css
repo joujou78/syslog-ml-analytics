@@ -307,3 +307,10 @@ label {
   background: rgba(154, 160, 170, 0.15);
   color: var(--text-dim);
 }
+
+.badge-anomaly {
+  background: rgba(229, 72, 77, 0.15);
+  color: var(--danger);
+  margin: 2px;
+  white-space: nowrap;
+}

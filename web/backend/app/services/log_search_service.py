@@ -21,6 +21,7 @@ def search_logs(
     severity: str | None = None,
     predicted_category: str | None = None,
     keyword: str | None = None,
+    only_anomalies: bool = False,
     limit: int = 100,
     offset: int = 0,
 ) -> LogSearchResponse:
@@ -65,6 +66,9 @@ def search_logs(
         conditions.append("positionCaseInsensitive(message, %(keyword)s) > 0")
         params["keyword"] = keyword
 
+    if only_anomalies:
+        conditions.append("is_anomaly = 1")
+
     params["fetch_limit"] = limit + 1
     params["offset"] = offset
 
@@ -72,7 +76,7 @@ def search_logs(
         SELECT
             event_time, source_ip, hostname, vendor, severity, program, pid,
             message, predicted_category, predicted_confidence, is_anomaly,
-            resolution_method
+            anomaly_reasons, resolution_method
         FROM syslog_ml.events
         WHERE {" AND ".join(conditions)}
         ORDER BY event_time DESC
@@ -97,7 +101,8 @@ def search_logs(
             predicted_category=row[8],
             predicted_confidence=row[9],
             is_anomaly=bool(row[10]),
-            resolution_method=row[11],
+            anomaly_reasons=list(row[11]),
+            resolution_method=row[12],
         )
         for row in rows
     ]
