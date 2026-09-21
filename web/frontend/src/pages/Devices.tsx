@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { devicesApi } from '../api/devices'
-import type { Device, ResolutionSummary } from '../types'
+import type { Device, DeviceSearchFilters, ResolutionSummary } from '../types'
 
 const RESOLUTION_LABEL: Record<string, string> = {
   snmp: 'Verified (SNMP)',
@@ -10,12 +10,15 @@ const RESOLUTION_LABEL: Record<string, string> = {
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 500]
 const AUTO_REFRESH_MS = 30000
+const EMPTY_FILTERS: DeviceSearchFilters = {}
 
 function ResolutionBadge({ method }: { method: string }) {
   return <span className={`badge badge-${method}`}>{RESOLUTION_LABEL[method] ?? method}</span>
 }
 
 export function Devices() {
+  const [filters, setFilters] = useState<DeviceSearchFilters>(EMPTY_FILTERS)
+  const [pendingFilters, setPendingFilters] = useState<DeviceSearchFilters>(EMPTY_FILTERS)
   const [devices, setDevices] = useState<Device[] | null>(null)
   const [hasMore, setHasMore] = useState(false)
   const [summary, setSummary] = useState<ResolutionSummary[] | null>(null)
@@ -26,7 +29,7 @@ export function Devices() {
 
   const load = (silent = false) => {
     if (!silent) setError(null)
-    Promise.all([devicesApi.list(pageSize, offset), devicesApi.resolutionSummary()])
+    Promise.all([devicesApi.list(filters, pageSize, offset), devicesApi.resolutionSummary()])
       .then(([deviceResp, summaryList]) => {
         setDevices(deviceResp.items)
         setHasMore(deviceResp.has_more)
@@ -38,16 +41,16 @@ export function Devices() {
 
   useEffect(() => {
     load()
-  }, [pageSize, offset])
+  }, [filters, pageSize, offset])
 
-  // Auto-refresh the current page in the background, without resetting
-  // pageSize/offset or flashing the table -- devices resolve and new ones
-  // appear continuously, so this page shouldn't need a manual reload to
-  // stay current.
+  // Auto-refresh the current page/filters in the background, without
+  // resetting pageSize/offset or flashing the table -- devices resolve
+  // and new ones appear continuously, so this page shouldn't need a
+  // manual reload to stay current.
   useEffect(() => {
     const interval = setInterval(() => load(true), AUTO_REFRESH_MS)
     return () => clearInterval(interval)
-  }, [pageSize, offset])
+  }, [filters, pageSize, offset])
 
   const totalDevices = summary?.reduce((sum, s) => sum + s.device_count, 0) ?? 0
 
@@ -56,14 +59,29 @@ export function Devices() {
     setOffset(0)
   }
 
+  function updateField(field: keyof DeviceSearchFilters, value: string) {
+    setPendingFilters((prev) => ({ ...prev, [field]: value || undefined }))
+  }
+
+  function applyFilters(e: React.FormEvent) {
+    e.preventDefault()
+    setOffset(0)
+    setFilters(pendingFilters)
+  }
+
+  function clearFilters() {
+    setPendingFilters(EMPTY_FILTERS)
+    setOffset(0)
+    setFilters(EMPTY_FILTERS)
+  }
+
   return (
     <div>
-      <h2>Devices (last 24h)</h2>
-      {lastUpdated && (
-        <p className="page-hint">
-          Auto-refreshes every 30s — last updated {lastUpdated.toLocaleTimeString()}.
-        </p>
-      )}
+      <h2>Devices</h2>
+      <p className="page-hint">
+        Defaults to the last 24 hours. Auto-refreshes every 30s
+        {lastUpdated && <> — last updated {lastUpdated.toLocaleTimeString()}</>}.
+      </p>
 
       {error && <p className="form-error">{error}</p>}
 
@@ -80,6 +98,37 @@ export function Devices() {
           ))}
         </div>
       )}
+
+      <form className="credential-form" onSubmit={applyFilters}>
+        <div className="form-grid">
+          <label>
+            Hostname
+            <input type="text" value={pendingFilters.hostname ?? ''} onChange={(e) => updateField('hostname', e.target.value)} />
+          </label>
+          <label>
+            IP
+            <input type="text" value={pendingFilters.ip ?? ''} onChange={(e) => updateField('ip', e.target.value)} />
+          </label>
+          <label>
+            Vendor
+            <input type="text" value={pendingFilters.vendor ?? ''} onChange={(e) => updateField('vendor', e.target.value)} />
+          </label>
+          <label>
+            Start
+            <input type="datetime-local" value={pendingFilters.start ?? ''} onChange={(e) => updateField('start', e.target.value)} />
+          </label>
+          <label>
+            End
+            <input type="datetime-local" value={pendingFilters.end ?? ''} onChange={(e) => updateField('end', e.target.value)} />
+          </label>
+        </div>
+        <div className="form-actions">
+          <button type="submit">Search</button>
+          <button type="button" onClick={clearFilters}>
+            Clear
+          </button>
+        </div>
+      </form>
 
       <div className="form-actions" style={{ alignItems: 'center' }}>
         <label style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
@@ -128,7 +177,7 @@ export function Devices() {
           ))}
           {devices?.length === 0 && (
             <tr>
-              <td colSpan={6}>No devices seen in the last 24 hours.</td>
+              <td colSpan={6}>No devices match these filters.</td>
             </tr>
           )}
         </tbody>

@@ -63,6 +63,14 @@ export interface DeviceListResponse {
   has_more: boolean
 }
 
+export interface DeviceSearchFilters {
+  hostname?: string
+  ip?: string
+  vendor?: string
+  start?: string
+  end?: string
+}
+
 export interface ResolutionSummary {
   resolution_method: ResolutionMethod
   device_count: number

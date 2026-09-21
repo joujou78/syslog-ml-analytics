@@ -1,19 +1,35 @@
+from datetime import datetime, timedelta, timezone
+
 from clickhouse_connect.driver.client import Client
 
 from app.schemas.device import DeviceListResponse, DeviceRead, ResolutionSummary
 
 DEFAULT_WINDOW = "INTERVAL 1 DAY"
+DEFAULT_LOOKBACK = timedelta(hours=24)
 MAX_LIMIT = 1000
 
 
 def list_devices(
-    client: Client, window: str = DEFAULT_WINDOW, limit: int = 100, offset: int = 0
+    client: Client,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    hostname: str | None = None,
+    ip: str | None = None,
+    vendor: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
 ) -> DeviceListResponse:
     """
     Every device seen in the window, with its most recent known identity —
     deliberately built from `events`, not just `device_inventory` (which
     only holds the SNMP-resolved subset), so unresolved/syslog_reported
     devices show up here too and can be triaged.
+
+    hostname/vendor are case-insensitive substring matches against each
+    device's most-recently-seen identity, so they're applied in HAVING
+    (after the argMax aggregation) rather than WHERE; ip matches against
+    the raw, un-aggregated source_ip column, so it's a WHERE condition.
 
     Paginated the same way as log search: fetches one row past `limit` to
     derive has_more instead of a separate COUNT(*), since with hundreds of
@@ -22,6 +38,24 @@ def list_devices(
     """
     limit = max(1, min(limit, MAX_LIMIT))
     offset = max(0, offset)
+    end = end or datetime.now(timezone.utc)
+    start = start or (end - DEFAULT_LOOKBACK)
+
+    conditions = ["event_time >= %(start)s", "event_time <= %(end)s"]
+    params: dict = {"start": start, "end": end, "fetch_limit": limit + 1, "offset": offset}
+
+    if ip:
+        conditions.append("positionCaseInsensitive(source_ip, %(ip)s) > 0")
+        params["ip"] = ip
+
+    having_conditions = []
+    if hostname:
+        having_conditions.append("positionCaseInsensitive(argMax(hostname, event_time), %(hostname)s) > 0")
+        params["hostname"] = hostname
+    if vendor:
+        having_conditions.append("positionCaseInsensitive(argMax(vendor, event_time), %(vendor)s) > 0")
+        params["vendor"] = vendor
+    having_clause = f"HAVING {' AND '.join(having_conditions)}" if having_conditions else ""
 
     query = f"""
         SELECT
@@ -35,12 +69,13 @@ def list_devices(
             max(event_time) AS last_seen,
             count() AS event_count
         FROM syslog_ml.events
-        WHERE event_time >= now() - {window}
+        WHERE {" AND ".join(conditions)}
         GROUP BY source_ip
+        {having_clause}
         ORDER BY event_count DESC
-        LIMIT {limit + 1} OFFSET {offset}
+        LIMIT %(fetch_limit)s OFFSET %(offset)s
     """
-    result = client.query(query)
+    result = client.query(query, parameters=params)
     rows = result.result_rows
     has_more = len(rows) > limit
     rows = rows[:limit]

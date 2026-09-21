@@ -12,6 +12,14 @@ current. The page size and current offset are preserved across
 auto-refreshes; only an explicit page-size change or Previous/Next click
 resets or moves the offset.
 
+It's also searchable by hostname, IP, vendor, and a start/end time range
+(defaults to the last 24h, same as log search). hostname/vendor match
+against each device's most-recently-seen identity, so they're applied in
+a ClickHouse `HAVING` clause (after the per-device `argMax` aggregation)
+rather than `WHERE`; IP matches the raw `source_ip` column directly.
+Applying a search resets pagination back to the first page. Covered by
+`web/frontend/e2e/devices_search.mjs` (`npm run test:e2e:devices-search`).
+
 **Log search** (`GET /api/logs/search`, "Log Search" in the nav) is a
 filtered, paginated query straight over `syslog_ml.events` in ClickHouse —
 no new database, no new data path. Filters: time range (defaults to the
