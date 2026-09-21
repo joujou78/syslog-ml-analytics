@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { credentialsApi } from '../api/credentials'
 import type { Credential, CredentialInput, SnmpVersion } from '../types'
 
@@ -28,6 +28,8 @@ export function Credentials() {
   const [poolResult, setPoolResult] = useState<string | null>(null)
   const [poolSubmitting, setPoolSubmitting] = useState(false)
 
+  const editFormRef = useRef<HTMLFormElement>(null)
+
   const load = () => credentialsApi.list().then(setCredentials).catch(() => setError('Could not load credentials'))
 
   useEffect(() => {
@@ -47,6 +49,10 @@ export function Credentials() {
       v3_priv_proto: 'AES',
       v3_priv_pass: '',
     })
+    // With a long credential list (e.g. after a bulk pool import), the edit
+    // form at the top of the page is often off-screen from a row further
+    // down -- without this, clicking Edit looks like it does nothing.
+    editFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
   const cancelEdit = () => {
@@ -109,7 +115,7 @@ export function Credentials() {
         per subnet that shares a community/user.
       </p>
 
-      <form className="credential-form" onSubmit={handleSubmit}>
+      <form ref={editFormRef} className="credential-form" onSubmit={handleSubmit}>
         <h3>{editingId ? 'Edit credential' : 'Add credential'}</h3>
         <div className="form-grid">
           <label>
