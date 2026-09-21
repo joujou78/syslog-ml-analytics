@@ -15,10 +15,12 @@ network devices --syslog--> rsyslog (existing) ----------> LogAnalyzer DB (uncha
                                                      - device identity lookup (cached)
                                                      - Drain3 template mining
                                                      - ML category classifier
+                                                     - is_anomaly (rare/new template)
                                                                    |
                                                               ClickHouse
-                                                                   |
-                                                                Grafana
+                                                                 |     |
+                                                           Grafana   syslog-ml-alert-evaluator.timer
+                                                                     (every 1 min) -> webhook
 
                           (separate, async, every 10 min)
           syslog-ml-resolver.timer -> resolve_pending.py
@@ -30,8 +32,9 @@ network devices --syslog--> rsyslog (existing) ----------> LogAnalyzer DB (uncha
 
 There's also a web app (`web/`) for managing SNMP credentials through a UI
 instead of hand-editing files, viewing device/resolution status, searching
-logs, and (planned) ML feedback — see `web/README.md`. It's optional:
-the pipeline above works standalone with Grafana as the only UI.
+logs, managing alert rules, and (planned) ML feedback — see `web/README.md`.
+It's optional: the pipeline above works standalone with Grafana as the only UI
+(alert rules just wouldn't have anywhere to be managed without it).
 
 No message broker: one VM, one rsyslog instance receiving everything, so a
 locally tailed file is enough durability without adding a Kafka/Redpanda
@@ -250,10 +253,13 @@ sudo cp rsyslog/60-syslog-ml.conf /etc/rsyslog.d/
 sudo systemctl restart rsyslog
 
 sudo cp systemd/syslog-ml-classifier.service systemd/syslog-ml-resolver.service systemd/syslog-ml-resolver.timer /etc/systemd/system/
+sudo cp systemd/syslog-ml-alert-evaluator.service systemd/syslog-ml-alert-evaluator.timer /etc/systemd/system/
 
-# The resolver needs credentials for the shared Postgres DB + the same
-# Fernet key the web app encrypts SNMP secrets with (see web/README.md
-# Step 3 for the matching web-api.env):
+# The resolver AND the alert evaluator need credentials for the shared
+# Postgres DB (the alert evaluator only reads DATABASE_URL out of this
+# file, ignores CREDENTIAL_ENCRYPTION_KEY) + the same Fernet key the web
+# app encrypts SNMP secrets with (see web/README.md Step 3 for the
+# matching web-api.env):
 sudo cp systemd/syslog-ml-resolver.env.example /etc/syslog-ml/resolver.env
 sudo $EDITOR /etc/syslog-ml/resolver.env
 sudo chmod 600 /etc/syslog-ml/resolver.env
@@ -262,6 +268,7 @@ sudo chown syslog-ml:syslog-ml /etc/syslog-ml/resolver.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now syslog-ml-classifier.service
 sudo systemctl enable --now syslog-ml-resolver.timer
+sudo systemctl enable --now syslog-ml-alert-evaluator.timer
 ```
 
 **Checkpoint:**
@@ -270,7 +277,45 @@ sudo systemctl enable --now syslog-ml-resolver.timer
 sudo tail -f /var/log/syslog-ml/raw.jsonl              # confirm rsyslog is writing
 sudo journalctl -u syslog-ml-classifier -f              # confirm it's processing
 clickhouse-client --query "SELECT count() FROM syslog_ml.events"
+clickhouse-client --query "SELECT count() FROM syslog_ml.events WHERE is_anomaly = 1"
+sudo journalctl -u syslog-ml-alert-evaluator -f         # confirm it runs every minute, no errors
 ```
+
+### Anomaly flagging
+
+`events.is_anomaly` is populated by the classifier itself (`ml/consumer.py`),
+not a separate process: every message is mined into a Drain3 template as
+before, and a row is flagged anomalous while its template's `cluster_size`
+is still small (`ANOMALY_RARE_THRESHOLD`, default 5) — i.e. it's new or
+still rare for that traffic, not yet part of the routine pattern. This is
+deliberately unsupervised (no labeled anomaly data exists to train on yet)
+and reuses infrastructure that was already running; it does not detect
+anything Drain3 itself couldn't already distinguish as a "new" or
+"still-forming" template.
+
+Drain3's cluster state now persists to `DRAIN3_STATE_FILE`
+(`/var/lib/syslog-ml/drain3_state.bin` by default, snapshotted every
+`DRAIN3_SNAPSHOT_INTERVAL_MINUTES`) specifically so this survives a
+classifier restart — without it, every template would look "new" again
+after each restart and you'd see a burst of false anomalies. One honest
+caveat: on this VM's very first run (no snapshot file yet), that startup
+burst is expected and one-time, not a bug — give it a few minutes of
+traffic before trusting `is_anomaly` counts.
+
+### Alerting
+
+`ml/evaluate_alerts.py` (run every minute by `syslog-ml-alert-evaluator.timer`)
+evaluates every enabled rule from the web app's "Alerts" page against
+`syslog_ml.events`: a rule fires when at least *threshold* matching events
+(optionally filtered by hostname/source IP/program/severity/category, or
+restricted to `is_anomaly=1` events) occur within the trailing *window*,
+and won't fire again until *cooldown* has elapsed since it last fired. A
+firing writes a row to Postgres (`alert_events`, visible in the same page)
+and, if the rule has a `webhook_url`, POSTs a JSON payload to it (works
+with a Slack incoming webhook, PagerDuty, or any endpoint that accepts a
+POST). There's no email delivery in this version — a webhook was the
+simplest channel to build and test without requiring SMTP credentials;
+point it at a service that turns webhooks into email/SMS if you need that.
 
 ### If syslog arrives relayed through another server, not directly from devices
 

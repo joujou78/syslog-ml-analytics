@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import clickhouse_connect
 import joblib
 from drain3 import TemplateMiner
+from drain3.file_persistence import FilePersistence
 from drain3.template_miner_config import TemplateMinerConfig
 
 import state_db
@@ -45,6 +46,14 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500"))
 BATCH_FLUSH_SECONDS = float(os.environ.get("BATCH_FLUSH_SECONDS", "2"))
 INVENTORY_REFRESH_SECONDS = float(os.environ.get("INVENTORY_REFRESH_SECONDS", "60"))
 POLL_IDLE_SECONDS = 0.5
+
+DRAIN3_STATE_FILE = os.environ.get("DRAIN3_STATE_FILE", "/var/lib/syslog-ml/drain3_state.bin")
+DRAIN3_SNAPSHOT_INTERVAL_MINUTES = float(os.environ.get("DRAIN3_SNAPSHOT_INTERVAL_MINUTES", "10"))
+# A template is flagged is_anomaly while its Drain3 cluster has matched this
+# many messages or fewer (in the cluster's whole lifetime, not per-window) --
+# i.e. it's new or still rare, not yet part of this device's normal traffic.
+# Unsupervised on purpose: no labeled anomaly data exists yet (see README).
+ANOMALY_RARE_THRESHOLD = int(os.environ.get("ANOMALY_RARE_THRESHOLD", "5"))
 
 INSERT_COLUMNS = [
     "event_time", "source_ip", "hostname", "reported_hostname", "vendor", "model",
@@ -126,7 +135,16 @@ def build_template_miner():
     # configparser.read(None) raises, so just skip calling it entirely.
     config = TemplateMinerConfig()
     config.profiling_enabled = False
-    return TemplateMiner(config=config)
+    config.snapshot_interval_minutes = DRAIN3_SNAPSHOT_INTERVAL_MINUTES
+    # Without persistence, every cluster starts from zero on each restart --
+    # is_anomaly would then flag a burst of "new" templates after every
+    # restart even for traffic that's actually routine. FilePersistence
+    # snapshots cluster state periodically and reloads it on startup
+    # (verified: a fresh TemplateMiner pointed at an existing snapshot file
+    # resumes prior cluster_size counts rather than starting over).
+    os.makedirs(os.path.dirname(DRAIN3_STATE_FILE), exist_ok=True)
+    persistence = FilePersistence(DRAIN3_STATE_FILE)
+    return TemplateMiner(persistence_handler=persistence, config=config)
 
 
 def classify(model, message):
@@ -214,12 +232,14 @@ def to_row(record, miner, model, inventory, state_conn, seen_unresolved):
         record, inventory, state_conn, seen_unresolved
     )
 
+    is_anomaly = 1 if cluster["cluster_size"] <= ANOMALY_RARE_THRESHOLD else 0
+
     return [
         event_time, source_ip, hostname, reported_hostname, vendor, dev_model, resolution_method,
         record.get("facility", "unknown"), severity, severity_rank(severity),
         record.get("program", "unknown"), pid, message,
         str(cluster["cluster_id"]), cluster["template_mined"],
-        category, confidence, 0, record.get("raw", message),
+        category, confidence, is_anomaly, record.get("raw", message),
     ]
 
 

@@ -16,6 +16,7 @@ Environment=STATE_DB=/var/lib/syslog-ml/state.db
 Environment=CLICKHOUSE_HOST=localhost
 Environment=CLICKHOUSE_PORT=8123
 Environment=MODEL_PATH=/var/lib/syslog-ml/classifier.joblib
+Environment=DRAIN3_STATE_FILE=/var/lib/syslog-ml/drain3_state.bin
 Restart=on-failure
 RestartSec=5
 

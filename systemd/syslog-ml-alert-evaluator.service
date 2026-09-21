@@ -1,0 +1,14 @@
+[Unit]
+Description=Syslog ML alert rule evaluator (one-shot, triggered by syslog-ml-alert-evaluator.timer)
+After=network.target clickhouse-server.service
+
+[Service]
+Type=oneshot
+User=syslog-ml
+Group=syslog-ml
+WorkingDirectory=/opt/syslog-ml/ml
+ExecStart=/opt/syslog-ml/venv/bin/python evaluate_alerts.py
+EnvironmentFile=/etc/syslog-ml/resolver.env
+EnvironmentFile=-/etc/syslog-ml/clickhouse.env
+Environment=CLICKHOUSE_HOST=localhost
+Environment=CLICKHOUSE_PORT=8123

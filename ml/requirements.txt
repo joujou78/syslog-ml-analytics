@@ -5,3 +5,4 @@ joblib==1.4.2
 numpy==1.26.4
 psycopg2-binary==2.9.9
 cryptography==43.0.1
+requests==2.32.3

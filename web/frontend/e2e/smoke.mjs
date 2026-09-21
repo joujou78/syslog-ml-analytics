@@ -40,7 +40,9 @@ page.on('response', (response) => {
 })
 
 const isExpectedFailure = (f) =>
-  f.url.includes('/api/devices') || (f.url.includes('/api/auth/login') && f.status === 401)
+  f.url.includes('/api/devices') ||
+  f.url.includes('/api/logs') ||
+  (f.url.includes('/api/auth/login') && f.status === 401)
 
 console.log('1. Load app while logged out -> should redirect to /login')
 await page.goto(base + '/')
@@ -87,7 +89,41 @@ await row.locator('button:has-text("Delete")').click()
 await page.waitForSelector(`td.mono:has-text("${testIp}")`, { state: 'detached' })
 console.log('   OK, cleaned up')
 
-console.log('8. Log out -> back to /login, and protected route redirects again')
+console.log('8. Open Log Search page (tolerating ClickHouse-not-running errors)')
+await page.click('text=Log Search')
+await page.waitForURL('**/logs')
+await page.waitForSelector('h2')
+await page.fill('input[placeholder*="authentication failure"]', 'test keyword')
+await page.click('button:has-text("Search")')
+await page.waitForTimeout(500)
+console.log('   OK, page loaded and search submitted without an uncaught exception')
+
+console.log('9. Create, edit, and delete an alert rule (Postgres-only -- no ClickHouse needed)')
+await page.click('text=Alerts')
+await page.waitForURL('**/alerts')
+await page.waitForSelector('h3:has-text("Add rule")')
+const ruleName = `e2e-rule-${Date.now()}`
+await page.fill('form.credential-form input[required]', ruleName)
+await page.click('button:has-text("Add rule")')
+await page.waitForSelector(`td:has-text("${ruleName}")`)
+await page.reload()
+await page.waitForSelector(`td:has-text("${ruleName}")`)
+const ruleRow = page.locator('tr', { has: page.locator(`td:has-text("${ruleName}")`) })
+await ruleRow.locator('button:has-text("Edit")').click()
+await page.locator('label:has-text("Threshold") input').fill('7')
+await page.click('button:has-text("Save changes")')
+await page.waitForFunction(
+  (name) => [...document.querySelectorAll('tr')].some((r) => r.textContent.includes(name) && r.textContent.includes('7 event')),
+  ruleName,
+  { timeout: 3000 },
+)
+const conditionText = await ruleRow.locator('td').nth(2).textContent()
+page.once('dialog', (d) => d.accept())
+await ruleRow.locator('button:has-text("Delete")').click()
+await page.waitForSelector(`td:has-text("${ruleName}")`, { state: 'detached' })
+console.log('   OK, rule created, persisted after reload, edited, and cleaned up')
+
+console.log('10. Log out -> back to /login, and protected route redirects again')
 await page.click('text=Log out')
 await page.waitForURL('**/login')
 await page.goto(base + '/credentials')

@@ -86,3 +86,37 @@ export interface LogSearchResponse {
   offset: number
   has_more: boolean
 }
+
+export interface AlertRuleInput {
+  name: string
+  enabled: boolean
+  window_minutes: number
+  threshold: number
+  cooldown_minutes: number
+  hostname?: string
+  source_ip?: string
+  program?: string
+  severity?: string
+  predicted_category?: string
+  only_anomalies: boolean
+  webhook_url?: string
+}
+
+export interface AlertRule extends AlertRuleInput {
+  id: string
+  last_triggered_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface AlertEvent {
+  id: string
+  rule_id: string
+  triggered_at: string
+  window_start: string
+  window_end: string
+  matched_count: number
+  sample_message: string
+  notified: boolean
+  notify_error: string | null
+}

@@ -76,6 +76,58 @@ class ClassificationFeedback(Base):
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AlertRule(Base):
+    """
+    A rule is the same shape of filter as log search (hostname/source_ip/
+    program/severity/predicted_category, plus an anomaly-only toggle) with
+    a count threshold over a trailing window -- deliberately not a general
+    expression language, since every condition anyone has asked for so far
+    reduces to "N or more matching events in the last M minutes".
+    Evaluated by ml/evaluate_alerts.py, not by this web process.
+    """
+    __tablename__ = "alert_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+
+    window_minutes: Mapped[int] = mapped_column(nullable=False, default=5)
+    threshold: Mapped[int] = mapped_column(nullable=False, default=1)
+    cooldown_minutes: Mapped[int] = mapped_column(nullable=False, default=15)
+
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    program: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    predicted_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    only_anomalies: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+    webhook_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    last_triggered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AlertEvent(Base):
+    """One row per time a rule actually fired (after its cooldown allowed it)."""
+    __tablename__ = "alert_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    rule_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("alert_rules.id"), index=True, nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    matched_count: Mapped[int] = mapped_column(nullable=False)
+    sample_message: Mapped[str] = mapped_column(String, nullable=False, default="")
+    notified: Mapped[bool] = mapped_column(default=False, nullable=False)
+    notify_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
+    rule: Mapped["AlertRule"] = relationship()
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
 

@@ -1,8 +1,8 @@
 # Syslog ML Analytics — Web App
 
 FastAPI + Postgres backend, React (Vite + TypeScript) frontend. Provides
-device/credential management and log search now, with an ML feedback/
-correction loop planned as a later phase (see "Roadmap" below).
+device/credential management, log search, and alerting now, with an ML
+feedback/correction loop planned as a later phase (see "Roadmap" below).
 
 **Log search** (`GET /api/logs/search`, "Log Search" in the nav) is a
 filtered, paginated query straight over `syslog_ml.events` in ClickHouse —
@@ -14,6 +14,15 @@ over the match set, since an unbounded count on a table sized for
 high-volume retention is the expensive query the skip indexes in
 `clickhouse/init.sql` exist to help you avoid, not something to run on
 every search.
+
+**Alerts** ("Alerts" in the nav) manage `alert_rules` here in Postgres
+(name, enabled, window/threshold/cooldown, the same filter fields as log
+search, an "anomalies only" toggle, and an optional webhook URL); a
+separate process, `ml/evaluate_alerts.py`, does the actual evaluation
+against ClickHouse and writes `alert_events` — see the pipeline README's
+"Alerting" section for how that worker runs. Rule management is
+admin/analyst; viewing rules and history is open to any authenticated
+role, same split as `/devices`.
 
 ## Why this stack
 
@@ -184,18 +193,30 @@ then log in with the admin account from Step 2.
 - Tested in this session against a real local Postgres and a real browser
   (Playwright) for the full auth/RBAC/credential-CRUD/persistence flow —
   not tested against a live ClickHouse (none available in this sandbox),
-  so the Devices page's actual data rendering (as opposed to its error
-  handling, which was exercised) is unverified until you run it against
-  your real ClickHouse instance.
+  so the Devices, Log Search, and Alerts pages' actual data rendering (as
+  opposed to their error handling, which was exercised) is unverified
+  until you run them against your real ClickHouse instance.
+- The alert rule CRUD (create/list/update/delete/history) was verified
+  against a real local Postgres, and `ml/evaluate_alerts.py`'s rule
+  evaluation, cooldown logic, and webhook delivery were verified end to end
+  against that same Postgres plus a mock ClickHouse client and a real local
+  HTTP server standing in for a webhook receiver — not against your actual
+  network traffic, so confirm a rule fires as expected on real data before
+  relying on it.
 - Password reset / account recovery isn't built — the only way to regain
   access if the sole admin's password is lost is `scripts/create_admin.py`
   won't help (it refuses existing usernames) or a manual DB update.
 
 ## Roadmap (not yet built)
 
-- **Log search & investigation**: filterable/paginated view over
-  `syslog_ml.events` in ClickHouse.
 - **ML feedback loop**: the `classification_feedback` table already exists
   (see `app/db/models.py`) but has no API/UI yet — review predicted
   categories, correct wrong ones, feed corrections back into
   `ml/train_classifier.py`.
+- **Event correlation**: grouping related events (e.g. several anomalies
+  from the same host in a short window) into a single "incident" rather
+  than one alert per event. Not built — alerting fires per rule match, not
+  per correlated group.
+- **Alert notification channels beyond a webhook** (email/SMS): the
+  evaluator only POSTs a webhook today; see the pipeline README's
+  "Alerting" section for why.
