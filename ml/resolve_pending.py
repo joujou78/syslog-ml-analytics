@@ -17,7 +17,13 @@ from datetime import datetime, timezone
 import clickhouse_connect
 
 import state_db
-from device_resolver import load_credentials, find_credential, resolve_via_snmp
+from device_resolver import (
+    find_candidate_credentials,
+    is_exact_host_credential,
+    load_credentials,
+    resolve_with_discovery,
+    save_discovered_credential,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("resolve_pending")
@@ -79,16 +85,19 @@ def main():
 
     for row in due_rows:
         ip = row["ip"]
-        credential = find_credential(credentials, ip)
+        candidates = find_candidate_credentials(credentials, ip)
 
-        if credential is None:
+        if not candidates:
             conn.execute(
                 "UPDATE pending_ips SET status='no_credential', last_attempt=?, attempt_count=attempt_count+1 WHERE ip=?",
                 (now_iso(), ip),
             )
             continue
 
-        result = resolve_via_snmp(ip, credential)
+        # Tries each matching credential (an exact host entry first, if one
+        # already exists; otherwise every pool candidate in turn) until one
+        # gets a real SNMP response -- see resolve_with_discovery's docstring.
+        result, matched = resolve_with_discovery(ip, candidates)
         if result is None:
             attempt_count = row["attempt_count"] + 1
             status = "unreachable" if attempt_count >= MAX_ATTEMPTS_BEFORE_BACKOFF else "pending"
@@ -96,7 +105,7 @@ def main():
                 "UPDATE pending_ips SET status=?, last_attempt=?, attempt_count=? WHERE ip=?",
                 (status, now_iso(), attempt_count, ip),
             )
-            log.warning("SNMP resolution failed for %s (attempt %d)", ip, attempt_count)
+            log.warning("SNMP resolution failed for %s (attempt %d, %d credential(s) tried)", ip, attempt_count, len(candidates))
             continue
 
         hostname, vendor, model = result
@@ -107,6 +116,11 @@ def main():
         )
         conn.execute("DELETE FROM pending_ips WHERE ip=?", (ip,))
         log.info("Resolved %s -> hostname=%s vendor=%s", ip, hostname, vendor)
+
+        # A pool community (not already this IP's own exact credential)
+        # matched -- save it so future cycles query this device directly.
+        if not is_exact_host_credential(matched, ip):
+            save_discovered_credential(DATABASE_URL, CREDENTIAL_ENCRYPTION_KEY, ip, matched)
 
     conn.commit()
     conn.close()

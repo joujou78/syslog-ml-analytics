@@ -11,6 +11,15 @@ always with `resolution_method` recorded so you can see exactly how
 confident each row's identity is (and which devices still need a
 credential added through the web UI).
 
+A credential "pool" is the one exception worth calling out: a scope like
+0.0.0.0/0 can hold many community-string candidates at once (added via
+the web app's bulk import), for when an admin has a known, finite set of
+communities in use across their devices but no per-IP mapping. Resolution
+still only ever tries a community an admin explicitly entered as theirs
+-- never an unknown/default string -- against an IP that has already sent
+this VM syslog traffic. See resolve_with_discovery() and
+save_discovered_credential() below.
+
 Uses the net-snmp CLI (`snmpget`) via subprocess rather than a Python SNMP
 library: it's what `apt install snmp` gives you natively on Ubuntu/Debian,
 handles v1/v2c/v3 uniformly, and one subprocess call per OID is plenty fast
@@ -19,6 +28,7 @@ for periodic (not per-message) resolution.
 import ipaddress
 import logging
 import subprocess
+import uuid
 
 import psycopg2
 import psycopg2.extras
@@ -144,6 +154,21 @@ def find_credential(credentials, ip):
     return None
 
 
+def find_candidate_credentials(credentials, ip):
+    """Like find_credential(), but returns every matching credential
+    (already most-specific first, since `credentials` is pre-sorted) --
+    used to try each pool candidate in turn rather than stopping at the
+    first (possibly stale) match."""
+    return [cred for cred in credentials if cred.contains(ip)]
+
+
+def is_exact_host_credential(credential, ip):
+    """True if this credential's scope already IS this specific IP (a
+    /32 host entry), meaning there's nothing new to auto-save -- it was
+    already a per-device credential, not a pool match."""
+    return credential.network.num_addresses == 1 and str(credential.network.network_address) == ip
+
+
 def _snmpget(ip, oid, credential):
     cmd = ["snmpget", "-O", "qv", "-t", str(SNMP_TIMEOUT_SECONDS), "-r", str(SNMP_RETRIES)]
     cmd += credential.snmpget_args()
@@ -176,3 +201,68 @@ def resolve_via_snmp(ip, credential):
     vendor = vendor_from_object_id(sys_object_id)
     model = sys_descr[:200]
     return sys_name or ip, vendor, model
+
+
+def resolve_with_discovery(ip, candidates):
+    """
+    Tries each candidate credential against `ip`, most specific first,
+    until one gets a real SNMP response. Returns (result, matched_credential)
+    or (None, None) if none worked. Never assumes a match -- every attempt
+    is a real SNMP round-trip, and `candidates` only ever contains
+    communities/users an admin explicitly entered (see load_credentials).
+    """
+    for credential in candidates:
+        result = resolve_via_snmp(ip, credential)
+        if result is not None:
+            return result, credential
+    return None, None
+
+
+def save_discovered_credential(database_url, encryption_key, ip, credential):
+    """
+    Persists the credential that just worked for `ip` as that IP's own
+    exact-host (/32) entry, so future cycles query it directly instead of
+    re-trying the whole pool. Upserts by exact ip_or_cidr match rather than
+    relying on a database constraint, since snmp_credentials.ip_or_cidr is
+    deliberately not unique any more (a pool has many rows sharing one
+    broad scope). Only ever called for v1/v2c (community-based) matches --
+    v3 has no equivalent "pool of usernames" concept, so it always requires
+    an exact per-device credential to begin with.
+    """
+    fernet = Fernet(encryption_key.encode())
+
+    def encrypt(value):
+        return fernet.encrypt(value.encode()).decode() if value else None
+
+    try:
+        conn = psycopg2.connect(database_url)
+    except psycopg2.OperationalError:
+        log.exception("Could not connect to the credentials database -- skipping auto-save for %s", ip)
+        return
+
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM snmp_credentials WHERE ip_or_cidr = %s", (ip,))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE snmp_credentials
+                    SET version = %s, community_encrypted = %s, auto_discovered = true, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (credential.version, encrypt(credential.community), existing[0]),
+                )
+                log.info("Updated auto-discovered credential for %s (its community changed)", ip)
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO snmp_credentials
+                        (id, ip_or_cidr, version, community_encrypted, auto_discovered, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, true, now(), now())
+                    """,
+                    (str(uuid.uuid4()), ip, credential.version, encrypt(credential.community)),
+                )
+                log.info("Auto-discovered and saved a credential for %s", ip)
+    finally:
+        conn.close()

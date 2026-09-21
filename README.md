@@ -42,12 +42,14 @@ service to operate.
 
 ## Why this design, and what it deliberately doesn't do
 
-- **No SNMP credential guessing.** Since communities aren't centrally
-  tracked, the resolver only ever attempts SNMP for an IP that has a row in
-  the `snmp_credentials` table (Postgres, encrypted at rest, managed
-  through the web app's admin UI — see `web/README.md`) — never a
-  default/common-string guess. Add rows as you onboard devices; everything
-  else keeps working in the meantime.
+- **No SNMP credential guessing.** The resolver only ever attempts SNMP
+  with a community/user an admin explicitly entered in the
+  `snmp_credentials` table (Postgres, encrypted at rest, managed through
+  the web app's admin UI — see `web/README.md`) — never a default/common
+  string nobody entered. A "credential pool" (see below) is still this
+  same rule, not an exception to it: it just lets one scope hold several
+  admin-entered candidates instead of one, for when you have a known set
+  of communities but no per-device mapping yet.
 - **Identity has three tiers, always labeled:** `resolution_method` on every
   event is `snmp` (verified via sysName), `syslog_reported` (the device's
   own hostname claim, unverified), or `unresolved` (source IP only). The
@@ -254,12 +256,13 @@ sudo systemctl restart rsyslog
 
 sudo cp systemd/syslog-ml-classifier.service systemd/syslog-ml-resolver.service systemd/syslog-ml-resolver.timer /etc/systemd/system/
 sudo cp systemd/syslog-ml-alert-evaluator.service systemd/syslog-ml-alert-evaluator.timer /etc/systemd/system/
+sudo cp systemd/syslog-ml-reverify.service systemd/syslog-ml-reverify.timer /etc/systemd/system/
 
-# The resolver AND the alert evaluator need credentials for the shared
-# Postgres DB (the alert evaluator only reads DATABASE_URL out of this
-# file, ignores CREDENTIAL_ENCRYPTION_KEY) + the same Fernet key the web
-# app encrypts SNMP secrets with (see web/README.md Step 3 for the
-# matching web-api.env):
+# The resolver, the alert evaluator, and the re-verify job all need
+# credentials for the shared Postgres DB (the alert evaluator only reads
+# DATABASE_URL out of this file, ignores CREDENTIAL_ENCRYPTION_KEY) + the
+# same Fernet key the web app encrypts SNMP secrets with (see
+# web/README.md Step 3 for the matching web-api.env):
 sudo cp systemd/syslog-ml-resolver.env.example /etc/syslog-ml/resolver.env
 sudo $EDITOR /etc/syslog-ml/resolver.env
 sudo chmod 600 /etc/syslog-ml/resolver.env
@@ -269,6 +272,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now syslog-ml-classifier.service
 sudo systemctl enable --now syslog-ml-resolver.timer
 sudo systemctl enable --now syslog-ml-alert-evaluator.timer
+sudo systemctl enable --now syslog-ml-reverify.timer
 ```
 
 **Checkpoint:**
@@ -345,6 +349,51 @@ compatibility, so that pattern lands in a `cisco_like` bucket rather than
 claiming a specific one of those four. Add an SNMP credential for a device
 whenever you want its vendor (and hostname) actually confirmed rather than
 guessed.
+
+### Credential pools: resolving many devices without a per-IP mapping
+
+If you have a known, finite set of SNMP community strings in use across
+your devices but no record of which IP uses which one, entering one
+credential per device by hand doesn't scale. The web app's SNMP
+Credentials page has a **bulk import** for exactly this: paste your
+communities (one per line) under one shared scope (e.g. `0.0.0.0/0`), and
+each becomes its own candidate row in `snmp_credentials`.
+
+**This is still never guessing an unknown/default string** — every
+candidate is one an admin explicitly entered as theirs, and SNMP is only
+ever attempted against an IP that has already sent this VM syslog
+traffic, never an arbitrary address. What changes is only *how many*
+admin-entered candidates get tried per device instead of assuming there's
+exactly one.
+
+How resolution uses a pool:
+1. **Fast path**: if a device already has its own exact-host (`/32`)
+   credential — either entered by hand or auto-discovered previously —
+   that's tried first, alone.
+2. **Discovery**: if not, `resolve_pending.py` tries each pool candidate
+   against the device (real SNMP round-trips, most specific credential
+   first) until one actually responds.
+3. **Auto-save**: the first community that works for a device is saved as
+   that device's own `/32` credential, tagged `auto_discovered` (visible
+   and editable in the Credentials page) — future cycles query that
+   device directly instead of re-trying the whole pool.
+4. **Twice-daily self-heal**: `syslog-ml-reverify.timer` (see Step 5)
+   re-checks every already-resolved device. If its saved credential still
+   works, nothing changes. If the community has since rotated, it
+   re-tries the pool and updates the saved credential to whichever new
+   one matches — so a rotated community heals itself within half a day
+   rather than silently going stale.
+
+**One honest scaling caveat**: discovering a *brand-new* device tries
+pool candidates one at a time, each a real SNMP round-trip with its own
+timeout — with "dozens to a few hundred" candidates, resolving one
+never-before-seen device can take a while (worst case, if none of them
+match, every single one times out). This runs in the background
+(`resolve_pending.py`, every 10 minutes) and never blocks log ingestion,
+but if you have many brand-new devices appearing at once and resolution
+feels slow, that's expected with a large pool, not a bug — the fast path
+in step 1 above is what keeps steady-state resolution quick once each
+device's credential has been discovered.
 
 ### If syslog arrives relayed through another server, not directly from devices
 
@@ -475,11 +524,12 @@ prefers a real `category` field over the weak-supervision guess.
 - `rsyslog/60-syslog-ml.conf` — mirrors rsyslog's feed to a local JSON file.
 - `snmptrapd/` — optional SNMP trap receiver config, feeding traps into the same pipeline via local syslog.
 - `ml/consumer.py` — tails the file, resolves identity, classifies, writes to ClickHouse.
-- `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver (reads credentials from Postgres, see `web/`).
+- `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver, including credential-pool discovery/auto-save (reads credentials from Postgres, see `web/`).
+- `ml/reverify_devices.py` — twice-daily re-check of already-resolved devices; self-heals an auto-discovered credential if its community rotates.
 - `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.
 - `ml/labeling_rules.py` — weak-supervision category rules (tune for your vendors).
 - `ml/train_classifier.py` — trains the TF-IDF + linear SVM classifier.
 - `ml/evaluate_alerts.py` — evaluates alert rules against ClickHouse, fires webhooks.
-- `systemd/` — unit files for the classifier, resolver timer, and alert evaluator timer.
+- `systemd/` — unit files for the classifier, resolver timer, alert evaluator timer, and re-verify timer.
 - `grafana/` — provisioned datasource + starter dashboard.
 - `web/` — FastAPI + React admin app for managing SNMP credentials and viewing device status (see `web/README.md`).

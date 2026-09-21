@@ -1,0 +1,14 @@
+[Unit]
+Description=Syslog ML device re-verification (one-shot, triggered by syslog-ml-reverify.timer)
+After=network.target clickhouse-server.service
+
+[Service]
+Type=oneshot
+User=syslog-ml
+Group=syslog-ml
+WorkingDirectory=/opt/syslog-ml/ml
+ExecStart=/opt/syslog-ml/venv/bin/python reverify_devices.py
+EnvironmentFile=/etc/syslog-ml/resolver.env
+EnvironmentFile=-/etc/syslog-ml/clickhouse.env
+Environment=CLICKHOUSE_HOST=localhost
+Environment=CLICKHOUSE_PORT=8123

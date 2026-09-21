@@ -13,6 +13,7 @@ export interface Credential {
   id: string
   ip_or_cidr: string
   version: SnmpVersion
+  auto_discovered: boolean
   v3_user: string | null
   v3_level: string | null
   created_at: string
@@ -20,6 +21,12 @@ export interface Credential {
   has_community: boolean
   has_v3_auth: boolean
   has_v3_priv: boolean
+}
+
+export interface CredentialPoolImportInput {
+  ip_or_cidr: string
+  version: 'v1' | 'v2c'
+  communities: string[]
 }
 
 export interface CredentialInput {

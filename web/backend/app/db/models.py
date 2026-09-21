@@ -32,12 +32,23 @@ class SnmpCredential(Base):
     (opt-in, per-IP/subnet SNMP creds for the resolver, never a guessed
     default), now with an admin-only UI, audit trail, and encryption at
     rest for community/passphrase fields instead of a plaintext file.
+
+    ip_or_cidr is intentionally NOT unique: a "credential pool" entry
+    (many rows sharing one broad ip_or_cidr, e.g. 0.0.0.0/0, each with a
+    different community) lets the resolver try each known community
+    against a device until one actually authenticates via a real SNMP
+    response -- never a blind guess of an unknown/default string, only
+    ever from communities the admin has explicitly entered as theirs.
+    Once one matches a specific IP, the resolver saves it as that IP's
+    own credential (auto_discovered=True) so future cycles query that
+    device directly instead of re-trying the whole pool.
     """
     __tablename__ = "snmp_credentials"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    ip_or_cidr: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    ip_or_cidr: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     version: Mapped[str] = mapped_column(String(8), nullable=False)  # v1 | v2c | v3
+    auto_discovered: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     # v1/v2c
     community_encrypted: Mapped[str | None] = mapped_column(String(512), nullable=True)

@@ -21,6 +21,13 @@ export function Credentials() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
+  const [poolScope, setPoolScope] = useState('0.0.0.0/0')
+  const [poolVersion, setPoolVersion] = useState<'v1' | 'v2c'>('v2c')
+  const [poolCommunities, setPoolCommunities] = useState('')
+  const [poolError, setPoolError] = useState<string | null>(null)
+  const [poolResult, setPoolResult] = useState<string | null>(null)
+  const [poolSubmitting, setPoolSubmitting] = useState(false)
+
   const load = () => credentialsApi.list().then(setCredentials).catch(() => setError('Could not load credentials'))
 
   useEffect(() => {
@@ -70,6 +77,28 @@ export function Credentials() {
     if (!confirm('Delete this credential? Devices matching it will stop resolving via SNMP.')) return
     await credentialsApi.remove(id)
     await load()
+  }
+
+  const handlePoolImport = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setPoolError(null)
+    setPoolResult(null)
+    const communities = poolCommunities.split('\n').map((c) => c.trim()).filter(Boolean)
+    if (communities.length === 0) {
+      setPoolError('Paste at least one community string, one per line')
+      return
+    }
+    setPoolSubmitting(true)
+    try {
+      const res = await credentialsApi.importPool({ ip_or_cidr: poolScope, version: poolVersion, communities })
+      setPoolResult(`Imported ${res.imported} candidate credential(s) scoped to ${poolScope}.`)
+      setPoolCommunities('')
+      await load()
+    } catch (err: any) {
+      setPoolError(err?.response?.data?.detail ?? 'Could not import the credential pool')
+    } finally {
+      setPoolSubmitting(false)
+    }
   }
 
   return (
@@ -185,6 +214,45 @@ export function Credentials() {
         </div>
       </form>
 
+      <form className="credential-form" onSubmit={handlePoolImport}>
+        <h3>Bulk import a community pool</h3>
+        <p className="page-hint">
+          Have a known set of community strings but no per-device mapping? Paste them here (one per line). The
+          resolver tries each one against a device until it gets a real SNMP response, then saves the one that
+          worked as that device's own credential (tagged "auto-discovered" below) so future checks query it
+          directly instead of re-trying the whole pool.
+        </p>
+        <div className="form-grid">
+          <label>
+            Scope (IP or CIDR these communities apply to)
+            <input value={poolScope} onChange={(e) => setPoolScope(e.target.value)} placeholder="0.0.0.0/0" required />
+          </label>
+          <label>
+            SNMP version
+            <select value={poolVersion} onChange={(e) => setPoolVersion(e.target.value as 'v1' | 'v2c')}>
+              <option value="v2c">v2c</option>
+              <option value="v1">v1</option>
+            </select>
+          </label>
+        </div>
+        <label>
+          Community strings (one per line)
+          <textarea
+            value={poolCommunities}
+            onChange={(e) => setPoolCommunities(e.target.value)}
+            rows={8}
+            placeholder={'community1\ncommunity2\ncommunity3'}
+          />
+        </label>
+        {poolError && <p className="form-error">{poolError}</p>}
+        {poolResult && <p className="page-hint">{poolResult}</p>}
+        <div className="form-actions">
+          <button type="submit" disabled={poolSubmitting}>
+            Import pool
+          </button>
+        </div>
+      </form>
+
       <table className="data-table">
         <thead>
           <tr>
@@ -198,7 +266,15 @@ export function Credentials() {
         <tbody>
           {credentials?.map((c) => (
             <tr key={c.id}>
-              <td className="mono">{c.ip_or_cidr}</td>
+              <td className="mono">
+                {c.ip_or_cidr}
+                {c.auto_discovered && (
+                  <span className="vendor-hint" title="Automatically saved after a pool community matched this device via SNMP">
+                    {' '}
+                    (auto-discovered)
+                  </span>
+                )}
+              </td>
               <td>{c.version}</td>
               <td>{c.version === 'v3' ? `user=${c.v3_user}, level=${c.v3_level}` : c.has_community ? 'community set' : 'no community set'}</td>
               <td>{new Date(c.updated_at).toLocaleString()}</td>

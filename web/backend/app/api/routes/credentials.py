@@ -1,14 +1,14 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_role
 from app.db.base import get_db
 from app.db.models import Role, User
-from app.schemas.credential import CredentialCreate, CredentialRead, CredentialUpdate
+from app.schemas.credential import CredentialCreate, CredentialPoolImport, CredentialRead, CredentialUpdate
 from app.services import credential_service
+from app.services.credential_service import DuplicateCredentialError
 
 router = APIRouter(prefix="/credentials", tags=["credentials"])
 
@@ -28,9 +28,16 @@ async def create_credential(
 ):
     try:
         return await credential_service.create_credential(db, payload, admin)
-    except IntegrityError:
-        await db.rollback()
+    except DuplicateCredentialError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A credential for this IP/CIDR already exists")
+
+
+@router.post("/bulk-pool", status_code=status.HTTP_201_CREATED)
+async def import_credential_pool(
+    payload: CredentialPoolImport, db: AsyncSession = Depends(get_db), admin: User = Depends(_admin_only)
+):
+    count = await credential_service.import_pool(db, payload, admin)
+    return {"imported": count}
 
 
 @router.put("/{credential_id}", response_model=CredentialRead)

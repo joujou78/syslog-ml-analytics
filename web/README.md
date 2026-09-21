@@ -37,6 +37,11 @@ role, same split as `/devices`.
   encryption at rest (Fernet), and an audit trail instead of a flat file
   anyone with VM access could read in plaintext. `ml/device_resolver.py`
   reads from this same table now — one source of truth.
+- **Bulk credential pool import** (Credentials page): for a known set of
+  community strings with no per-device mapping, paste them all under one
+  shared scope instead of entering devices one at a time. See the pipeline
+  README's "Credential pools" section for how the resolver uses this to
+  discover and auto-save each device's own credential.
 - **React SPA**: the app has real interactive state (forms, filters, role-
   gated views) that suits client-side routing better than server-rendered
   pages.
@@ -220,6 +225,15 @@ then log in with the admin account from Step 2.
   HTTP server standing in for a webhook receiver — not against your actual
   network traffic, so confirm a rule fires as expected on real data before
   relying on it.
+- The credential pool's bulk import, the fast-path/discovery/auto-save
+  logic in `device_resolver.py`, and the upsert-on-rotation behavior in
+  `save_discovered_credential()` were all verified end to end against a
+  real local Postgres, with SNMP itself mocked (no real network devices
+  reachable from this sandbox) to simulate a pool where only one of
+  several candidates responds. The actual `snmpget` calls against your
+  real devices are unverified until you run this against them — if
+  resolution behaves unexpectedly, check `journalctl -u syslog-ml-resolver`
+  for which credential(s) were tried.
 - Password reset / account recovery isn't built — the only way to regain
   access if the sole admin's password is lost is `scripts/create_admin.py`
   won't help (it refuses existing usernames) or a manual DB update.

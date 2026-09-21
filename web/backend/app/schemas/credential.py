@@ -46,6 +46,7 @@ class CredentialRead(BaseModel):
     id: uuid.UUID
     ip_or_cidr: str
     version: str
+    auto_discovered: bool
     v3_user: str | None
     v3_level: str | None
     created_at: datetime
@@ -53,3 +54,35 @@ class CredentialRead(BaseModel):
     has_community: bool = False
     has_v3_auth: bool = False
     has_v3_priv: bool = False
+
+
+class CredentialPoolImport(BaseModel):
+    """
+    Bulk-adds many candidate community strings under one shared scope
+    (e.g. "0.0.0.0/0") -- for when you have a known, finite set of
+    communities in use across your devices but no per-IP mapping of which
+    one belongs to which device. The resolver tries each one against a
+    device until it gets a real SNMP response; see the SnmpCredential
+    docstring in db/models.py for why this isn't the same thing as
+    guessing an unknown/default credential.
+    """
+    ip_or_cidr: str
+    version: Literal["v1", "v2c"]
+    communities: list[str]
+
+    @field_validator("ip_or_cidr")
+    @classmethod
+    def validate_network(cls, value: str) -> str:
+        try:
+            ipaddress.ip_network(value, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"{value!r} is not a valid IP address or CIDR range") from exc
+        return value
+
+    @field_validator("communities")
+    @classmethod
+    def validate_communities(cls, value: list[str]) -> list[str]:
+        cleaned = [c.strip() for c in value if c.strip()]
+        if not cleaned:
+            raise ValueError("At least one non-empty community string is required")
+        return cleaned

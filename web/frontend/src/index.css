@@ -38,13 +38,20 @@ button:disabled {
 }
 
 input,
-select {
+select,
+textarea {
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
   border-radius: 6px;
   padding: 8px 10px;
   font-size: 14px;
+  font-family: inherit;
+}
+
+textarea {
+  font-family: ui-monospace, monospace;
+  resize: vertical;
 }
 
 label {

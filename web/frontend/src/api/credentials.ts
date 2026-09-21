@@ -1,5 +1,5 @@
 import { apiClient } from './client'
-import type { Credential, CredentialInput } from '../types'
+import type { Credential, CredentialInput, CredentialPoolImportInput } from '../types'
 
 export const credentialsApi = {
   list: () => apiClient.get<Credential[]>('/credentials').then((r) => r.data),
@@ -7,4 +7,6 @@ export const credentialsApi = {
   update: (id: string, payload: CredentialInput) =>
     apiClient.put<Credential>(`/credentials/${id}`, payload).then((r) => r.data),
   remove: (id: string) => apiClient.delete(`/credentials/${id}`),
+  importPool: (payload: CredentialPoolImportInput) =>
+    apiClient.post<{ imported: number }>('/credentials/bulk-pool', payload).then((r) => r.data),
 }
