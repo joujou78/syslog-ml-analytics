@@ -29,8 +29,8 @@ network devices --syslog--> rsyslog (existing) ----------> LogAnalyzer DB (uncha
 ```
 
 There's also a web app (`web/`) for managing SNMP credentials through a UI
-instead of hand-editing files, viewing device/resolution status, and
-(planned) log search and ML feedback — see `web/README.md`. It's optional:
+instead of hand-editing files, viewing device/resolution status, searching
+logs, and (planned) ML feedback — see `web/README.md`. It's optional:
 the pipeline above works standalone with Grafana as the only UI.
 
 No message broker: one VM, one rsyslog instance receiving everything, so a

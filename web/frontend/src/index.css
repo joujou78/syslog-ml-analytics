@@ -268,3 +268,30 @@ label {
   font-size: 12px;
   padding: 4px 10px;
 }
+
+.log-message {
+  max-width: 480px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge-severity-emerg,
+.badge-severity-alert,
+.badge-severity-crit,
+.badge-severity-err {
+  background: rgba(229, 72, 77, 0.15);
+  color: var(--danger);
+}
+
+.badge-severity-warning {
+  background: rgba(245, 166, 35, 0.15);
+  color: var(--warn);
+}
+
+.badge-severity-notice,
+.badge-severity-info,
+.badge-severity-debug {
+  background: rgba(154, 160, 170, 0.15);
+  color: var(--text-dim);
+}

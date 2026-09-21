@@ -12,6 +12,7 @@ export function Layout() {
           <NavLink to="/" end>
             Devices
           </NavLink>
+          <NavLink to="/logs">Log Search</NavLink>
           {user?.role === 'admin' && <NavLink to="/credentials">SNMP Credentials</NavLink>}
         </nav>
         <div className="app-user">

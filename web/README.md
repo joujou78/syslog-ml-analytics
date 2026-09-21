@@ -1,8 +1,19 @@
 # Syslog ML Analytics — Web App
 
 FastAPI + Postgres backend, React (Vite + TypeScript) frontend. Provides
-device/credential management now, with log search and an ML feedback/
-correction loop planned as later phases (see "Roadmap" below).
+device/credential management and log search now, with an ML feedback/
+correction loop planned as a later phase (see "Roadmap" below).
+
+**Log search** (`GET /api/logs/search`, "Log Search" in the nav) is a
+filtered, paginated query straight over `syslog_ml.events` in ClickHouse —
+no new database, no new data path. Filters: time range (defaults to the
+last 24h), hostname, source IP, program, severity, category, and a
+case-insensitive keyword match on the message. It fetches one row past the
+page size to derive "more results exist" instead of running `COUNT(*)`
+over the match set, since an unbounded count on a table sized for
+high-volume retention is the expensive query the skip indexes in
+`clickhouse/init.sql` exist to help you avoid, not something to run on
+every search.
 
 ## Why this stack
 
