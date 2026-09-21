@@ -131,6 +131,23 @@ sudo -u syslog-ml SYSLOG_ML_DATABASE_URL=postgresql+asyncpg://syslog_ml:<passwor
 
 **Checkpoint** — confirm `alembic upgrade head` reports success and the admin script prints a user ID.
 
+### Applying a future migration (after `git pull` adds a new one)
+
+Every later `alembic upgrade head` needs `SYSLOG_ML_DATABASE_URL` set
+explicitly, same as above — without it, `Settings()`'s class default
+(`postgresql+asyncpg://syslog_ml:syslog_ml@localhost:5432/syslog_ml`, a
+dev-only placeholder password) silently applies instead of your real one,
+and alembic fails with "password authentication failed" that has nothing
+to do with the migration itself. Reuse the password already deployed
+rather than retyping it:
+
+```bash
+sudo grep SYSLOG_ML_DATABASE_URL /etc/syslog-ml/web-api.env
+cd /opt/syslog-ml/web/backend
+sudo -u syslog-ml SYSLOG_ML_DATABASE_URL='<value from the grep above>' .venv/bin/alembic upgrade head
+sudo systemctl restart syslog-ml-web-api
+```
+
 ### 3. Wire up the API systemd service and the resolver's shared credentials
 
 ```bash
