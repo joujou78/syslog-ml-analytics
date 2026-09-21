@@ -4,6 +4,14 @@ FastAPI + Postgres backend, React (Vite + TypeScript) frontend. Provides
 device/credential management, log search, and alerting now, with an ML
 feedback/correction loop planned as a later phase (see "Roadmap" below).
 
+**Devices** ("Devices" in the nav) is paginated (10/25/50/100/500 per page,
+same `has_more`-based approach as log search) and auto-refreshes its
+current page every 30 seconds in the background, since devices resolve
+and new ones appear continuously — no manual reload needed to stay
+current. The page size and current offset are preserved across
+auto-refreshes; only an explicit page-size change or Previous/Next click
+resets or moves the offset.
+
 **Log search** (`GET /api/logs/search`, "Log Search" in the nav) is a
 filtered, paginated query straight over `syslog_ml.events` in ClickHouse —
 no new database, no new data path. Filters: time range (defaults to the

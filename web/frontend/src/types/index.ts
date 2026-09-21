@@ -56,6 +56,13 @@ export interface Device {
   event_count: number
 }
 
+export interface DeviceListResponse {
+  items: Device[]
+  limit: number
+  offset: number
+  has_more: boolean
+}
+
 export interface ResolutionSummary {
   resolution_method: ResolutionMethod
   device_count: number

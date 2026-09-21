@@ -22,3 +22,10 @@ class DeviceRead(BaseModel):
 class ResolutionSummary(BaseModel):
     resolution_method: str
     device_count: int
+
+
+class DeviceListResponse(BaseModel):
+    items: list[DeviceRead]
+    limit: int
+    offset: int
+    has_more: bool
