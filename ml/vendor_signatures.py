@@ -26,8 +26,16 @@ RouterOS's own default "topic,severity: message" prefix also isn't
 present in the `message` field as delivered by this pipeline (rsyslog's
 parsing already splits that off into other fields), so the mikrotik
 patterns below match message *content* actually observed here instead:
-interface up/down, wireless scan-list and client-status lines, PPP dialer
-state, DHCP lease assignment, and admin login/logout.
+interface up/down, wireless scan-list/client-status/ACL lines, PPP dialer
+state, DHCP lease assign/release, SNTP time adjustment, and admin
+login/logout.
+
+Also found in real traffic: many messages arrive with a leading space in
+the `message` field (a common rsyslog artifact -- it often keeps the
+space between a syslog tag's ":" and the text that follows), which broke
+every pattern anchored to the start of the string, including ones that
+should already have matched. detect_vendor() strips the message before
+matching to fix this, rather than special-casing every pattern.
 """
 import re
 
@@ -36,12 +44,13 @@ _SIGNATURES = [
     ("juniper", re.compile(r"junos@2636\.1\.1\.1\.2"), "Junos structured-data field (2636 = Juniper's IANA enterprise number)"),
     ("paloalto", re.compile(r"^\d+,\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2},\d+,(TRAFFIC|THREAT|SYSTEM|CONFIG|HIPMATCH|GLOBALPROTECT|CORRELATION)"), "PAN-OS CSV log header"),
     ("fortinet", re.compile(r"\bdevname=\S+.*\blogid=\"?\d+\"?"), "FortiOS key=value log line with devname/logid fields"),
-    ("mikrotik", re.compile(r"^ether\d+ link (up|down)\b"), "RouterOS interface up/down message"),
+    ("mikrotik", re.compile(r"\bether\d+ link (up|down)\b"), "RouterOS interface up/down message"),
     ("mikrotik", re.compile(r"\bon \d+ AP: (yes|no) SSID\b"), "RouterOS wireless scan-list entry"),
-    ("mikrotik", re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}@wlan\d+\b", re.I), "RouterOS wireless client MAC associating on a wlan interface"),
-    ("mikrotik", re.compile(r"^wlan\d+: (failed to select network|no network that satisfies connect-list|must select network)\b"), "RouterOS wireless client status message"),
-    ("mikrotik", re.compile(r"^ppp-(in|out)\d+:"), "RouterOS PPP interface state message (dialing/authenticating/disconnecting)"),
-    ("mikrotik", re.compile(r"\bassigned \d{1,3}(\.\d{1,3}){3} to [0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}\b"), "RouterOS DHCP server lease assignment"),
+    ("mikrotik", re.compile(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}@wlan\d+\b", re.I), "RouterOS wireless client MAC connecting/disconnecting on a wlan interface"),
+    ("mikrotik", re.compile(r"\bwlan\d+:\s", re.I), "RouterOS wireless log line (client status, ACL, association attempts, etc.)"),
+    ("mikrotik", re.compile(r"\bppp-(in|out)\d+:"), "RouterOS PPP interface state message (dialing/authenticating/disconnecting)"),
+    ("mikrotik", re.compile(r"\b(de)?assigned \d{1,3}(\.\d{1,3}){3} (to|from) [0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}\b"), "RouterOS DHCP server lease assign/release"),
+    ("mikrotik", re.compile(r"^sntp change time .+ => .+", re.I), "RouterOS SNTP time adjustment"),
     ("mikrotik", re.compile(r"\blogged (in|out) from \S+ via \w+\b"), "RouterOS admin session login/logout message"),
     ("mikrotik", re.compile(r"^[a-z0-9]+(,[a-z0-9]+)*,(info|warning|error|critical|debug)\b"), "RouterOS topic(s),severity prefix (if not split into a separate field upstream)"),
     ("cisco_like", re.compile(r"%[A-Z0-9_]+-\d-[A-Z0-9_]+:"), "%FACILITY-SEVERITY-MNEMONIC: convention (Cisco, and often mimicked by Arista/HP/Dell) -- not anchored to message start since real devices often prefix a sequence number/timestamp first"),
@@ -50,6 +59,7 @@ _SIGNATURES = [
 
 def detect_vendor(message: str) -> str:
     """Returns a vendor string, or 'unknown' if no signature matches."""
+    message = (message or "").strip()
     for vendor, pattern, _description in _SIGNATURES:
         if pattern.search(message):
             return vendor
