@@ -109,9 +109,13 @@ def main():
             continue
 
         hostname, vendor, model = result
+        # device_inventory's first_seen/last_resolved are DateTime64 columns
+        # -- clickhouse-connect needs real datetime objects here (it calls
+        # .timestamp() on each value), not the ISO strings used elsewhere in
+        # this file for the sqlite state db's TEXT columns.
         ch_client.insert(
             "syslog_ml.device_inventory",
-            [[ip, hostname, vendor, model, "snmp", row["first_seen"], now_iso()]],
+            [[ip, hostname, vendor, model, "snmp", datetime.fromisoformat(row["first_seen"]), datetime.now(timezone.utc)]],
             column_names=["ip", "hostname", "vendor", "model", "resolution_method", "first_seen", "last_resolved"],
         )
         conn.execute("DELETE FROM pending_ips WHERE ip=?", (ip,))

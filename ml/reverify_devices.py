@@ -62,7 +62,12 @@ def main():
 
     refreshed = 0
     unreachable = 0
-    now_iso = datetime.now(timezone.utc).isoformat()
+    # device_inventory's first_seen/last_resolved are DateTime64 columns --
+    # clickhouse-connect needs a real datetime object here (it calls
+    # .timestamp() on each value), not an ISO string. first_seen comes back
+    # from the SELECT below as a real datetime already; last_resolved needs
+    # one built the same way.
+    now = datetime.now(timezone.utc)
 
     for ip, first_seen in devices:
         candidates = find_candidate_credentials(credentials, ip)
@@ -80,7 +85,7 @@ def main():
         hostname, vendor, model = result
         ch_client.insert(
             "syslog_ml.device_inventory",
-            [[ip, hostname, vendor, model, "snmp", first_seen, now_iso]],
+            [[ip, hostname, vendor, model, "snmp", first_seen, now]],
             column_names=["ip", "hostname", "vendor", "model", "resolution_method", "first_seen", "last_resolved"],
         )
         refreshed += 1
