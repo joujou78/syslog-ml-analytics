@@ -315,6 +315,35 @@ def _distinct_relayed_ip(candidate, network_source_ip):
     return candidate
 
 
+# Values devices fall back to when they have no real identity configured
+# (e.g. a RouterOS device with no /system identity set) -- not
+# distinguishing, so never worth treating as a device's identity even
+# though they're technically a non-empty, non-IP string.
+_GENERIC_RELAY_HOSTNAMES = {"localhost", "localhost.localdomain"}
+
+
+def _distinct_relayed_hostname(candidate, relay_hostname):
+    """
+    True if `candidate` (reported_hostname) is a real, distinguishing
+    hostname for a relayed event -- not an IP (that's _distinct_relayed_ip's
+    job, since only an IP can be SNMP-polled), not empty, not one of the
+    generic placeholders above, and not just an echo of the relay's own
+    already-known identity.
+    """
+    if not candidate:
+        return False
+    try:
+        ipaddress.ip_address(candidate)
+        return False
+    except ValueError:
+        pass
+    if candidate.lower() in _GENERIC_RELAY_HOSTNAMES:
+        return False
+    if relay_hostname and candidate == relay_hostname:
+        return False
+    return True
+
+
 def resolve_identity(record, inventory, state_conn, seen_unresolved):
     network_source_ip = record.get("source_ip", "unknown")
     reported_hostname = record.get("reported_hostname", "") or ""
@@ -326,6 +355,21 @@ def resolve_identity(record, inventory, state_conn, seen_unresolved):
         if origin_ip is not None:
             relayed_via = network_source_ip
             source_ip = origin_ip
+        else:
+            relay_known = inventory.lookup(network_source_ip)
+            relay_hostname = relay_known[0] if relay_known else None
+            if _distinct_relayed_hostname(reported_hostname, relay_hostname):
+                # A real, distinguishing hostname (e.g. a Cisco ACS
+                # appliance's own name) but not an IP -- nothing to
+                # SNMP-poll, so this is a final syslog_reported identity,
+                # not a pending resolution candidate like the IP case
+                # above. Grouped/keyed by the hostname string itself.
+                detected_vendor = detect_vendor(record.get("message", ""))
+                vendor_source = "passive" if detected_vendor != "unknown" else "unknown"
+                return (
+                    reported_hostname, reported_hostname, reported_hostname, network_source_ip,
+                    detected_vendor, "", "syslog_reported", vendor_source,
+                )
 
     known = inventory.lookup(source_ip)
     if known is not None:
