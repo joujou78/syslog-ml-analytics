@@ -191,8 +191,17 @@ def _snmpget(ip, oid, credential):
 def vendor_from_object_id(object_id):
     if not object_id:
         return "unknown"
+    # net-snmp's default output translates the numeric root arc "1" to its
+    # symbolic MIB name "iso" (e.g. "iso.3.6.1.4.1.14988.1" instead of
+    # "1.3.6.1.4.1.14988.1") even with our -O qv flags -- that's the
+    # always-loaded base SNMPv2-SMI MIB, not a private one, so every real
+    # sysObjectID comes back this way. Normalize before matching, or every
+    # prefix in VENDOR_OID_PREFIXES silently never matches.
+    normalized = object_id.lstrip(".")
+    if normalized.startswith("iso."):
+        normalized = "1." + normalized[len("iso."):]
     for prefix, vendor in VENDOR_OID_PREFIXES.items():
-        if object_id.startswith(prefix):
+        if normalized.startswith(prefix):
             return vendor
     return "unknown"
 
