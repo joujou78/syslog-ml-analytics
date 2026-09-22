@@ -458,9 +458,55 @@ in order of how much they preserve of the original design:
 2. **Reconfigure the relay to preserve/inject per-device identity** --
    e.g. have it forward using RFC 5424 with structured data carrying the
    original source IP, if your relay's syslog daemon supports that.
-3. **Build a static hostname/IP inventory** you maintain yourself, and
-   adjust `device_resolver.py` to consult it -- more manual upkeep, but
-   works with the relay topology as-is.
+3. **`RELAY_SOURCE_IPS`** (below) -- if your relay's rsyslog already
+   preserves the original device's `HOSTNAME` field on forward (many do,
+   by default, even without RFC 5424), you don't need to reconfigure
+   anything: opt that relay's IP in and the pipeline recovers per-device
+   identity from what's already arriving.
+
+#### `RELAY_SOURCE_IPS`: recovering per-device identity from an opted-in relay
+
+Confirmed on a real relay setup (rsyslog forwarding from a LogAnalyzer
+collector): even though `fromhost-ip` collapses to the relay's own IP for
+every event, the relay's rsyslog still forwarded each device's original
+`HOSTNAME` field untouched -- for a MikroTik device with no `/system
+identity` name configured, that field held the device's own management
+IP (e.g. `172.20.0.74`), not the relay's. That's enough to recover real
+per-device identity and analytics *without* touching the relay or the
+devices, whenever it holds:
+
+```bash
+sudo systemctl edit syslog-ml-classifier
+```
+```ini
+[Service]
+Environment=RELAY_SOURCE_IPS=192.168.247.33,192.168.255.33
+```
+```bash
+sudo systemctl restart syslog-ml-classifier
+```
+
+For an event whose `source_ip` matches one of these, `ml/consumer.py`
+checks `reported_hostname` for a well-formed IP address different from
+the relay's own -- and if found, substitutes it in as that event's
+*effective* `source_ip` for identity resolution, SNMP polling, grouping
+(Devices page, Log Search), and the per-device anomaly baselines. The
+original network-level relay IP isn't discarded: it's kept in the new
+`relayed_via` column (empty for everything that didn't go through a
+relay), so the substitution stays traceable rather than silently
+overwriting what was actually observed on the wire.
+
+This is opt-in per relay IP, not an automatic heuristic applied to all
+traffic: `reported_hostname` is still a self-reported, spoofable
+message-body field (see `rsyslog/60-syslog-ml.conf`'s comment on why
+`source_ip` is normally trusted instead of it), so widening that trust
+only makes sense for IPs you've deliberately identified as relays.
+
+**Only fixes what's already in the data.** If your relay doesn't preserve
+per-device identity in the forwarded message at all (check with `sudo
+grep '"source_ip": *"<relay-ip>"' /var/log/syslog-ml/raw.jsonl | tail -3`
+and look at `reported_hostname`), this can't recover it -- fall back to
+option 1 or 2 above.
 
 ### Optional: receive SNMP traps too (separate from syslog)
 

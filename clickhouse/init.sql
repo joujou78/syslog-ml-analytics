@@ -20,9 +20,10 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
 (
     event_time          DateTime64(3),
     received_at         DateTime64(3) DEFAULT now64(3),
-    source_ip           String,
+    source_ip           String,             -- effective device identity: substituted with the origin IP embedded in reported_hostname for events relayed through a RELAY_SOURCE_IPS entry (see ml/consumer.py's resolve_identity) -- not always the raw network-level sender
     hostname            String,             -- best-known identity: see resolution_method
     reported_hostname   String,             -- raw hostname string the device put in the syslog message, unverified
+    relayed_via         String DEFAULT '',  -- if non-empty, the relay's network-level source_ip this event actually arrived from (source_ip above is the origin device it was relayed for, not the relay itself)
     vendor              LowCardinality(String) DEFAULT 'unknown',
     vendor_source       LowCardinality(String) DEFAULT 'unknown', -- 'snmp' (verified) | 'passive' (guessed from message format, see ml/vendor_signatures.py) | 'unknown'
     model               String DEFAULT '',

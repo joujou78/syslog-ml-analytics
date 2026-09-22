@@ -16,6 +16,7 @@ If MODEL_PATH doesn't exist yet (classifier not trained), falls back to
 the weak-supervision rules in labeling_rules.py so the pipeline is useful
 from day one.
 """
+import ipaddress
 import json
 import logging
 import os
@@ -67,8 +68,25 @@ BASELINE_REFRESH_SECONDS = float(os.environ.get("ANOMALY_BASELINE_REFRESH_SECOND
 # refresh is at least this many times its historical average rate.
 VOLUME_SPIKE_MULTIPLIER = float(os.environ.get("ANOMALY_VOLUME_SPIKE_MULTIPLIER", "5"))
 
+# IPs of syslog relays/collectors that forward a copy of other devices'
+# messages here (e.g. an existing LogAnalyzer setup) rather than sending
+# their own logs directly. For an event whose source_ip is one of these,
+# reported_hostname is checked for a distinct, well-formed IP address
+# (some devices -- RouterOS in particular -- put their own management IP
+# in the syslog HOSTNAME field rather than a name) and, if found, that IP
+# is used as the event's effective identity instead of the relay's network
+# source_ip -- otherwise every device relayed through the same collector
+# collapses into one row/one baseline. Explicit opt-in per relay IP, not
+# an automatic heuristic applied to all traffic: reported_hostname is
+# still just a self-reported, spoofable message-body field (see
+# rsyslog/60-syslog-ml.conf's comment on why source_ip is normally
+# trusted instead), so this only widens that trust for IPs an admin has
+# deliberately identified as relays. See README's "If syslog arrives
+# relayed through another server" section.
+RELAY_SOURCE_IPS = {ip.strip() for ip in os.environ.get("RELAY_SOURCE_IPS", "").split(",") if ip.strip()}
+
 INSERT_COLUMNS = [
-    "event_time", "source_ip", "hostname", "reported_hostname", "vendor", "vendor_source", "model",
+    "event_time", "source_ip", "hostname", "reported_hostname", "relayed_via", "vendor", "vendor_source", "model",
     "resolution_method", "facility", "severity", "severity_num", "program", "pid",
     "message", "template_id", "template", "predicted_category", "predicted_confidence",
     "is_anomaly", "anomaly_reasons", "raw",
@@ -281,14 +299,38 @@ class DeviceBaselineCache:
         return source_ip in self._spiking
 
 
+def _distinct_relayed_ip(candidate, network_source_ip):
+    """
+    True/normalized-IP if `candidate` (reported_hostname) is a well-formed
+    IP address different from the relay's own network_source_ip -- i.e.
+    looks like the real origin device's address, not just an echo of the
+    relay or an arbitrary non-IP string.
+    """
+    if not candidate or candidate == network_source_ip:
+        return None
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
 def resolve_identity(record, inventory, state_conn, seen_unresolved):
-    source_ip = record.get("source_ip", "unknown")
+    network_source_ip = record.get("source_ip", "unknown")
     reported_hostname = record.get("reported_hostname", "") or ""
+
+    relayed_via = ""
+    source_ip = network_source_ip
+    if network_source_ip in RELAY_SOURCE_IPS:
+        origin_ip = _distinct_relayed_ip(reported_hostname, network_source_ip)
+        if origin_ip is not None:
+            relayed_via = network_source_ip
+            source_ip = origin_ip
 
     known = inventory.lookup(source_ip)
     if known is not None:
         hostname, vendor, model, resolution_method = known
-        return source_ip, hostname, reported_hostname, vendor, model, resolution_method, "snmp"
+        return source_ip, hostname, reported_hostname, relayed_via, vendor, model, resolution_method, "snmp"
 
     # No SNMP-verified identity yet. Use the device's self-reported hostname
     # as a best-effort fallback if it looks meaningful, otherwise fall back
@@ -311,7 +353,7 @@ def resolve_identity(record, inventory, state_conn, seen_unresolved):
     detected_vendor = detect_vendor(record.get("message", ""))
     vendor_source = "passive" if detected_vendor != "unknown" else "unknown"
 
-    return source_ip, hostname, reported_hostname, detected_vendor, "", resolution_method, vendor_source
+    return source_ip, hostname, reported_hostname, relayed_via, detected_vendor, "", resolution_method, vendor_source
 
 
 def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolved):
@@ -332,8 +374,8 @@ def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolv
     except (TypeError, ValueError):
         pid = None
 
-    source_ip, hostname, reported_hostname, vendor, dev_model, resolution_method, vendor_source = resolve_identity(
-        record, inventory, state_conn, seen_unresolved
+    source_ip, hostname, reported_hostname, relayed_via, vendor, dev_model, resolution_method, vendor_source = (
+        resolve_identity(record, inventory, state_conn, seen_unresolved)
     )
     severity_num = severity_rank(severity)
 
@@ -353,8 +395,8 @@ def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolv
     is_anomaly = 1 if reasons else 0
 
     return [
-        event_time, source_ip, hostname, reported_hostname, vendor, vendor_source, dev_model, resolution_method,
-        record.get("facility", "unknown"), severity, severity_num,
+        event_time, source_ip, hostname, reported_hostname, relayed_via, vendor, vendor_source, dev_model,
+        resolution_method, record.get("facility", "unknown"), severity, severity_num,
         record.get("program", "unknown"), pid, message,
         str(cluster["cluster_id"]), cluster["template_mined"],
         category, confidence, is_anomaly, reasons, record.get("raw", message),
