@@ -657,8 +657,8 @@ prefers a real `category` field over the weak-supervision guess.
 ## Files
 
 - `clickhouse/init.sql` — `device_inventory`, `events`, and the per-minute rollup.
-- `rsyslog/10-network-listener.conf` — enables rsyslog to receive syslog over the network (UDP/TCP 514), not just local messages.
-- `rsyslog/60-syslog-ml.conf` — mirrors rsyslog's feed to a local JSON file.
+- `rsyslog/10-network-listener.conf` — enables rsyslog to receive syslog over the network (UDP/TCP 514), routed into the `syslogMlNetwork` ruleset so this VM's own local/journald traffic isn't mixed in.
+- `rsyslog/60-syslog-ml.conf` — mirrors that network-only ruleset's feed to a local JSON file.
 - `snmptrapd/` — optional SNMP trap receiver config, feeding traps into the same pipeline via local syslog.
 - `ml/consumer.py` — tails the file, resolves identity, classifies, flags anomalies, writes to ClickHouse.
 - `ml/anomaly_signals.py` — stateless anomaly signals (always_severe, security_content); the per-device ones (severity_spike, volume_spike) live in `consumer.py`'s `DeviceBaselineCache`.
