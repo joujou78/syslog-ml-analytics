@@ -519,6 +519,33 @@ grep '"source_ip": *"<relay-ip>"' /var/log/syslog-ml/raw.jsonl | tail -3`
 and look at `reported_hostname`), this can't recover it -- fall back to
 option 1 or 2 above.
 
+#### `RELAY_TIMEZONE_OFFSET_HOURS`: correcting a relay that timestamps in local time
+
+Confirmed on the same real relay: `event_time` for its traffic was 3 hours
+*ahead* of `received_at` (the real wall-clock insert time) -- net-flow's
+own clock is correctly UTC (`timedatectl` confirmed NTP-synced), so this
+isn't a net-flow problem. The legacy BSD syslog format these messages use
+has no timezone field at all, and whatever wrote this relay's copy of the
+timestamp (the relay itself, or the origin devices) put local time
+(Beirut, UTC+3) into it -- rsyslog then took that number at face value
+and stored it as if it were already UTC.
+
+`ml/consumer.py` now subtracts `RELAY_TIMEZONE_OFFSET_HOURS` (default
+`3`) from `event_time` for any event whose `source_ip` is a
+`RELAY_SOURCE_IPS` entry -- scoped to that traffic specifically, since
+it's the only population this has been confirmed against. Set to `0`
+(`sudo systemctl edit syslog-ml-classifier`, same as `RELAY_SOURCE_IPS`)
+to disable it if it turns out not to apply to your relay, or override it
+to a different fixed offset if your relay's local timezone isn't UTC+3.
+This is a flat offset, not a named IANA timezone -- it doesn't account
+for DST -- because that's what was actually observed and asked for; if
+your relay's local time observes DST, this will need revisiting twice a
+year.
+
+**Doesn't retroactively fix already-inserted rows.** Only events
+processed after this deploys get the correction; historical rows keep
+their originally-recorded (off-by-3-hours) `event_time`.
+
 ### Optional: receive SNMP traps too (separate from syslog)
 
 SNMP traps are a different protocol (default UDP 162, not 514) and need

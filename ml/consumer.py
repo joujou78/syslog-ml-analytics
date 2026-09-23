@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import clickhouse_connect
 import joblib
@@ -84,6 +84,21 @@ VOLUME_SPIKE_MULTIPLIER = float(os.environ.get("ANOMALY_VOLUME_SPIKE_MULTIPLIER"
 # deliberately identified as relays. See README's "If syslog arrives
 # relayed through another server" section.
 RELAY_SOURCE_IPS = {ip.strip() for ip in os.environ.get("RELAY_SOURCE_IPS", "").split(",") if ip.strip()}
+
+# Confirmed on net-flow's real relay traffic: rsyslog's `timereported` for a
+# message forwarded through this relay is 3 hours ahead of the real receipt
+# time (event_time ~15:32 vs received_at, the actual insert-time now64(),
+# ~12:34 for the same row) -- the legacy BSD syslog format these messages
+# use has no timezone field at all, and whatever wrote this relay's copy
+# (the relay itself, or the origin devices) appears to put local Beirut
+# time (UTC+3) into it, which rsyslog then takes at face value instead of
+# converting. A fixed offset, not a named IANA timezone (no DST handling)
+# -- if that turns out wrong, this needs revisiting, but it's what's
+# actually observed and what was asked for. Only applied to
+# RELAY_SOURCE_IPS traffic, since that's the only population this has
+# been confirmed against; doesn't touch or retroactively fix events
+# already inserted before this was added.
+RELAY_TIMEZONE_OFFSET_HOURS = float(os.environ.get("RELAY_TIMEZONE_OFFSET_HOURS", "3"))
 
 INSERT_COLUMNS = [
     "event_time", "source_ip", "hostname", "reported_hostname", "relayed_via", "vendor", "vendor_source", "model",
@@ -408,6 +423,8 @@ def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolv
         event_time = datetime.fromisoformat(timestamp) if timestamp else datetime.now(timezone.utc)
     except ValueError:
         event_time = datetime.now(timezone.utc)
+    if RELAY_TIMEZONE_OFFSET_HOURS and record.get("source_ip") in RELAY_SOURCE_IPS:
+        event_time -= timedelta(hours=RELAY_TIMEZONE_OFFSET_HOURS)
 
     category, confidence = classify(model, message)
     severity = record.get("severity", "info")
