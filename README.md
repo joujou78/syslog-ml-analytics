@@ -530,17 +530,26 @@ timestamp (the relay itself, or the origin devices) put local time
 (Beirut, UTC+3) into it -- rsyslog then took that number at face value
 and stored it as if it were already UTC.
 
-`ml/consumer.py` now subtracts `RELAY_TIMEZONE_OFFSET_HOURS` (default
-`3`) from `event_time` for any event whose `source_ip` is a
-`RELAY_SOURCE_IPS` entry -- scoped to that traffic specifically, since
-it's the only population this has been confirmed against. Set to `0`
+**Not all of this relay's traffic is skewed, though** -- confirmed:
+some of the same device's messages (an ACSSERVER appliance) arrive
+already correct. A blanket "always subtract 3h for this relay" rule
+wrongly shifts those into the past instead, so `ml/consumer.py` applies
+the correction per-message: only when `event_time` claims to be more
+than `RELAY_TIMEZONE_FUTURE_TOLERANCE_MINUTES` (default `30`) ahead of
+the real processing time -- a message can't legitimately be from the
+future, whereas a merely delayed/backlogged one is late, not early, so
+this only ever fires in the direction the actual bug produces -- and
+even then, only if subtracting `RELAY_TIMEZONE_OFFSET_HOURS` (default
+`3`) genuinely brings it closer to now instead of further away. Both are
+scoped to `RELAY_SOURCE_IPS` traffic, since that's the only population
+this has been confirmed against. Set `RELAY_TIMEZONE_OFFSET_HOURS=0`
 (`sudo systemctl edit syslog-ml-classifier`, same as `RELAY_SOURCE_IPS`)
-to disable it if it turns out not to apply to your relay, or override it
-to a different fixed offset if your relay's local timezone isn't UTC+3.
-This is a flat offset, not a named IANA timezone -- it doesn't account
-for DST -- because that's what was actually observed and asked for; if
-your relay's local time observes DST, this will need revisiting twice a
-year.
+to disable this entirely if it turns out not to apply to your relay, or
+override it to a different fixed offset if your relay's local timezone
+isn't UTC+3. This is a flat offset, not a named IANA timezone -- it
+doesn't account for DST -- because that's what was actually observed
+and asked for; if your relay's local time observes DST, this will need
+revisiting twice a year.
 
 **Doesn't retroactively fix already-inserted rows.** Only events
 processed after this deploys get the correction; historical rows keep
