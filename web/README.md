@@ -81,6 +81,24 @@ resolved identity can change after the fact) using the same
 `FINAL`-qualified read pattern needed because the underlying table is a
 `ReplacingMergeTree` that gets rewritten as windows are rescored.
 
+**Query Console** (`POST /api/query-console/execute`, "Query Console" in
+the admin nav) is full, unrestricted SQL access against ClickHouse from
+the browser — including `ALTER`, `DELETE`, `DROP`, and `TRUNCATE`. This is
+a deliberate departure from this app's usual "narrow, explicit allowlist"
+posture (Relay Source IPs, SNMP Credentials): built this way by explicit
+request, not by default. Admin-only, and every query is written to
+`audit_log` (full query text, actor, timestamp) **before** it executes —
+not after — so a query that crashes the worker or times out still leaves
+a record of what was attempted, since the audit trail is this feature's
+only real safety net. `SELECT`/`SHOW`/`DESCRIBE`/`EXPLAIN`/`WITH`
+statements return a results table (capped at 1,000 rows); anything else
+runs via ClickHouse's command path and just confirms success, since
+DDL/mutations don't return rows. A 30-second query timeout is a backstop
+against one runaway query tying up a web worker indefinitely, not a
+substitute for the admin knowing what they're running. There is
+deliberately no query history or saved-queries feature (yet) — the audit
+log is the record.
+
 ## Why this stack
 
 - **FastAPI**: shares Python with the rest of the pipeline (`ml/`), async,

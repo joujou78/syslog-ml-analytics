@@ -175,6 +175,15 @@ export interface AnomalyWindowListResponse {
   has_more: boolean
 }
 
+export interface QueryResult {
+  columns: string[]
+  rows: unknown[][]
+  row_count: number
+  truncated: boolean
+  is_command: boolean
+  message: string | null
+}
+
 export interface AlertEvent {
   id: string
   rule_id: string

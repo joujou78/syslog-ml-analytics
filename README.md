@@ -78,7 +78,8 @@ that's already in ClickHouse: a column-oriented, time-partitioned database
 built for exactly this kind of workload (it's the engine behind large-scale
 log pipelines such as Cloudflare's and Uber's, at far higher volume than
 one VM will see). `events` is already partitioned by day (`PARTITION BY
-toYYYYMMDD(event_time)`), has a 90-day TTL, has an `events_by_minute`
+toYYYYMMDD(event_time)`), is retained indefinitely (no TTL -- see
+`clickhouse/init.sql`'s comment on that tradeoff), has an `events_by_minute`
 rollup for fast dashboards, and now has skip indexes on `message`,
 `program`, `predicted_category`, and `source_ip` (see
 `clickhouse/init.sql` and `clickhouse/migrations/001_search_indexes.sql`)

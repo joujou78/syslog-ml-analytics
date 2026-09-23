@@ -8,6 +8,7 @@ import { Credentials } from './pages/Credentials'
 import { Devices } from './pages/Devices'
 import { Logs } from './pages/Logs'
 import { Login } from './pages/Login'
+import { QueryConsole } from './pages/QueryConsole'
 import { Relays } from './pages/Relays'
 
 export default function App() {
@@ -24,6 +25,7 @@ export default function App() {
             <Route element={<ProtectedRoute allowedRoles={['admin']} />}>
               <Route path="/credentials" element={<Credentials />} />
               <Route path="/relays" element={<Relays />} />
+              <Route path="/query-console" element={<QueryConsole />} />
             </Route>
           </Route>
         </Route>

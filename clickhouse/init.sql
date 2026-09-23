@@ -56,7 +56,14 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(event_time)
 ORDER BY (event_time, hostname, severity)
-TTL toDateTime(event_time) + INTERVAL 90 DAY
+-- No TTL: retained indefinitely by explicit choice. Disk usage on
+-- whatever host runs ClickHouse grows without bound as long as the
+-- pipeline runs -- monitor free disk yourself; nothing here enforces a
+-- ceiling. If retention ever needs bounding again, add back
+-- `TTL toDateTime(event_time) + INTERVAL <n> DAY` (existing rows aren't
+-- retroactively deleted just by having briefly had a shorter TTL earlier
+-- and then removing it -- only while a TTL clause is actually in effect
+-- does ClickHouse's background merge process drop expired parts).
 SETTINGS index_granularity = 8192;
 
 -- Pre-aggregated per-minute rollup so Grafana panels stay fast even once
@@ -100,5 +107,8 @@ CREATE TABLE IF NOT EXISTS syslog_ml.device_window_anomalies
 ENGINE = ReplacingMergeTree(scored_at)
 PARTITION BY toYYYYMMDD(window_start)
 ORDER BY (source_ip, window_start)
-TTL toDateTime(window_start) + INTERVAL 90 DAY
+-- No TTL, same choice and same caveat as `events` above -- kept
+-- consistent so an old flagged window's score/model_scope context doesn't
+-- disappear while the event it tagged (unusual_template_mix) is retained
+-- forever.
 SETTINGS index_granularity = 8192;
