@@ -512,8 +512,12 @@ identity too, just without an IP to SNMP-poll: `resolution_method` is
 anomaly baseline key off the hostname string itself. Generic placeholders
 devices fall back to when they have no identity configured at all
 (`localhost`, `localhost.localdomain`) are deliberately excluded --
-they're not distinguishing, so those events still show the relay's own
-identity, same as before.
+they're not distinguishing, so those events fall through to whatever
+identity the relay's own `source_ip` otherwise resolves to (its SNMP
+hostname if known, its bare IP if not -- never the placeholder string
+itself). This exclusion isn't relay-specific: any device, relayed or not,
+that self-reports one of these generic placeholders shows its IP instead
+of the placeholder, for the same reason.
 
 **Only fixes what's already in the data.** If your relay doesn't preserve
 per-device identity in the forwarded message at all (check with `sudo

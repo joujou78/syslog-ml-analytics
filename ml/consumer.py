@@ -396,8 +396,11 @@ def _distinct_relayed_ip(candidate, network_source_ip):
 # Values devices fall back to when they have no real identity configured
 # (e.g. a RouterOS device with no /system identity set) -- not
 # distinguishing, so never worth treating as a device's identity even
-# though they're technically a non-empty, non-IP string.
-_GENERIC_RELAY_HOSTNAMES = {"localhost", "localhost.localdomain"}
+# though they're technically a non-empty, non-IP string. Applies whether
+# or not the traffic came through a listed relay: a device that reports
+# one of these directly (no relay involved at all) is exactly as
+# unidentifying as one that reports it via a relay.
+_GENERIC_HOSTNAMES = {"localhost", "localhost.localdomain"}
 
 
 def _distinct_relayed_hostname(candidate, relay_hostname):
@@ -415,7 +418,7 @@ def _distinct_relayed_hostname(candidate, relay_hostname):
         return False
     except ValueError:
         pass
-    if candidate.lower() in _GENERIC_RELAY_HOSTNAMES:
+    if candidate.lower() in _GENERIC_HOSTNAMES:
         return False
     if relay_hostname and candidate == relay_hostname:
         return False
@@ -457,7 +460,11 @@ def resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved):
     # No SNMP-verified identity yet. Use the device's self-reported hostname
     # as a best-effort fallback if it looks meaningful, otherwise fall back
     # to the bare IP — either way this is flagged, not presented as verified.
-    if reported_hostname and reported_hostname != source_ip:
+    # A generic placeholder (e.g. an unconfigured device's default
+    # "localhost.localdomain") is worse than useless here: it's less
+    # identifying than the IP it would replace, so it's excluded the same
+    # way the relay path already excludes it from _distinct_relayed_hostname.
+    if reported_hostname and reported_hostname != source_ip and reported_hostname.lower() not in _GENERIC_HOSTNAMES:
         resolution_method = "syslog_reported"
         hostname = reported_hostname
     else:
