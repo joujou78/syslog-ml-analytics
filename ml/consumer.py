@@ -282,7 +282,7 @@ class RelaySourceIpCache:
                 cur.execute("SELECT ip FROM relay_source_ips")
                 self._ips = {row[0] for row in cur.fetchall()}
             self._last_refresh = time.monotonic()
-            log.info("Refreshed relay source IP list: %d relay(s)", len(self._ips))
+            log.info("Refreshed relay source IP list: %d relay(s): %r", len(self._ips), self._ips)
         except Exception:
             log.exception("Failed to refresh relay source IP list, keeping previous snapshot")
         finally:
