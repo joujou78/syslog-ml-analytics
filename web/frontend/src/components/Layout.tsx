@@ -15,6 +15,7 @@ export function Layout() {
           <NavLink to="/logs">Log Search</NavLink>
           <NavLink to="/alerts">Alerts</NavLink>
           {user?.role === 'admin' && <NavLink to="/credentials">SNMP Credentials</NavLink>}
+          {user?.role === 'admin' && <NavLink to="/relays">Relay Source IPs</NavLink>}
         </nav>
         <div className="app-user">
           <span>

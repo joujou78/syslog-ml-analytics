@@ -85,6 +85,12 @@ role, same split as `/devices`.
   shared scope instead of entering devices one at a time. See the pipeline
   README's "Credential pools" section for how the resolver uses this to
   discover and auto-save each device's own credential.
+- **Relay Source IPs** (admin nav, `relay_source_ips` table): the same
+  "admin-managed in Postgres, not a config file/env var" pattern applied
+  to the list of syslog relay IPs `ml/consumer.py` trusts enough to
+  recover per-device identity from a relayed message's body — see the
+  pipeline README's "Relay Source IPs" section for what this actually
+  does and why it's a narrow, explicit allowlist rather than automatic.
 - **React SPA**: the app has real interactive state (forms, filters, role-
   gated views) that suits client-side routing better than server-rendered
   pages.

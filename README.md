@@ -458,13 +458,13 @@ in order of how much they preserve of the original design:
 2. **Reconfigure the relay to preserve/inject per-device identity** --
    e.g. have it forward using RFC 5424 with structured data carrying the
    original source IP, if your relay's syslog daemon supports that.
-3. **`RELAY_SOURCE_IPS`** (below) -- if your relay's rsyslog already
-   preserves the original device's `HOSTNAME` field on forward (many do,
-   by default, even without RFC 5424), you don't need to reconfigure
-   anything: opt that relay's IP in and the pipeline recovers per-device
-   identity from what's already arriving.
+3. **The "Relay Source IPs" admin page** (below) -- if your relay's
+   rsyslog already preserves the original device's `HOSTNAME` field on
+   forward (many do, by default, even without RFC 5424), you don't need
+   to reconfigure anything: list that relay's IP and the pipeline
+   recovers per-device identity from what's already arriving.
 
-#### `RELAY_SOURCE_IPS`: recovering per-device identity from an opted-in relay
+#### Relay Source IPs: recovering per-device identity from a listed relay
 
 Confirmed on a real relay setup (rsyslog forwarding from a LogAnalyzer
 collector): even though `fromhost-ip` collapses to the relay's own IP for
@@ -473,20 +473,22 @@ every event, the relay's rsyslog still forwarded each device's original
 identity` name configured, that field held the device's own management
 IP (e.g. `172.20.0.74`), not the relay's. That's enough to recover real
 per-device identity and analytics *without* touching the relay or the
-devices, whenever it holds:
+devices, whenever it holds.
 
-```bash
-sudo systemctl edit syslog-ml-classifier
-```
-```ini
-[Service]
-Environment=RELAY_SOURCE_IPS=192.168.247.33,192.168.255.33
-```
-```bash
-sudo systemctl restart syslog-ml-classifier
-```
+Add the relay's IP via **Relay Source IPs** in the web app's admin nav
+(`web/frontend/src/pages/Relays.tsx`, `POST /api/relays`) -- admin-only,
+same as SNMP Credentials. `ml/consumer.py`'s `RelaySourceIpCache` reads
+this list directly from the same Postgres database the web app writes to
+(same pattern as the resolver reading `snmp_credentials`), refreshed
+every `RELAY_LIST_REFRESH_SECONDS` (default 60s) -- no service restart
+needed after adding or removing an entry. Requires `DATABASE_URL` to be
+set for `syslog-ml-classifier.service` (it now also reads
+`/etc/syslog-ml/resolver.env`, the same file the resolver already uses,
+for this); if unset or Postgres is unreachable, the list just stays
+empty (or keeps its last known snapshot) and every `source_ip` is
+treated as a direct device, same as before this feature existed.
 
-For an event whose `source_ip` matches one of these, `ml/consumer.py`
+For an event whose `source_ip` is in this list, `ml/consumer.py`
 checks `reported_hostname` for a well-formed IP address different from
 the relay's own -- and if found, substitutes it in as that event's
 *effective* `source_ip` for identity resolution, SNMP polling, grouping
@@ -541,10 +543,12 @@ future, whereas a merely delayed/backlogged one is late, not early, so
 this only ever fires in the direction the actual bug produces -- and
 even then, only if subtracting `RELAY_TIMEZONE_OFFSET_HOURS` (default
 `3`) genuinely brings it closer to now instead of further away. Both are
-scoped to `RELAY_SOURCE_IPS` traffic, since that's the only population
-this has been confirmed against. Set `RELAY_TIMEZONE_OFFSET_HOURS=0`
-(`sudo systemctl edit syslog-ml-classifier`, same as `RELAY_SOURCE_IPS`)
-to disable this entirely if it turns out not to apply to your relay, or
+scoped to traffic from an IP in the Relay Source IPs list, since that's
+the only population this has been confirmed against -- unlike that list
+itself, these two are still env vars (`sudo systemctl edit
+syslog-ml-classifier`), since they're global tuning constants, not
+per-relay data. Set `RELAY_TIMEZONE_OFFSET_HOURS=0` to disable this
+entirely if it turns out not to apply to your relay, or
 override it to a different fixed offset if your relay's local timezone
 isn't UTC+3. This is a flat offset, not a named IANA timezone -- it
 doesn't account for DST -- because that's what was actually observed

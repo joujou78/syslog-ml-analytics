@@ -7,6 +7,7 @@ import { Credentials } from './pages/Credentials'
 import { Devices } from './pages/Devices'
 import { Logs } from './pages/Logs'
 import { Login } from './pages/Login'
+import { Relays } from './pages/Relays'
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
             <Route path="/alerts" element={<Alerts />} />
             <Route element={<ProtectedRoute allowedRoles={['admin']} />}>
               <Route path="/credentials" element={<Credentials />} />
+              <Route path="/relays" element={<Relays />} />
             </Route>
           </Route>
         </Route>

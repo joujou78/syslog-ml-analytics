@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 import clickhouse_connect
 import joblib
+import psycopg2
 from drain3 import TemplateMiner
 from drain3.file_persistence import FilePersistence
 from drain3.template_miner_config import TemplateMinerConfig
@@ -68,22 +69,13 @@ BASELINE_REFRESH_SECONDS = float(os.environ.get("ANOMALY_BASELINE_REFRESH_SECOND
 # refresh is at least this many times its historical average rate.
 VOLUME_SPIKE_MULTIPLIER = float(os.environ.get("ANOMALY_VOLUME_SPIKE_MULTIPLIER", "5"))
 
-# IPs of syslog relays/collectors that forward a copy of other devices'
-# messages here (e.g. an existing LogAnalyzer setup) rather than sending
-# their own logs directly. For an event whose source_ip is one of these,
-# reported_hostname is checked for a distinct, well-formed IP address
-# (some devices -- RouterOS in particular -- put their own management IP
-# in the syslog HOSTNAME field rather than a name) and, if found, that IP
-# is used as the event's effective identity instead of the relay's network
-# source_ip -- otherwise every device relayed through the same collector
-# collapses into one row/one baseline. Explicit opt-in per relay IP, not
-# an automatic heuristic applied to all traffic: reported_hostname is
-# still just a self-reported, spoofable message-body field (see
-# rsyslog/60-syslog-ml.conf's comment on why source_ip is normally
-# trusted instead), so this only widens that trust for IPs an admin has
-# deliberately identified as relays. See README's "If syslog arrives
-# relayed through another server" section.
-RELAY_SOURCE_IPS = {ip.strip() for ip in os.environ.get("RELAY_SOURCE_IPS", "").split(",") if ip.strip()}
+# Postgres connection for the admin-managed relay_source_ips table (same
+# database/table the web app's "Relay Source IPs" admin page reads and
+# writes -- see RelaySourceIpCache below). Empty by default: if unset, the
+# cache just never has any entries and every source_ip is treated as a
+# direct device, the same as before this feature existed.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+RELAY_LIST_REFRESH_SECONDS = float(os.environ.get("RELAY_LIST_REFRESH_SECONDS", "60"))
 
 # Confirmed on net-flow's real relay traffic: rsyslog's `timereported` for
 # some messages forwarded through this relay is 3 hours ahead of the real
@@ -108,10 +100,10 @@ RELAY_SOURCE_IPS = {ip.strip() for ip in os.environ.get("RELAY_SOURCE_IPS", "").
 #
 # A fixed offset, not a named IANA timezone (no DST handling) -- if that
 # turns out wrong, this needs revisiting, but it's what's actually
-# observed and what was asked for. Only applied to RELAY_SOURCE_IPS
-# traffic, since that's the only population this has been confirmed
-# against; doesn't touch or retroactively fix events already inserted
-# before this was added.
+# observed and what was asked for. Only applied to traffic from a listed
+# relay (see RelaySourceIpCache below), since that's the only population
+# this has been confirmed against; doesn't touch or retroactively fix
+# events already inserted before this was added.
 RELAY_TIMEZONE_OFFSET_HOURS = float(os.environ.get("RELAY_TIMEZONE_OFFSET_HOURS", "3"))
 RELAY_TIMEZONE_FUTURE_TOLERANCE_MINUTES = float(os.environ.get("RELAY_TIMEZONE_FUTURE_TOLERANCE_MINUTES", "30"))
 
@@ -244,6 +236,62 @@ class InventoryCache:
         return self._cache.get(ip)
 
 
+class RelaySourceIpCache:
+    """
+    In-memory set of relay/collector IPs, refreshed periodically from the
+    web app's relay_source_ips table (admin-managed via the "Relay Source
+    IPs" page) -- same pattern as device_resolver.py reading
+    snmp_credentials directly from Postgres, not through the web API.
+
+    For an event whose source_ip is in this set, resolve_identity() checks
+    reported_hostname for a distinct, well-formed IP address or a real
+    non-generic hostname and, if found, uses it as the event's effective
+    identity instead of the relay's network source_ip -- otherwise every
+    device relayed through the same collector collapses into one row/one
+    baseline. It also gates the timestamp sanity-check for relays that
+    timestamp in local time instead of UTC. Explicit opt-in per relay IP,
+    not an automatic heuristic applied to all traffic: reported_hostname
+    is still just a self-reported, spoofable message-body field (see
+    rsyslog/60-syslog-ml.conf's comment on why source_ip is normally
+    trusted instead), so this only widens that trust for IPs an admin has
+    deliberately identified as relays. See README's "If syslog arrives
+    relayed through another server" section.
+
+    If DATABASE_URL isn't set, or Postgres is unreachable, this just stays
+    empty (or keeps its last known snapshot) -- a relay-detection outage
+    degrades to "treat everything as a direct device", not a crash.
+    """
+
+    def __init__(self, database_url):
+        self.database_url = database_url
+        self._ips = set()
+        self._last_refresh = 0.0
+
+    def refresh_if_stale(self):
+        if not self.database_url:
+            return
+        if time.monotonic() - self._last_refresh < RELAY_LIST_REFRESH_SECONDS:
+            return
+        try:
+            conn = psycopg2.connect(self.database_url)
+        except psycopg2.OperationalError:
+            log.exception("Could not connect to Postgres to refresh the relay source IP list, keeping previous snapshot")
+            return
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT ip FROM relay_source_ips")
+                self._ips = {row[0] for row in cur.fetchall()}
+            self._last_refresh = time.monotonic()
+            log.info("Refreshed relay source IP list: %d relay(s)", len(self._ips))
+        except Exception:
+            log.exception("Failed to refresh relay source IP list, keeping previous snapshot")
+        finally:
+            conn.close()
+
+    def __contains__(self, ip):
+        return ip in self._ips
+
+
 class DeviceBaselineCache:
     """
     Per-device (keyed by source_ip, not hostname -- stable across a device
@@ -374,13 +422,13 @@ def _distinct_relayed_hostname(candidate, relay_hostname):
     return True
 
 
-def resolve_identity(record, inventory, state_conn, seen_unresolved):
+def resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved):
     network_source_ip = record.get("source_ip", "unknown")
     reported_hostname = record.get("reported_hostname", "") or ""
 
     relayed_via = ""
     source_ip = network_source_ip
-    if network_source_ip in RELAY_SOURCE_IPS:
+    if network_source_ip in relay_ips:
         origin_ip = _distinct_relayed_ip(reported_hostname, network_source_ip)
         if origin_ip is not None:
             relayed_via = network_source_ip
@@ -430,7 +478,7 @@ def resolve_identity(record, inventory, state_conn, seen_unresolved):
     return source_ip, hostname, reported_hostname, relayed_via, detected_vendor, "", resolution_method, vendor_source
 
 
-def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolved):
+def to_row(record, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved):
     message = record.get("message", "")
     cluster = miner.add_log_message(message)
     timestamp = record.get("timestamp")
@@ -438,7 +486,7 @@ def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolv
         event_time = datetime.fromisoformat(timestamp) if timestamp else datetime.now(timezone.utc)
     except ValueError:
         event_time = datetime.now(timezone.utc)
-    if RELAY_TIMEZONE_OFFSET_HOURS and record.get("source_ip") in RELAY_SOURCE_IPS:
+    if RELAY_TIMEZONE_OFFSET_HOURS and record.get("source_ip") in relay_ips:
         now = datetime.now(timezone.utc)
         if event_time - now > timedelta(minutes=RELAY_TIMEZONE_FUTURE_TOLERANCE_MINUTES):
             candidate = event_time - timedelta(hours=RELAY_TIMEZONE_OFFSET_HOURS)
@@ -455,7 +503,7 @@ def to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolv
         pid = None
 
     source_ip, hostname, reported_hostname, relayed_via, vendor, dev_model, resolution_method, vendor_source = (
-        resolve_identity(record, inventory, state_conn, seen_unresolved)
+        resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved)
     )
     severity_num = severity_rank(severity)
 
@@ -508,6 +556,7 @@ def main():
     )
     inventory = InventoryCache(ch_client)
     baselines = DeviceBaselineCache(ch_client)
+    relay_ips = RelaySourceIpCache(DATABASE_URL)
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)
 
@@ -519,13 +568,14 @@ def main():
     while True:
         inventory.refresh_if_stale()
         baselines.refresh_if_stale()
+        relay_ips.refresh_if_stale()
         lines = tailer.readlines()
 
         for line in lines:
             record = parse_record(line)
             if record is None:
                 continue
-            batch.append(to_row(record, miner, model, inventory, baselines, state_conn, seen_unresolved))
+            batch.append(to_row(record, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved))
 
         should_flush = len(batch) >= BATCH_SIZE or (time.monotonic() - last_flush) >= BATCH_FLUSH_SECONDS
         if should_flush and batch:

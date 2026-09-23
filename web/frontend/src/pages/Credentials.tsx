@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { credentialsApi } from '../api/credentials'
 import type { Credential, CredentialInput, SnmpVersion } from '../types'
+import { extractErrorMessage } from '../utils/errors'
 import { formatBeirutDateTime } from '../utils/time'
 
 const EMPTY_FORM: CredentialInput = {
@@ -73,8 +74,8 @@ export function Credentials() {
       }
       cancelEdit()
       await load()
-    } catch (err: any) {
-      setError(err?.response?.data?.detail ?? 'Could not save credential')
+    } catch (err) {
+      setError(extractErrorMessage(err, 'Could not save credential'))
     } finally {
       setSubmitting(false)
     }
@@ -101,8 +102,8 @@ export function Credentials() {
       setPoolResult(`Imported ${res.imported} candidate credential(s) scoped to ${poolScope}.`)
       setPoolCommunities('')
       await load()
-    } catch (err: any) {
-      setPoolError(err?.response?.data?.detail ?? 'Could not import the credential pool')
+    } catch (err) {
+      setPoolError(extractErrorMessage(err, 'Could not import the credential pool'))
     } finally {
       setPoolSubmitting(false)
     }

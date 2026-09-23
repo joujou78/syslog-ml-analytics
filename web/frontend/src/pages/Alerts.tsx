@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { alertsApi } from '../api/alerts'
 import { useAuth } from '../auth/AuthContext'
 import type { AlertEvent, AlertRule, AlertRuleInput } from '../types'
+import { extractErrorMessage } from '../utils/errors'
 import { formatBeirutDateTime } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
@@ -90,8 +91,8 @@ export function Alerts() {
       }
       cancelEdit()
       load()
-    } catch (err: any) {
-      setError(err?.response?.data?.detail ?? 'Could not save alert rule')
+    } catch (err) {
+      setError(extractErrorMessage(err, 'Could not save alert rule'))
     } finally {
       setSubmitting(false)
     }

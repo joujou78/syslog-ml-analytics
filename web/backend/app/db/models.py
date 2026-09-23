@@ -68,6 +68,37 @@ class SnmpCredential(Base):
     created_by_user: Mapped["User"] = relationship()
 
 
+class RelaySourceIp(Base):
+    """
+    Admin-managed allowlist of syslog relay/collector IPs (e.g. an existing
+    LogAnalyzer setup) that forward other devices' messages here rather
+    than sending their own logs directly. Read directly from Postgres by
+    ml/consumer.py's RelaySourceIpCache (same pattern as SnmpCredential
+    being read by device_resolver.py) -- not through the web API.
+
+    Deliberately an explicit, admin-curated list rather than applied to
+    all traffic: for a listed IP, ml/consumer.py trusts that event's
+    self-reported `reported_hostname` field enough to use it as the
+    event's identity (recovering per-device analytics that would
+    otherwise collapse into one row behind the relay) and applies a
+    timestamp sanity-check for relays that timestamp in local time
+    instead of UTC. reported_hostname is a self-reported, spoofable
+    message-body field (see rsyslog/60-syslog-ml.conf's comment on why
+    source_ip is normally trusted instead of it) -- widening that trust
+    only makes sense for network sources an admin has deliberately
+    identified as relays, never for arbitrary traffic. See README's "If
+    syslog arrives relayed through another server" section.
+    """
+    __tablename__ = "relay_source_ips"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ip: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ClassificationFeedback(Base):
     """
     Phase 3 (ML feedback loop) table — schema created now so it doesn't

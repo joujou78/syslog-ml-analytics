@@ -41,6 +41,18 @@ export interface CredentialInput {
   v3_priv_pass?: string
 }
 
+export interface RelaySourceIp {
+  id: string
+  ip: string
+  note: string | null
+  created_at: string
+}
+
+export interface RelaySourceIpInput {
+  ip: string
+  note?: string
+}
+
 export type ResolutionMethod = 'snmp' | 'syslog_reported' | 'unresolved'
 export type VendorSource = 'snmp' | 'passive' | 'unknown'
 
