@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
     predicted_category  LowCardinality(String),
     predicted_confidence Float32,
     is_anomaly          UInt8 DEFAULT 0,
-    anomaly_reasons     Array(LowCardinality(String)) DEFAULT [], -- which signal(s) fired: rare_template | always_severe | severity_spike | security_content | volume_spike -- see ml/anomaly_signals.py and consumer.py's DeviceBaselineCache
+    anomaly_reasons     Array(LowCardinality(String)) DEFAULT [], -- which signal(s) fired: rare_template | always_severe | severity_spike | security_content | volume_spike | unusual_template_mix -- see ml/anomaly_signals.py, consumer.py's DeviceBaselineCache, and ml/template_mix_anomaly.py
     raw                 String,
 
     -- Secondary (skip) indexes: `events` is a *columnar* store ordered by
@@ -77,3 +77,28 @@ SELECT
     sum(resolution_method = 'unresolved') AS unresolved_count
 FROM syslog_ml.events
 GROUP BY minute, hostname, vendor, severity, predicted_category;
+
+-- Windowed template-mix anomaly scores (see ml/template_mix_anomaly.py).
+-- Distinct from `events.anomaly_reasons` (per-event, evaluated inline as
+-- each message arrives): this is a per-(device, time window) signal that
+-- can only be judged once a window's worth of data exists, so it's
+-- computed by a periodic batch job, not at insert time. One row per
+-- window per device; ReplacingMergeTree(scored_at) because a window gets
+-- rescored (and its row replaced) on every retrain cycle while it's
+-- still the most recent complete window.
+CREATE TABLE IF NOT EXISTS syslog_ml.device_window_anomalies
+(
+    window_start        DateTime,
+    source_ip           String,
+    vendor              LowCardinality(String) DEFAULT 'unknown',
+    model_scope         LowCardinality(String), -- 'device' | 'vendor' -- which model actually scored this window (see README's "hybrid" note)
+    anomaly_score        Float32,                -- IsolationForest decision_function output; more negative = more anomalous
+    is_anomaly           UInt8,
+    event_count          UInt32,                 -- events observed in this device's window, for context alongside the score
+    scored_at            DateTime64(3) DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(scored_at)
+PARTITION BY toYYYYMMDD(window_start)
+ORDER BY (source_ip, window_start)
+TTL toDateTime(window_start) + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;

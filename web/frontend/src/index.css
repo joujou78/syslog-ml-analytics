@@ -195,6 +195,16 @@ label {
   color: var(--danger);
 }
 
+.badge-scope-device {
+  background: rgba(48, 164, 108, 0.15);
+  color: var(--ok);
+}
+
+.badge-scope-vendor {
+  background: rgba(245, 166, 35, 0.15);
+  color: var(--warn);
+}
+
 .summary-row {
   display: flex;
   gap: 16px;

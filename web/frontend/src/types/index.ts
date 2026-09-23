@@ -147,6 +147,34 @@ export interface AlertRule extends AlertRuleInput {
   updated_at: string
 }
 
+export type ModelScope = 'device' | 'vendor'
+
+export interface AnomalyWindow {
+  window_start: string
+  source_ip: string
+  hostname: string
+  vendor: string
+  model_scope: ModelScope
+  anomaly_score: number
+  is_anomaly: boolean
+  event_count: number
+}
+
+export interface AnomalyWindowFilters {
+  start?: string
+  end?: string
+  source_ip?: string
+  vendor?: string
+  only_anomalies?: boolean
+}
+
+export interface AnomalyWindowListResponse {
+  items: AnomalyWindow[]
+  limit: number
+  offset: number
+  has_more: boolean
+}
+
 export interface AlertEvent {
   id: string
   rule_id: string

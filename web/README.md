@@ -67,6 +67,20 @@ against ClickHouse and writes `alert_events` — see the pipeline README's
 admin/analyst; viewing rules and history is open to any authenticated
 role, same split as `/devices`.
 
+**Anomaly Windows** (`GET /api/anomaly-windows`, "Anomaly Windows" in the
+nav) is a read-only, paginated view over `syslog_ml.device_window_anomalies`
+— the periodic, windowed template-mix detector's own scored output (see
+the pipeline README's "Windowed template-mix anomaly detection" section),
+distinct from the per-event anomalies Log Search filters on. Defaults to
+flagged windows only, over the last 24h; toggle to "all scored windows" to
+see the unflagged ones too, e.g. to sanity-check what a device's normal
+score range looks like. Each row shows whether it was judged against that
+device's own model or a pooled vendor baseline. hostname is joined live
+from `events` (not stored on the anomaly table itself, since a device's
+resolved identity can change after the fact) using the same
+`FINAL`-qualified read pattern needed because the underlying table is a
+`ReplacingMergeTree` that gets rewritten as windows are rescored.
+
 ## Why this stack
 
 - **FastAPI**: shares Python with the rest of the pipeline (`ml/`), async,

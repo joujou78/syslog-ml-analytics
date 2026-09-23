@@ -288,13 +288,13 @@ sudo journalctl -u syslog-ml-alert-evaluator -f         # confirm it runs every 
 ### Anomaly flagging
 
 `events.is_anomaly` is populated by the classifier itself (`ml/consumer.py`),
-not a separate process. It's actually five independent signals
+not a separate process. It's actually six independent signals
 (`ml/anomaly_signals.py` for the stateless two, `DeviceBaselineCache` in
-`consumer.py` for the two that need per-device history) — any one firing
-sets `is_anomaly = 1`, and `events.anomaly_reasons` (an array column)
-records *which* one(s) did, the same "always label the reason, not just a
-verdict" principle already used for `resolution_method` and
-`vendor_source`:
+`consumer.py` for two that need per-device history, `ml/template_mix_anomaly.py`
+for the sixth — see below) — any one firing sets `is_anomaly = 1`, and
+`events.anomaly_reasons` (an array column) records *which* one(s) did, the
+same "always label the reason, not just a verdict" principle already used
+for `resolution_method` and `vendor_source`:
 
 - **`rare_template`**: the message's Drain3 template has matched
   `ANOMALY_RARE_THRESHOLD` (default 5) times or fewer in its whole
@@ -312,8 +312,16 @@ verdict" principle already used for `resolution_method` and
   `ANOMALY_VOLUME_SPIKE_MULTIPLIER` (default 5x) or more its own historical
   average rate — catches things like a flapping interface flooding the
   same (non-rare) message.
+- **`unusual_template_mix`**: this device's *mix* of Drain3 template types
+  over the last 5-minute window looks statistically different from its own
+  normal mix (or its vendor's, for a device without enough history of its
+  own yet) — see "Windowed template-mix anomaly detection" below. Unlike
+  the other five, this one is retrospective: it can only be judged once a
+  window has closed, so it's applied to already-inserted rows via a
+  targeted mutation, not inline as each message arrives.
 
-The last two are per-device, not global thresholds, since "unusual" only
+The middle two (severity_spike, volume_spike) are per-device, not global
+thresholds, since "unusual" only
 means something relative to what's normal *for that device* — a device
 that always logs at `err` isn't anomalous for continuing to do so, and a
 naturally chatty device isn't anomalous for being chatty. A brand-new
@@ -341,6 +349,82 @@ least one baseline refresh interval) before trusting `is_anomaly` counts.
 
 In the web app, search "Anomalies only" on the Log Search page to see
 everything currently flagged, with the reason(s) shown per row.
+
+### Windowed template-mix anomaly detection
+
+The five signals above all judge one message (or one device's running
+counters) at a time. `ml/template_mix_anomaly.py` asks a different
+question: does this device's overall *mix* of log message types over the
+last few minutes look normal, even if no single message in it looks
+unusual on its own? A device quietly switching from its usual mix of
+routine interface/DHCP chatter to mostly error-type messages, for
+instance, might not trip `rare_template` or `severity_spike` at all if
+none of those individual templates are new or unconditionally severe —
+but the *shift in composition* is itself a meaningful signal, and this is
+the same technique (windowed event-count vectors + an unsupervised
+outlier detector) that the [loglizer](https://github.com/logpai/loglizer)
+research toolkit uses for offline log anomaly benchmarks, adapted here to
+run continuously on live traffic.
+
+**How it works**, once per `TEMPLATE_MIX_REFRESH_SECONDS` (default 900s,
+15 min):
+
+1. Bucket each device's recent events (last `TEMPLATE_MIX_LOOKBACK_DAYS`,
+   default 7) into `TEMPLATE_MIX_WINDOW_MINUTES` (default 5) windows, and
+   count how many times each Drain3 template occurred in each window.
+2. Project each window into a fixed-size vector: the count of that
+   device's `TEMPLATE_MIX_TOP_K_TEMPLATES` (default 50) most frequent
+   templates, plus one "other" bucket for everything else — bounded
+   dimensionality even as new templates keep appearing over time, so the
+   model never has to be rebuilt from scratch just because Drain3 mined a
+   new template somewhere.
+3. **Hybrid model scope**: a device with at least
+   `TEMPLATE_MIX_MIN_WINDOWS_FOR_DEVICE` (default 30) windows of its own
+   history gets its own `IsolationForest`, trained on nothing but its own
+   past behavior. A lower-traffic device that hasn't accumulated that much
+   yet falls back to a *vendor-level* model instead — pooled from every
+   window of every device sharing that vendor (needs
+   `TEMPLATE_MIX_MIN_WINDOWS_FOR_VENDOR`, default 30, pooled windows) — so
+   it's still compared against something meaningful rather than going
+   unscored indefinitely. A device with neither isn't scored yet.
+4. Score every window that's completed since the last cycle (not just the
+   newest one — with a 15-minute cycle and 5-minute windows, only scoring
+   "the latest" would silently skip two out of every three windows). A
+   restart resumes from `syslog_ml.device_window_anomalies`'s own recorded
+   checkpoint rather than either re-backfilling everything or leaving a
+   gap.
+5. `TEMPLATE_MIX_CONTAMINATION` (default 0.01) is passed explicitly to
+   `IsolationForest` rather than using its `"auto"` setting — verified in
+   testing that `"auto"` over-flags by 20-30% on realistic windowed data
+   here, far too high for a signal meant to be rare. 0.01 assumes roughly
+   1% of windows are genuinely anomalous; tune it if that doesn't match
+   what you see in practice.
+
+**Where it surfaces**: every scored window (flagged or not) is written to
+`syslog_ml.device_window_anomalies` — browse it on the new **Anomaly
+Windows** page, which shows which model scope (device-specific or vendor
+baseline) applies to each row. Separately, since that table alone
+wouldn't hook into Log Search's or Alerts' existing `is_anomaly`/
+`anomaly_reasons` filtering, a *newly*-flagged window triggers one
+targeted `ALTER TABLE events UPDATE ... WHERE source_ip = ... AND
+event_time >= window_start AND event_time < window_end` — tagging every
+event in that window (not just the ones that look individually odd) with
+`unusual_template_mix`. This only ever fires for windows actually flagged
+anomalous (expected to be a small fraction), guarded by
+`NOT has(anomaly_reasons, 'unusual_template_mix')` so re-scoring the same
+window twice never double-tags it — never for the much larger common case
+of a normal window, which is what keeps it affordable despite ClickHouse
+mutations being relatively heavy in general.
+
+**Honest cost caveat**: the per-cycle query groups by
+`(source_ip, window, template_id)` across the whole lookback window —
+finer-grained, and so more expensive, than the simple `GROUP BY source_ip`
+the severity/volume baseline above already does. It runs on the same
+single-threaded loop as everything else in `consumer.py`, so a slow cycle
+briefly delays tailing new lines, the same tradeoff `DeviceBaselineCache`
+already makes at its own (shorter) interval. Widen
+`TEMPLATE_MIX_REFRESH_SECONDS` or shorten `TEMPLATE_MIX_LOOKBACK_DAYS` if
+this becomes a real cost on your traffic volume.
 
 ### Alerting
 
@@ -641,6 +725,16 @@ message body (snmptrapd's default format includes it), not in a
 structured field -- something a future improvement could parse out, not
 built yet.
 
+That same local-socket delivery is also why `rsyslog/60-syslog-ml.conf`
+explicitly allow-lists `programname == 'snmptrapd'` into the ML pipeline's
+ruleset: everything *else* arriving via that local path (this VM's own
+`gunicorn`/`sudo`/`systemd` output, forwarded from `journald`) is
+deliberately excluded (see that file's own comments) so it doesn't pollute
+Log Search as if it were device traffic. If you rename or wrap the
+`snmptrapd` binary such that its logged `programname` isn't literally
+`snmptrapd`, traps will stop reaching `raw.jsonl` silently -- the same
+`sudo tail -3 /var/log/syslog-ml/raw.jsonl` checkpoint above catches that.
+
 ## Step 6 — train the real classifier (after a few hours/days of traffic)
 
 ```bash
@@ -656,12 +750,13 @@ prefers a real `category` field over the weak-supervision guess.
 
 ## Files
 
-- `clickhouse/init.sql` — `device_inventory`, `events`, and the per-minute rollup.
+- `clickhouse/init.sql` — `device_inventory`, `events`, the per-minute rollup, and `device_window_anomalies`.
 - `rsyslog/10-network-listener.conf` — enables rsyslog to receive syslog over the network (UDP/TCP 514), routed into the `syslogMlNetwork` ruleset so this VM's own local/journald traffic isn't mixed in.
-- `rsyslog/60-syslog-ml.conf` — mirrors that network-only ruleset's feed to a local JSON file.
+- `rsyslog/60-syslog-ml.conf` — mirrors that network-only ruleset's feed to a local JSON file (plus an explicit `snmptrapd` allow-list, since it logs traps via that same local path -- see "Windowed template-mix anomaly detection" and the SNMP trap section below).
 - `snmptrapd/` — optional SNMP trap receiver config, feeding traps into the same pipeline via local syslog.
 - `ml/consumer.py` — tails the file, resolves identity, classifies, flags anomalies, writes to ClickHouse.
 - `ml/anomaly_signals.py` — stateless anomaly signals (always_severe, security_content); the per-device ones (severity_spike, volume_spike) live in `consumer.py`'s `DeviceBaselineCache`.
+- `ml/template_mix_anomaly.py` — the sixth anomaly signal: periodic, windowed, per-device/per-vendor template-mix outlier detection (`unusual_template_mix`).
 - `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver, including credential-pool discovery/auto-save (reads credentials from Postgres, see `web/`).
 - `ml/reverify_devices.py` — twice-daily re-check of already-resolved devices; self-heals an auto-discovered credential if its community rotates.
 - `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.
