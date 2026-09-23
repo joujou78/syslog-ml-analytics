@@ -14,6 +14,7 @@ export function Layout() {
           </NavLink>
           <NavLink to="/logs">Log Search</NavLink>
           <NavLink to="/anomaly-windows">Anomaly Windows</NavLink>
+          <NavLink to="/anomaly-summary">Anomaly Summary</NavLink>
           <NavLink to="/alerts">Alerts</NavLink>
           {user?.role === 'admin' && <NavLink to="/credentials">SNMP Credentials</NavLink>}
           {user?.role === 'admin' && <NavLink to="/relays">Relay Source IPs</NavLink>}

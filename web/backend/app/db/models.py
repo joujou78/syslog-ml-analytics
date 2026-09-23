@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, func
+from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -168,6 +168,38 @@ class AlertEvent(Base):
     notify_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     rule: Mapped["AlertRule"] = relationship()
+
+
+class AnomalyAcknowledgment(Base):
+    """
+    A persistent "we've seen and handled this" flag per (device, anomaly
+    type) pair -- e.g. severity_spike on 10.0.0.1 -- surfaced on the
+    Anomaly Summary page. Deliberately simple: one row per pair (upserted,
+    not append-only), and it stays acknowledged until someone explicitly
+    un-acknowledges it -- it does NOT automatically go stale just because
+    a new matching event arrives later. That's a real tradeoff (a
+    genuinely recurring problem can go unnoticed if nobody thinks to
+    re-check an old ack), chosen deliberately over the alternative
+    (auto-reset on any new occurrence) because the operator wanted a
+    stable "handled" flag rather than one that flips back on every
+    recurrence.
+
+    anomaly_reason is one of events.anomaly_reasons' values (rare_template
+    | always_severe | security_content | severity_spike | volume_spike |
+    unusual_template_mix) but not a DB-level foreign key, since that
+    array lives in ClickHouse, not Postgres -- logical reference only,
+    same as ClassificationFeedback.event_id.
+    """
+    __tablename__ = "anomaly_acknowledgments"
+    __table_args__ = (UniqueConstraint("source_ip", "anomaly_reason", name="uq_anomaly_ack_device_reason"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_ip: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    anomaly_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    acknowledged_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    acknowledged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class AuditLog(Base):

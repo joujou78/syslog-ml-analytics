@@ -81,6 +81,37 @@ resolved identity can change after the fact) using the same
 `FINAL`-qualified read pattern needed because the underlying table is a
 `ReplacingMergeTree` that gets rewritten as windows are rescored.
 
+**Anomaly Summary** (`GET /api/anomaly-summary/devices` and `/vendors`,
+"Anomaly Summary" in the nav) answers a different question than Anomaly
+Windows or Log Search: not "what happened recently" but "how many times,
+total, has each device produced each *type* of anomaly (rare_template,
+always_severe, security_content, severity_spike, volume_spike,
+unusual_template_mix), since the beginning of your data". Built from
+`syslog_ml.events` with `arrayJoin(anomaly_reasons)` to unnest the array
+column — an event tagged with two reasons contributes to two separate
+(device, reason) rows, not one. No time filter, deliberately: this is a
+cumulative view, not a rolling window.
+
+Each (device, anomaly type) row can be **acknowledged** — a persistent
+"reviewed and handled" flag stored in Postgres'
+`anomaly_acknowledgments` (upserted, unique on `(source_ip,
+anomaly_reason)`), with an optional free-text note (e.g. "restarted
+switch, resolved") and who/when. By explicit choice, it does **not**
+auto-reset when a new matching event arrives later — it stays
+acknowledged until someone explicitly un-acknowledges it. That's a real
+tradeoff: a genuinely recurring problem can go unnoticed behind an old
+ack if nobody thinks to re-check it, chosen anyway because a stable flag
+was wanted over one that silently flips back on every recurrence.
+Acknowledging/un-acknowledging is admin/analyst (same split as alert rule
+management); viewing is open to any authenticated role.
+
+The "By vendor" toggle switches to a read-only rollup (`GROUP BY vendor,
+reason` instead of `source_ip, reason`) for a fleet-wide view of which
+anomaly types are common for a given vendor and how many distinct devices
+are affected — not individually acknowledgable, since an ack is
+meaningful per-device (you fix one specific box), not per-vendor. Export
+(CSV/XML) respects whichever view is currently selected.
+
 **Query Console** (`POST /api/query-console/execute`, "Query Console" in
 the admin nav) is full, unrestricted SQL access against ClickHouse from
 the browser — including `ALTER`, `DELETE`, `DROP`, and `TRUNCATE`. This is

@@ -3,6 +3,7 @@ import { AuthProvider } from './auth/AuthContext'
 import { Layout } from './components/Layout'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { Alerts } from './pages/Alerts'
+import { AnomalySummary } from './pages/AnomalySummary'
 import { AnomalyWindows } from './pages/AnomalyWindows'
 import { Credentials } from './pages/Credentials'
 import { Devices } from './pages/Devices'
@@ -21,6 +22,7 @@ export default function App() {
             <Route path="/" element={<Devices />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/anomaly-windows" element={<AnomalyWindows />} />
+            <Route path="/anomaly-summary" element={<AnomalySummary />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route element={<ProtectedRoute allowedRoles={['admin']} />}>
               <Route path="/credentials" element={<Credentials />} />

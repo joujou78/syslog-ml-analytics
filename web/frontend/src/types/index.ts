@@ -195,3 +195,26 @@ export interface AlertEvent {
   notified: boolean
   notify_error: string | null
 }
+
+export interface DeviceAnomalySummaryRow {
+  source_ip: string
+  hostname: string
+  vendor: string
+  anomaly_reason: string
+  event_count: number
+  first_seen: string
+  last_seen: string
+  acknowledged: boolean
+  acknowledged_by: string | null
+  acknowledged_at: string | null
+  note: string | null
+}
+
+export interface VendorAnomalySummaryRow {
+  vendor: string
+  anomaly_reason: string
+  device_count: number
+  event_count: number
+  first_seen: string
+  last_seen: string
+}
