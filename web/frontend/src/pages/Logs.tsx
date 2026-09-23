@@ -5,7 +5,7 @@ import { formatBeirutDateTime } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
 
-const PAGE_SIZE = 50
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 500]
 
 const EMPTY_FILTERS: LogSearchFilters = {}
 
@@ -16,24 +16,26 @@ function SeverityBadge({ severity }: { severity: string }) {
 export function Logs() {
   const [filters, setFilters] = useState<LogSearchFilters>(EMPTY_FILTERS)
   const [pendingFilters, setPendingFilters] = useState<LogSearchFilters>(EMPTY_FILTERS)
+  const [pageSize, setPageSize] = useState(50)
   const [offset, setOffset] = useState(0)
   const [items, setItems] = useState<LogEntry[] | null>(null)
   const [hasMore, setHasMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   useEffect(() => {
     setLoading(true)
     setError(null)
     logsApi
-      .search({ ...filters, limit: PAGE_SIZE, offset })
+      .search({ ...filters, limit: pageSize, offset })
       .then((res) => {
         setItems(res.items)
         setHasMore(res.has_more)
       })
       .catch(() => setError('Could not search logs — is ClickHouse reachable from the API?'))
       .finally(() => setLoading(false))
-  }, [filters, offset])
+  }, [filters, pageSize, offset])
 
   function applyFilters(e: React.FormEvent) {
     e.preventDefault()
@@ -53,6 +55,23 @@ export function Logs() {
 
   function toggleOnlyAnomalies(checked: boolean) {
     setPendingFilters((prev) => ({ ...prev, only_anomalies: checked || undefined }))
+  }
+
+  function changePageSize(size: number) {
+    setPageSize(size)
+    setOffset(0)
+  }
+
+  function exportLogs(format: 'csv' | 'xml') {
+    setExporting(true)
+    setError(null)
+    logsApi
+      .export(filters, format)
+      .then(({ truncated }) => {
+        if (truncated) setError('Export was capped at 50,000 rows — narrow the time range to get everything.')
+      })
+      .catch(() => setError('Could not export logs — is ClickHouse reachable from the API?'))
+      .finally(() => setExporting(false))
   }
 
   return (
@@ -130,11 +149,30 @@ export function Logs() {
           <button type="button" onClick={clearFilters}>
             Clear
           </button>
+          <button type="button" disabled={exporting} onClick={() => exportLogs('csv')}>
+            {exporting ? 'Exporting…' : 'Export CSV'}
+          </button>
+          <button type="button" disabled={exporting} onClick={() => exportLogs('xml')}>
+            {exporting ? 'Exporting…' : 'Export XML'}
+          </button>
         </div>
       </form>
 
       {error && <p className="form-error">{error}</p>}
       {loading && <p className="page-hint">Searching…</p>}
+
+      <div className="form-actions" style={{ alignItems: 'center' }}>
+        <label style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          Per page
+          <select value={pageSize} onChange={(e) => changePageSize(Number(e.target.value))}>
+            {PAGE_SIZE_OPTIONS.map((size) => (
+              <option key={size} value={size}>
+                {size}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
 
       <table className="data-table">
         <thead>
@@ -179,12 +217,15 @@ export function Logs() {
       </table>
 
       <div className="form-actions" style={{ marginTop: 16 }}>
-        <button type="button" disabled={offset === 0} onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}>
+        <button type="button" disabled={offset === 0} onClick={() => setOffset((o) => Math.max(0, o - pageSize))}>
           Previous
         </button>
-        <button type="button" disabled={!hasMore} onClick={() => setOffset((o) => o + PAGE_SIZE)}>
+        <button type="button" disabled={!hasMore} onClick={() => setOffset((o) => o + pageSize)}>
           Next
         </button>
+        <span className="page-hint">
+          Showing {items?.length ? offset + 1 : 0}–{offset + (items?.length ?? 0)}
+        </span>
       </div>
     </div>
   )

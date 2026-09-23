@@ -45,7 +45,18 @@ the page size to derive "more results exist" instead of running
 `COUNT(*)` over the match set, since an unbounded count on a table sized
 for high-volume retention is the expensive query the skip indexes in
 `clickhouse/init.sql` exist to help you avoid, not something to run on
-every search.
+every search. Page size is selectable (10/25/50/100/500), same as
+Devices.
+
+**Export** (`GET /api/logs/export`, "Export CSV"/"Export XML" buttons on
+the Log Search page) downloads every row matching the *currently applied*
+filters -- not just the current page -- as a single CSV or XML file, up
+to `EXPORT_MAX_ROWS` (50,000; a `X-Export-Truncated: true` response
+header, surfaced as a warning in the UI, tells you if the real match set
+was larger). Shares the same filter-building logic as `/logs/search` via
+`log_search_service._build_conditions`, so a filter added to one search
+path can't silently drift from the other. Covered by
+`web/frontend/e2e/logs_export.mjs` (`npm run test:e2e:logs-export`).
 
 **Alerts** ("Alerts" in the nav) manage `alert_rules` here in Postgres
 (name, enabled, window/threshold/cooldown, the same filter fields as log
