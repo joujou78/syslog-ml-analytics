@@ -1,11 +1,23 @@
 import { useEffect, useState } from 'react'
 import { logsApi } from '../api/logs'
 import type { LogEntry, LogSearchFilters } from '../types'
-import { formatBeirutDateTime } from '../utils/time'
+import { formatBeirutDateTime, formatBeirutTime } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 500]
+
+// Milliseconds; 0 means "off". Off by default -- unlike Devices' fixed
+// 30s auto-refresh, this page is also where you sit reading through a
+// specific search/page of results, so silently re-fetching underneath
+// someone mid-review should be something they opt into, not a default.
+const AUTO_REFRESH_OPTIONS: { label: string; value: number }[] = [
+  { label: 'Off', value: 0 },
+  { label: '5s', value: 5000 },
+  { label: '15s', value: 15000 },
+  { label: '30s', value: 30000 },
+  { label: '60s', value: 60000 },
+]
 
 const EMPTY_FILTERS: LogSearchFilters = {}
 
@@ -23,19 +35,39 @@ export function Logs() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [autoRefreshMs, setAutoRefreshMs] = useState(0)
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
-  useEffect(() => {
-    setLoading(true)
-    setError(null)
+  const load = (silent = false) => {
+    if (!silent) {
+      setLoading(true)
+      setError(null)
+    }
     logsApi
       .search({ ...filters, limit: pageSize, offset })
       .then((res) => {
         setItems(res.items)
         setHasMore(res.has_more)
+        setLastUpdated(new Date())
       })
       .catch(() => setError('Could not search logs — is ClickHouse reachable from the API?'))
-      .finally(() => setLoading(false))
+      .finally(() => {
+        if (!silent) setLoading(false)
+      })
+  }
+
+  useEffect(() => {
+    load()
   }, [filters, pageSize, offset])
+
+  // Auto-refresh the current search/page in the background when enabled --
+  // doesn't touch filters/offset, so paging or editing the form is
+  // unaffected. Off by default (see AUTO_REFRESH_OPTIONS above).
+  useEffect(() => {
+    if (!autoRefreshMs) return
+    const interval = setInterval(() => load(true), autoRefreshMs)
+    return () => clearInterval(interval)
+  }, [autoRefreshMs, filters, pageSize, offset])
 
   function applyFilters(e: React.FormEvent) {
     e.preventDefault()
@@ -80,6 +112,7 @@ export function Logs() {
       <p className="page-hint">
         Searches the last 24 hours by default. Narrow the time range for faster results on a busy day.
         Times shown are Beirut local time.
+        {autoRefreshMs > 0 && lastUpdated && <> Auto-refreshing every {autoRefreshMs / 1000}s — last updated {formatBeirutTime(lastUpdated)}.</>}
       </p>
 
       <form className="credential-form" onSubmit={applyFilters}>
@@ -168,6 +201,16 @@ export function Logs() {
             {PAGE_SIZE_OPTIONS.map((size) => (
               <option key={size} value={size}>
                 {size}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          Auto-refresh
+          <select value={autoRefreshMs} onChange={(e) => setAutoRefreshMs(Number(e.target.value))}>
+            {AUTO_REFRESH_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
               </option>
             ))}
           </select>
