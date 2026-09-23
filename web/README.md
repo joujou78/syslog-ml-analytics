@@ -4,6 +4,20 @@ FastAPI + Postgres backend, React (Vite + TypeScript) frontend. Provides
 device/credential management, log search, and alerting now, with an ML
 feedback/correction loop planned as a later phase (see "Roadmap" below).
 
+**Timestamps are displayed in Beirut local time** across every page
+(Devices, Log Search, Alerts, Credentials) via `src/utils/time.ts` --
+using the real `Asia/Beirut` IANA timezone (not a fixed offset), so it
+stays correct across DST if Lebanon observes it, confirmed against both
+a September (+3h) and January (+2h) UTC timestamp. This is display-only:
+every timestamp is still stored and transmitted as UTC end-to-end (see
+the pipeline README's `clickhouse/init.sql`), which every window/TTL/
+comparison query in this codebase assumes -- only the last rendering
+step converts it. **Known gap**: the Log Search page's Start/End filter
+inputs (`<input type="datetime-local">`) are not converted the same
+way -- they still submit the browser's own local wall-clock time as a
+naive value straight to the API, so filtering by a specific time range
+can be off if the viewer's browser isn't itself set to Beirut time.
+
 **Devices** ("Devices" in the nav) is paginated (10/25/50/100/500 per page,
 same `has_more`-based approach as log search) and auto-refreshes its
 current page every 30 seconds in the background, since devices resolve

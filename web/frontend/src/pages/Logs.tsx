@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { logsApi } from '../api/logs'
 import type { LogEntry, LogSearchFilters } from '../types'
+import { formatBeirutDateTime } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
 
@@ -59,6 +60,7 @@ export function Logs() {
       <h2>Log search</h2>
       <p className="page-hint">
         Searches the last 24 hours by default. Narrow the time range for faster results on a busy day.
+        Times shown are Beirut local time.
       </p>
 
       <form className="credential-form" onSubmit={applyFilters}>
@@ -150,7 +152,7 @@ export function Logs() {
         <tbody>
           {items?.map((entry, i) => (
             <tr key={`${entry.event_time}-${entry.source_ip}-${i}`}>
-              <td className="mono">{new Date(entry.event_time).toLocaleString()}</td>
+              <td className="mono">{formatBeirutDateTime(entry.event_time)}</td>
               <td>{entry.hostname}</td>
               <td className="mono">{entry.source_ip}</td>
               <td>

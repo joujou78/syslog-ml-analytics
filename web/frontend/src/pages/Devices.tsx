@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { devicesApi } from '../api/devices'
 import type { Device, DeviceSearchFilters, ResolutionSummary } from '../types'
+import { formatBeirutDateTime, formatBeirutTime } from '../utils/time'
 
 const RESOLUTION_LABEL: Record<string, string> = {
   snmp: 'Verified (SNMP)',
@@ -80,7 +81,7 @@ export function Devices() {
       <h2>Devices</h2>
       <p className="page-hint">
         Defaults to the last 24 hours. Auto-refreshes every 30s
-        {lastUpdated && <> — last updated {lastUpdated.toLocaleTimeString()}</>}.
+        {lastUpdated && <> — last updated {formatBeirutTime(lastUpdated)}</>}. Times shown are Beirut local time.
       </p>
 
       {error && <p className="form-error">{error}</p>}
@@ -172,7 +173,7 @@ export function Devices() {
                 <ResolutionBadge method={d.resolution_method} />
               </td>
               <td>{d.event_count.toLocaleString()}</td>
-              <td>{new Date(d.last_seen).toLocaleString()}</td>
+              <td>{formatBeirutDateTime(d.last_seen)}</td>
             </tr>
           ))}
           {devices?.length === 0 && (

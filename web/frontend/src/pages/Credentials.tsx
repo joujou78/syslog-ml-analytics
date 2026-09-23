@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { credentialsApi } from '../api/credentials'
 import type { Credential, CredentialInput, SnmpVersion } from '../types'
+import { formatBeirutDateTime } from '../utils/time'
 
 const EMPTY_FORM: CredentialInput = {
   ip_or_cidr: '',
@@ -283,7 +284,7 @@ export function Credentials() {
               </td>
               <td>{c.version}</td>
               <td>{c.version === 'v3' ? `user=${c.v3_user}, level=${c.v3_level}` : c.has_community ? 'community set' : 'no community set'}</td>
-              <td>{new Date(c.updated_at).toLocaleString()}</td>
+              <td>{formatBeirutDateTime(c.updated_at)}</td>
               <td className="row-actions">
                 <button onClick={() => startEdit(c)}>Edit</button>
                 <button onClick={() => handleDelete(c.id)}>Delete</button>

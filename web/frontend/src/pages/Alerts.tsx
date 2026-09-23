@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { alertsApi } from '../api/alerts'
 import { useAuth } from '../auth/AuthContext'
 import type { AlertEvent, AlertRule, AlertRuleInput } from '../types'
+import { formatBeirutDateTime } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
 
@@ -256,7 +257,7 @@ export function Alerts() {
                 {r.program && `, program=${r.program}`}
                 {r.only_anomalies && ', anomalies only'}
               </td>
-              <td>{r.last_triggered_at ? new Date(r.last_triggered_at).toLocaleString() : 'Never'}</td>
+              <td>{r.last_triggered_at ? formatBeirutDateTime(r.last_triggered_at) : 'Never'}</td>
               {canManage && (
                 <td className="row-actions">
                   <button onClick={() => startEdit(r)}>Edit</button>
@@ -288,7 +289,7 @@ export function Alerts() {
           {history?.map((h) => (
             <tr key={h.id}>
               <td>{ruleName(h.rule_id)}</td>
-              <td>{new Date(h.triggered_at).toLocaleString()}</td>
+              <td>{formatBeirutDateTime(h.triggered_at)}</td>
               <td>{h.matched_count}</td>
               <td className="mono log-message">{h.sample_message}</td>
               <td>{h.notified ? 'Yes' : `No${h.notify_error ? ` (${h.notify_error})` : ''}`}</td>
