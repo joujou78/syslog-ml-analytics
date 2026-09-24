@@ -85,6 +85,14 @@ export function Logs() {
   const [autoRefreshMs, setAutoRefreshMs] = useState(0)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [filterOptions, setFilterOptions] = useState<LogFilterOptions>({ vendors: [], programs: [] })
+  // Message cells are truncated to one line by default (some vendors emit
+  // very long structured payloads) -- clicking one expands it in place,
+  // wrapping onto multiple lines instead of overflowing the table.
+  // Row-index-keyed, not persisted across a reload/refresh (see `load`
+  // below), since "row 3" meaning something different after a re-search or
+  // auto-refresh reshuffles the page is more confusing than losing the
+  // expansion.
+  const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set())
 
   useEffect(() => {
     logsApi.filterOptions().then(setFilterOptions).catch(() => {
@@ -105,6 +113,7 @@ export function Logs() {
         setItems(res.items)
         setHasMore(res.has_more)
         setLastUpdated(new Date())
+        setExpandedRows(new Set())
       })
       .catch(() => setError('Could not search logs — is ClickHouse reachable from the API?'))
       .finally(() => {
@@ -124,6 +133,15 @@ export function Logs() {
     const interval = setInterval(() => load(true), autoRefreshMs)
     return () => clearInterval(interval)
   }, [autoRefreshMs, filters, pageSize, offset])
+
+  function toggleExpanded(i: number) {
+    setExpandedRows((prev) => {
+      const next = new Set(prev)
+      if (next.has(i)) next.delete(i)
+      else next.add(i)
+      return next
+    })
+  }
 
   function applyFilters(e: React.FormEvent) {
     e.preventDefault()
@@ -333,7 +351,13 @@ export function Logs() {
                   </span>
                 ))}
               </td>
-              <td className="mono log-message">{entry.message}</td>
+              <td
+                className={`mono log-message${expandedRows.has(i) ? ' expanded' : ''}`}
+                onClick={() => toggleExpanded(i)}
+                title={expandedRows.has(i) ? 'Click to collapse' : 'Click to expand'}
+              >
+                {entry.message}
+              </td>
             </tr>
           ))}
           {items?.length === 0 && !loading && (

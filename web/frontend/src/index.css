@@ -315,6 +315,19 @@ label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.log-message:hover {
+  text-decoration: underline dotted;
+  text-decoration-color: var(--text-dim);
+}
+
+.log-message.expanded {
+  max-width: 640px;
+  overflow: visible;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .badge-severity-emerg,
