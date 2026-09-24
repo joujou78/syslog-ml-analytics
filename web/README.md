@@ -37,7 +37,8 @@ Applying a search resets pagination back to the first page. Covered by
 **Log search** (`GET /api/logs/search`, "Log Search" in the nav) is a
 filtered, paginated query straight over `syslog_ml.events` in ClickHouse —
 no new database, no new data path. Filters: time range (defaults to the
-last 24h), hostname, source IP, program, severity, category, an
+last 24h), hostname, source IP (free text -- too high-cardinality for a
+dropdown), vendor, anomaly type, program, severity, category, an
 "anomalies only" toggle, and a case-insensitive keyword match on the
 message. Each result row shows which anomaly signal(s) fired (see the
 pipeline README's "Anomaly flagging" section). It fetches one row past
@@ -47,6 +48,19 @@ for high-volume retention is the expensive query the skip indexes in
 `clickhouse/init.sql` exist to help you avoid, not something to run on
 every search. Page size is selectable (10/25/50/100/500), same as
 Devices.
+
+**Filter dropdowns**: Severity and Anomaly type are fixed, small enums
+defined in code (there are only ever 8 severities and 6 anomaly reasons),
+so their options are hardcoded in the frontend, same treatment. Vendor
+and Program aren't fixed enums -- they're whatever's actually shown up in
+your fleet -- so `GET /api/logs/filter-options` returns the real distinct
+values via a single `groupUniqArray` pass over `syslog_ml.events`,
+bounded to the last `FILTER_OPTIONS_LOOKBACK_DAYS` (30) so the query
+doesn't get slower as the table grows (it now retains data indefinitely).
+If a filter value arrives via a deep link (e.g. an Anomaly Summary
+drill-down) that isn't in that 30-day window, it's still shown as a valid
+selected option -- the dropdown never silently drops a value it didn't
+happen to fetch.
 
 **Export** (`GET /api/logs/export`, "Export CSV"/"Export XML" buttons on
 the Log Search page) downloads every row matching the *currently applied*

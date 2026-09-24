@@ -24,3 +24,13 @@ class LogSearchResponse(BaseModel):
     limit: int
     offset: int
     has_more: bool
+
+
+class LogFilterOptions(BaseModel):
+    """Distinct values actually present in recent data, for populating the
+    Vendor/Program filter dropdowns -- unlike severity or anomaly_reason,
+    these aren't a fixed enum defined in code, so they can't just be
+    hardcoded in the frontend the way Severity's options already are."""
+
+    vendors: list[str]
+    programs: list[str]

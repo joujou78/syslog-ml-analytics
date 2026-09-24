@@ -127,6 +127,11 @@ export interface LogSearchResponse {
   has_more: boolean
 }
 
+export interface LogFilterOptions {
+  vendors: string[]
+  programs: string[]
+}
+
 export interface AlertRuleInput {
   name: string
   enabled: boolean

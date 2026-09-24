@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { logsApi } from '../api/logs'
-import type { LogEntry, LogSearchFilters } from '../types'
+import type { LogEntry, LogFilterOptions, LogSearchFilters } from '../types'
 import { formatBeirutDateTime, formatBeirutTime } from '../utils/time'
 
 type StringFilterKey =
@@ -28,6 +28,24 @@ function filtersFromSearchParams(params: URLSearchParams): LogSearchFilters {
 }
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
+
+// A fixed, small set defined in code (see ml/anomaly_signals.py,
+// consumer.py's DeviceBaselineCache, and ml/template_mix_anomaly.py) --
+// unlike Vendor/Program below, there's nothing to fetch, this can't grow
+// without a code change.
+const ANOMALY_REASON_OPTIONS = [
+  'rare_template', 'always_severe', 'security_content', 'severity_spike', 'volume_spike', 'unusual_template_mix',
+]
+
+// If the current filter value (e.g. from a deep link -- see Anomaly
+// Summary's drill-down links) isn't among the fetched options (which only
+// cover the last 30 days, see FILTER_OPTIONS_LOOKBACK_DAYS on the
+// backend), include it anyway so the dropdown doesn't silently show a
+// value that isn't one of its own options.
+function optionsWithCurrent(options: string[], current: string | undefined): string[] {
+  if (current && !options.includes(current)) return [current, ...options]
+  return options
+}
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 500]
 
@@ -66,6 +84,15 @@ export function Logs() {
   const [exporting, setExporting] = useState(false)
   const [autoRefreshMs, setAutoRefreshMs] = useState(0)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [filterOptions, setFilterOptions] = useState<LogFilterOptions>({ vendors: [], programs: [] })
+
+  useEffect(() => {
+    logsApi.filterOptions().then(setFilterOptions).catch(() => {
+      // Non-fatal: the Vendor/Program dropdowns just show only whatever
+      // value a deep link carried in, if any -- the rest of the page
+      // still works.
+    })
+  }, [])
 
   const load = (silent = false) => {
     if (!silent) {
@@ -165,20 +192,36 @@ export function Logs() {
           </label>
           <label>
             Vendor
-            <input type="text" value={pendingFilters.vendor ?? ''} onChange={(e) => updateField('vendor', e.target.value)} />
+            <select value={pendingFilters.vendor ?? ''} onChange={(e) => updateField('vendor', e.target.value)}>
+              <option value="">Any</option>
+              {optionsWithCurrent(filterOptions.vendors, pendingFilters.vendor).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             Anomaly type
-            <input
-              type="text"
-              value={pendingFilters.anomaly_reason ?? ''}
-              onChange={(e) => updateField('anomaly_reason', e.target.value)}
-              placeholder="e.g. severity_spike, volume_spike"
-            />
+            <select value={pendingFilters.anomaly_reason ?? ''} onChange={(e) => updateField('anomaly_reason', e.target.value)}>
+              <option value="">Any</option>
+              {ANOMALY_REASON_OPTIONS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             Program
-            <input type="text" value={pendingFilters.program ?? ''} onChange={(e) => updateField('program', e.target.value)} />
+            <select value={pendingFilters.program ?? ''} onChange={(e) => updateField('program', e.target.value)}>
+              <option value="">Any</option>
+              {optionsWithCurrent(filterOptions.programs, pendingFilters.program).map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             Severity

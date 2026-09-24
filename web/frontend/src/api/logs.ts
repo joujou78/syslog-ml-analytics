@@ -1,5 +1,5 @@
 import { apiClient } from './client'
-import type { LogSearchFilters, LogSearchResponse } from '../types'
+import type { LogFilterOptions, LogSearchFilters, LogSearchResponse } from '../types'
 
 function cleanParams<T extends object>(filters: T) {
   return Object.fromEntries(Object.entries(filters).filter(([, v]) => v !== undefined && v !== ''))
@@ -8,6 +8,8 @@ function cleanParams<T extends object>(filters: T) {
 export const logsApi = {
   search: (filters: LogSearchFilters) =>
     apiClient.get<LogSearchResponse>('/logs/search', { params: cleanParams(filters) }).then((r) => r.data),
+
+  filterOptions: () => apiClient.get<LogFilterOptions>('/logs/filter-options').then((r) => r.data),
 
   // Not paginated -- exports everything matching the current filters (up to
   // the backend's EXPORT_MAX_ROWS cap) as a single file download, rather

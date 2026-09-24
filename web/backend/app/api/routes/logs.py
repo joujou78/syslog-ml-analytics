@@ -5,7 +5,7 @@ from clickhouse_connect.driver.client import Client
 from fastapi import APIRouter, Depends, Query, Response
 
 from app.api.deps import get_ch_client, get_current_user
-from app.schemas.log_search import LogSearchResponse
+from app.schemas.log_search import LogFilterOptions, LogSearchResponse
 from app.services import log_search_service
 
 router = APIRouter(prefix="/logs", tags=["logs"])
@@ -49,6 +49,11 @@ async def search_logs(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/filter-options", response_model=LogFilterOptions)
+async def filter_options(_user=_authenticated, client: Client = Depends(get_ch_client)):
+    return log_search_service.get_filter_options(client)
 
 
 @router.get("/export")

@@ -5,10 +5,16 @@ from xml.sax.saxutils import escape
 
 from clickhouse_connect.driver.client import Client
 
-from app.schemas.log_search import LogEntry, LogSearchResponse
+from app.schemas.log_search import LogEntry, LogFilterOptions, LogSearchResponse
 
 DEFAULT_LOOKBACK = timedelta(hours=24)
 MAX_LIMIT = 1000
+# How far back to look for "what vendors/programs actually exist" when
+# populating the filter dropdowns. Bounded deliberately: `events` now
+# retains data indefinitely (no TTL), so an unbounded DISTINCT here would
+# only get slower as the table grows, and a vendor/program that hasn't
+# appeared in months isn't a useful filter option today anyway.
+FILTER_OPTIONS_LOOKBACK_DAYS = 30
 # Export isn't paginated -- it's a one-shot "give me everything matching" --
 # so it needs its own, much higher cap rather than reusing MAX_LIMIT. Still
 # bounded: an unbounded export over a wide time range on a table sized for
@@ -160,6 +166,20 @@ def search_logs(
         for row in rows
     ]
     return LogSearchResponse(items=items, limit=limit, offset=offset, has_more=has_more)
+
+
+def get_filter_options(client: Client) -> LogFilterOptions:
+    """Real, currently-relevant values for the Vendor/Program filter
+    dropdowns -- unlike Severity or anomaly_reason (fixed, small enums
+    hardcoded in the frontend), vendor and program are open-ended based on
+    whatever's actually in the fleet, so there's nothing to hardcode."""
+    result = client.query(f"""
+        SELECT groupUniqArray(vendor), groupUniqArray(program)
+        FROM syslog_ml.events
+        WHERE event_time >= now() - INTERVAL {FILTER_OPTIONS_LOOKBACK_DAYS} DAY
+    """)
+    vendors, programs = result.result_rows[0] if result.result_rows else ([], [])
+    return LogFilterOptions(vendors=sorted(vendors), programs=sorted(programs))
 
 
 def _rows_to_csv(rows: list) -> bytes:
