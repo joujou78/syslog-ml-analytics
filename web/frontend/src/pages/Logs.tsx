@@ -354,7 +354,7 @@ export function Logs() {
               <td
                 className={`mono log-message${expandedRows.has(i) ? ' expanded' : ''}`}
                 onClick={() => toggleExpanded(i)}
-                title={expandedRows.has(i) ? 'Click to collapse' : 'Click to expand'}
+                title={entry.message}
               >
                 {entry.message}
               </td>
