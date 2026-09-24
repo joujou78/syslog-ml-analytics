@@ -648,6 +648,25 @@ revisiting twice a year.
 processed after this deploys get the correction; historical rows keep
 their originally-recorded (off-by-3-hours) `event_time`.
 
+### Cisco ACS/ISE multi-part message reassembly
+
+Cisco ACS/ISE splits any message too long for one UDP syslog datagram
+into multiple separate syslog messages (program names like
+`CSCOacs_TACACS_Diagnostics`, `CSCOacs_Failed_Attempts`,
+`CSCOacs_TACACS_Accounting`), each carrying the same
+`<message-id> <total-segments> <this-segment-index>` numeric prefix so
+the receiver can stitch them back together. `ml/consumer.py`'s
+`AcsMultipartReassembler` buffers these by `(source_ip, message_id)` and
+inserts one merged row per complete group instead of one broken partial
+row per segment — this also strips that numeric prefix from
+single-segment ACS messages, so every ACS row in Log Search reads as the
+actual message text, not raw protocol plumbing. This runs automatically;
+no setup needed. If a segment is lost (UDP), `ACS_REASSEMBLY_TIMEOUT_SECONDS`
+(default `10`) controls how long it waits before giving up and inserting
+whatever segments did arrive — check `journalctl -u syslog-ml-classifier`
+for `"incomplete after"` warnings if you ever see a still-truncated ACS
+message.
+
 ### Optional: receive SNMP traps too (separate from syslog)
 
 SNMP traps are a different protocol (default UDP 162, not 514) and need

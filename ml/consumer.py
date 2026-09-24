@@ -20,6 +20,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -114,6 +115,128 @@ INSERT_COLUMNS = [
     "message", "template_id", "template", "predicted_category", "predicted_confidence",
     "is_anomaly", "anomaly_reasons", "raw",
 ]
+
+# Cisco ACS/ISE (TACACS+/RADIUS accounting, TACACS diagnostics, failed
+# attempts, etc.) splits any message too long for one UDP syslog datagram
+# into multiple separate syslog messages, each carrying the SAME
+# "<message-id> <total-segments> <this-segment-index>" prefix (index
+# 0-based) so the receiver can stitch them back together. Confirmed on
+# net-flow's real ACS traffic (program=CSCOacs_TACACS_Diagnostics /
+# CSCOacs_Failed_Attempts / CSCOacs_TACACS_Accounting):
+#   " 0001384016 2 0 2026-09-24 ... NetworkDeviceGroups=...PESCO BACKBONE,"
+#   " 0001384016 2 1  ServiceSelectionMatchedRule=Rule-2, ... }"
+# -- concatenating each segment's content (everything after the 3-number
+# prefix, in index order) with NO added separator reproduces the original
+# message exactly: the leading space visible before "ServiceSelection..."
+# above is itself part of segment 1's own content (ACS resumes mid-string
+# at whatever byte the datagram limit cut it off), not a delimiter to
+# strip. Without this, every split ACS message shows up in Log Search and
+# the Log Assistant's index as 2+ separate, individually meaningless
+# partial rows instead of one real message.
+ACS_SEGMENT_RE = re.compile(r"^(\d{10}) (\d+) (\d+) (.*)$", re.DOTALL)
+
+# Gates the above on the program name too (Cisco ACS's own convention
+# across all its message categories), not just the numeric prefix match,
+# so this can never fire on non-ACS traffic that might coincidentally
+# start a message with three numbers.
+ACS_PROGRAM_PREFIX = "CSCOacs_"
+
+# How long to wait for a lost/delayed segment before giving up and
+# emitting whatever segments did arrive (logged as incomplete) instead of
+# buffering forever -- a dropped UDP segment must not silently blackhole
+# the segments that did make it. All segments of a real split message
+# arrive within the same second in practice (see the samples above), so
+# this is generous.
+ACS_REASSEMBLY_TIMEOUT_SECONDS = float(os.environ.get("ACS_REASSEMBLY_TIMEOUT_SECONDS", "10"))
+
+
+class AcsMultipartReassembler:
+    """
+    Buffers Cisco ACS/ISE syslog messages that arrive split across
+    multiple lines (see ACS_SEGMENT_RE's comment above) and re-emits one
+    merged record per complete group, in place of handing each partial
+    segment to to_row() as if it were a whole message on its own. Also
+    strips the numeric message-id/total/index prefix from single-segment
+    ACS messages (total=1), since they carry the exact same protocol
+    plumbing and leaving it on only the non-split ones would be an
+    inconsistent Log Search experience.
+
+    Keyed by (source_ip, message_id): the message-id counter is presumably
+    per-ACS-instance, so two ACS appliances feeding this same box
+    shouldn't collide even if their counters overlap in value.
+
+    Not persisted across a consumer.py restart -- an in-flight incomplete
+    group is lost on restart, same as anything else this process hasn't
+    flushed yet. Acceptable: real segments arrive milliseconds apart, so
+    a restart landing exactly inside that window is rare, and the
+    alternative (persisting a tiny, short-lived buffer) isn't worth the
+    complexity for what it'd save.
+    """
+
+    def __init__(self):
+        self._groups = {}
+
+    def feed(self, record):
+        """Returns a list of zero or more ready-to-process records: the
+        input record unchanged (non-ACS or non-matching), a merged record
+        (group just completed), or nothing yet (still waiting on more
+        segments)."""
+        program = record.get("program", "") or ""
+        message = record.get("message", "") or ""
+        if not program.startswith(ACS_PROGRAM_PREFIX):
+            return [record]
+
+        match = ACS_SEGMENT_RE.match(message.lstrip(" "))
+        if not match:
+            return [record]
+
+        message_id, total_str, index_str, content = match.groups()
+        total, index = int(total_str), int(index_str)
+        if total < 1:
+            return [record]
+
+        key = (record.get("source_ip", "unknown"), message_id)
+        group = self._groups.setdefault(key, {"total": total, "segments": {}, "first_seen": time.monotonic()})
+        group["segments"][index] = content
+        if index == 0:
+            # Segment 0 carries the record's own metadata (timestamp,
+            # severity, program, ...) -- continuation segments repeat the
+            # same envelope, so segment 0's record is what the merged
+            # record is built from.
+            group["record"] = record
+        group.setdefault("record", record)
+
+        if len(group["segments"]) >= group["total"]:
+            del self._groups[key]
+            return [self._merge(group)]
+        return []
+
+    def flush_stale(self):
+        """Call periodically: emits (best-effort, logged as incomplete)
+        any group that's been waiting past ACS_REASSEMBLY_TIMEOUT_SECONDS
+        for a segment that never arrived, so one lost UDP datagram doesn't
+        bury the segments that did make it."""
+        now = time.monotonic()
+        stale_keys = [
+            key for key, group in self._groups.items()
+            if now - group["first_seen"] >= ACS_REASSEMBLY_TIMEOUT_SECONDS
+        ]
+        ready = []
+        for key in stale_keys:
+            group = self._groups.pop(key)
+            log.warning(
+                "Cisco ACS message %s incomplete after %.0fs (%d/%d segments) -- emitting what arrived",
+                key[1], ACS_REASSEMBLY_TIMEOUT_SECONDS, len(group["segments"]), group["total"],
+            )
+            ready.append(self._merge(group))
+        return ready
+
+    @staticmethod
+    def _merge(group):
+        merged_content = "".join(group["segments"][i] for i in sorted(group["segments"]))
+        record = dict(group["record"])
+        record["message"] = merged_content
+        return record
 
 
 class FileTailer:
@@ -566,6 +689,7 @@ def main():
     baselines = DeviceBaselineCache(ch_client)
     relay_ips = RelaySourceIpCache(DATABASE_URL)
     template_mix = TemplateMixAnomalyDetector(ch_client)
+    acs_reassembler = AcsMultipartReassembler()
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)
 
@@ -585,7 +709,11 @@ def main():
             record = parse_record(line)
             if record is None:
                 continue
-            batch.append(to_row(record, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved))
+            for ready in acs_reassembler.feed(record):
+                batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved))
+
+        for ready in acs_reassembler.flush_stale():
+            batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved))
 
         should_flush = len(batch) >= BATCH_SIZE or (time.monotonic() - last_flush) >= BATCH_FLUSH_SECONDS
         if should_flush and batch:
