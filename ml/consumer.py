@@ -161,9 +161,15 @@ class AcsMultipartReassembler:
     plumbing and leaving it on only the non-split ones would be an
     inconsistent Log Search experience.
 
-    Keyed by (source_ip, message_id): the message-id counter is presumably
-    per-ACS-instance, so two ACS appliances feeding this same box
-    shouldn't collide even if their counters overlap in value.
+    Keyed by (source_ip, reported_hostname, message_id), not source_ip
+    alone: per RelaySourceIpCache's own docstring, multiple ACS appliances
+    relayed through the same collector all share one network-level
+    source_ip, so source_ip alone could collide two unrelated appliances'
+    message-id counters into one corrupted merge. reported_hostname (ACS's
+    own configured name, e.g. "ACSSERVER") is already present on every
+    segment and reliably distinguishes them even before resolve_identity()
+    runs, the same way the relay-hostname resolution path elsewhere in
+    this file already relies on it.
 
     Not persisted across a consumer.py restart -- an in-flight incomplete
     group is lost on restart, same as anything else this process hasn't
@@ -195,9 +201,9 @@ class AcsMultipartReassembler:
         if total < 1:
             return [record]
 
-        key = (record.get("source_ip", "unknown"), message_id)
+        key = (record.get("source_ip", "unknown"), record.get("reported_hostname", ""), message_id)
         group = self._groups.setdefault(key, {"total": total, "segments": {}, "first_seen": time.monotonic()})
-        group["segments"][index] = content
+        group["segments"][index] = (content, record.get("raw", ""))
         if index == 0:
             # Segment 0 carries the record's own metadata (timestamp,
             # severity, program, ...) -- continuation segments repeat the
@@ -226,16 +232,17 @@ class AcsMultipartReassembler:
             group = self._groups.pop(key)
             log.warning(
                 "Cisco ACS message %s incomplete after %.0fs (%d/%d segments) -- emitting what arrived",
-                key[1], ACS_REASSEMBLY_TIMEOUT_SECONDS, len(group["segments"]), group["total"],
+                key[2], now - group["first_seen"], len(group["segments"]), group["total"],
             )
             ready.append(self._merge(group))
         return ready
 
     @staticmethod
     def _merge(group):
-        merged_content = "".join(group["segments"][i] for i in sorted(group["segments"]))
+        ordered = [group["segments"][i] for i in sorted(group["segments"])]
         record = dict(group["record"])
-        record["message"] = merged_content
+        record["message"] = "".join(content for content, _raw in ordered)
+        record["raw"] = "\n".join(raw for _content, raw in ordered)
         return record
 
 
