@@ -6,7 +6,7 @@ import type {
   DeviceAnomalySummaryRow, DeviceCategorySummaryRow, VendorAnomalySummaryRow, VendorCategorySummaryRow,
 } from '../types'
 import { extractErrorMessage } from '../utils/errors'
-import { formatBeirutDateTime } from '../utils/time'
+import { formatBeirutDateTime, padWindow } from '../utils/time'
 
 type View = 'device' | 'vendor'
 type Metric = 'anomaly' | 'category'
@@ -28,6 +28,17 @@ function withStart(params: Record<string, string>, firstSeen: string) {
 
 function rowKey(sourceIp: string, type: string) {
   return `${sourceIp}::${type}`
+}
+
+// Anchored on last_seen, not first_seen like withStart above -- an
+// analyst clicking "Explain" wants context around the most recent
+// occurrence (is this still happening, and why), not the first time this
+// device/reason pair was ever recorded, which for a long-lived row could
+// be months of drift away from anything still relevant.
+function explainLink(question: string, params: Record<string, string>, lastSeen: string) {
+  const { start, end } = padWindow(lastSeen, 30, 15)
+  const search = new URLSearchParams({ ...params, start, end, question })
+  return `/log-assistant?${search.toString()}`
 }
 
 export function AnomalySummary() {
@@ -165,6 +176,7 @@ export function AnomalySummary() {
               <th>First seen</th>
               <th>Last seen</th>
               <th>Status</th>
+              <th></th>
               {canManage && <th></th>}
             </tr>
           </thead>
@@ -194,6 +206,18 @@ export function AnomalySummary() {
                       <span className="badge badge-unresolved">Unhandled</span>
                     )}
                   </td>
+                  <td>
+                    <Link
+                      to={explainLink(
+                        `${r.hostname} logged a ${r.anomaly_reason} anomaly. What was happening in its logs ` +
+                          'around this time that might explain it?',
+                        { source_ip: r.source_ip },
+                        r.last_seen,
+                      )}
+                    >
+                      Explain with AI
+                    </Link>
+                  </td>
                   {canManage && (
                     <td className="row-actions">
                       {r.acknowledged ? (
@@ -221,7 +245,7 @@ export function AnomalySummary() {
             })}
             {anomalyDeviceRows?.length === 0 && !loading && (
               <tr>
-                <td colSpan={canManage ? 9 : 8}>No anomalies recorded yet.</td>
+                <td colSpan={canManage ? 10 : 9}>No anomalies recorded yet.</td>
               </tr>
             )}
           </tbody>
@@ -275,6 +299,7 @@ export function AnomalySummary() {
               <th>Count</th>
               <th>First seen</th>
               <th>Last seen</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -291,11 +316,22 @@ export function AnomalySummary() {
                 </td>
                 <td>{formatBeirutDateTime(r.first_seen)}</td>
                 <td>{formatBeirutDateTime(r.last_seen)}</td>
+                <td>
+                  <Link
+                    to={explainLink(
+                      `What's been going on with ${r.hostname}'s ${r.predicted_category} log activity around this time?`,
+                      { source_ip: r.source_ip },
+                      r.last_seen,
+                    )}
+                  >
+                    Explain with AI
+                  </Link>
+                </td>
               </tr>
             ))}
             {categoryDeviceRows?.length === 0 && !loading && (
               <tr>
-                <td colSpan={7}>No events recorded yet.</td>
+                <td colSpan={8}>No events recorded yet.</td>
               </tr>
             )}
           </tbody>

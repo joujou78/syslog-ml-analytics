@@ -1,7 +1,8 @@
 from fastapi import APIRouter
 
 from app.api.routes import (
-    alerts, anomaly_summary, anomaly_windows, auth, credentials, devices, logs, query_console, relays, users,
+    alerts, anomaly_summary, anomaly_windows, auth, credentials, devices, log_assistant, logs, query_console,
+    relays, users,
 )
 
 api_router = APIRouter(prefix="/api")
@@ -15,3 +16,4 @@ api_router.include_router(alerts.router)
 api_router.include_router(anomaly_windows.router)
 api_router.include_router(anomaly_summary.router)
 api_router.include_router(query_console.router)
+api_router.include_router(log_assistant.router)

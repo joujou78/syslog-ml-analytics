@@ -6,6 +6,7 @@ from app.clickhouse_client import get_clickhouse_client
 from app.core.security import decode_access_token
 from app.db.base import get_db
 from app.db.models import Role, User
+from app.opensearch_client import get_opensearch_client
 from app.services.auth_service import get_user_by_username
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -43,3 +44,7 @@ def require_role(*allowed: Role):
 
 def get_ch_client():
     return get_clickhouse_client()
+
+
+def get_os_client():
+    return get_opensearch_client()

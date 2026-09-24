@@ -7,6 +7,7 @@ import { AnomalySummary } from './pages/AnomalySummary'
 import { AnomalyWindows } from './pages/AnomalyWindows'
 import { Credentials } from './pages/Credentials'
 import { Devices } from './pages/Devices'
+import { LogAssistant } from './pages/LogAssistant'
 import { Logs } from './pages/Logs'
 import { Login } from './pages/Login'
 import { QueryConsole } from './pages/QueryConsole'
@@ -21,6 +22,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<Devices />} />
             <Route path="/logs" element={<Logs />} />
+            <Route path="/log-assistant" element={<LogAssistant />} />
             <Route path="/anomaly-windows" element={<AnomalyWindows />} />
             <Route path="/anomaly-summary" element={<AnomalySummary />} />
             <Route path="/alerts" element={<Alerts />} />

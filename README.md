@@ -749,6 +749,123 @@ Better: export a sample, hand-correct the `category` field for a few hundred
 rows across your different vendors, and re-run with that file — the script
 prefers a real `category` field over the weak-supervision guess.
 
+## Step 7 — Log Assistant (semantic search + local LLM Q&A)
+
+Everything above judges logs by statistics (rare templates, severity/volume
+baselines, template-mix outliers). This is a different kind of feature:
+answering a question typed in plain language — "why has sw1 been logging
+interface errors this morning?" — by finding the log lines that are
+semantically *related* to it (even if they don't share the same words) and
+having a local LLM read them and answer. Modeled on
+[sislogIQ](https://github.com/Toxa/sislogIQ)'s architecture: OpenSearch's
+vector (k-NN) search for retrieval, [Ollama](https://ollama.com) for local
+inference — nothing here calls out to an external API; the whole thing
+runs on your own hardware.
+
+**Architecture**: a new standalone process, `ml/log_assistant_indexer.py`
+(its own systemd service, deliberately separate from `consumer.py` — see
+its module docstring for why), tails `syslog_ml.events` the same way
+`consumer.py` tails the raw log file, embeds each new event with Ollama,
+and writes the vector into an OpenSearch index. The web backend then does
+two things against that index: `/api/log-assistant/search` (semantic
+search alone) and `/api/log-assistant/ask` (search, then hand the results
+to an LLM as context and return its answer — the **Log Assistant** page in
+the web UI). Anomaly Windows and Anomaly Summary both link into it with an
+**"Explain with AI"** action that pre-fills a question and the relevant
+device/time range.
+
+**Hardware note**: this needs real headroom — see this repo's own
+deploy history for a concrete example. A 4-core/7.8GB VM already running
+ClickHouse, Postgres, the classifier, and the web backend had only ~4GB
+free; that's not enough to also run OpenSearch's JVM plus a capable local
+LLM. **16GB is the tested target** this section assumes. A rough budget at
+that size (watch `free -h` after deploying — this is a starting point, not
+a guarantee):
+
+| Component | Approx. RAM |
+|---|---|
+| Existing stack (ClickHouse, Postgres, classifier, gunicorn) | 3–4 GB |
+| OpenSearch JVM heap | 2 GB |
+| OpenSearch off-heap + OS overhead | ~1 GB |
+| Ollama + `llama3.1:8b-instruct-q4_K_M` loaded | ~6 GB |
+| OS buffer / headroom | remainder |
+
+Drop to a smaller chat model (e.g. `llama3.2:3b-instruct-q4_K_M`, ~2GB) if
+16GB is still tight, or if this ever needs to run on hardware smaller than
+the target above — everything below is a config change (`ollama pull` a
+different model, update `SYSLOG_ML_OLLAMA_CHAT_MODEL`), not a code change.
+
+**Install OpenSearch** (single node, no Docker — same "native systemd
+service" approach as everything else here):
+
+```bash
+curl -fsSL https://artifacts.opensearch.org/publickeys/opensearch.pgp | sudo gpg --dearmor -o /usr/share/keyrings/opensearch-keyring
+echo "deb [signed-by=/usr/share/keyrings/opensearch-keyring] https://artifacts.opensearch.org/releases/bundle/opensearch/2.x/apt stable main" | sudo tee /etc/apt/sources.list.d/opensearch-2.x.list
+sudo apt update && sudo apt install opensearch
+```
+
+Two edits to `/etc/opensearch/opensearch.yml` before starting it:
+
+```yaml
+network.host: 127.0.0.1     # loopback only -- nothing outside this host talks to it directly
+plugins.security.disabled: true
+```
+
+`plugins.security.disabled` trades OpenSearch's built-in auth/TLS for
+simplicity, the same posture this project already takes with ClickHouse's
+own password-less default-user setup — safe specifically *because* it's
+bound to loopback and only this host's own backend process ever talks to
+it, not because the data itself is unimportant. Don't do this if you ever
+bind it to a non-loopback address. Then:
+
+```bash
+sudo systemctl enable --now opensearch
+```
+
+**Install Ollama** (its own installer sets up a systemd service):
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull nomic-embed-text                 # embedding model -- must match OLLAMA_EMBED_MODEL below
+ollama pull llama3.1:8b-instruct-q4_K_M       # chat model -- must match SYSLOG_ML_OLLAMA_CHAT_MODEL below
+```
+
+**Create the OpenSearch index**, then enable the indexer:
+
+```bash
+sudo -u syslog-ml /opt/syslog-ml/venv/bin/pip install -r /opt/syslog-ml/ml/requirements.txt
+sudo -u syslog-ml /opt/syslog-ml/venv/bin/python /opt/syslog-ml/opensearch/setup_index.py
+sudo systemctl enable --now syslog-ml-log-assistant-indexer
+```
+
+Add to the backend's env (wherever `SYSLOG_ML_DATABASE_URL` etc. are set,
+see `web/README.md`) if you changed any of the defaults:
+
+```
+SYSLOG_ML_OPENSEARCH_URL=http://localhost:9200
+SYSLOG_ML_OPENSEARCH_INDEX=syslog_ml_log_events
+SYSLOG_ML_OLLAMA_URL=http://localhost:11434
+SYSLOG_ML_OLLAMA_EMBED_MODEL=nomic-embed-text
+SYSLOG_ML_OLLAMA_CHAT_MODEL=llama3.1:8b-instruct-q4_K_M
+```
+
+**Honest testing caveat**: this project's own development sandbox
+couldn't reach `opensearch.org` or `ollama.com` (blocked by that sandbox's
+own egress proxy — not a constraint that applies to your own server), so
+none of the OpenSearch/Ollama-facing code paths could be run end-to-end
+against the real services while writing them. What *was* verified:
+`opensearch-py`'s real client library confirms the query/index-creation
+code matches its actual method signatures, and the full FastAPI route
+stack (`/log-assistant/search`, `/log-assistant/ask`, error handling,
+request validation) was tested against a mocked OpenSearch client and
+mocked Ollama HTTP responses, including the exact JSON shapes those two
+services' documented APIs return. The frontend page and its "Explain with
+AI" deep links were verified in a real browser. Treat the first real
+question you ask after installing this as the actual smoke test, and
+check both services' own logs (`journalctl -u opensearch`, `journalctl -u
+ollama`, `journalctl -u syslog-ml-log-assistant-indexer`) if it doesn't
+work as expected.
+
 ## Files
 
 - `clickhouse/init.sql` — `device_inventory`, `events`, the per-minute rollup, and `device_window_anomalies`.
@@ -764,6 +881,8 @@ prefers a real `category` field over the weak-supervision guess.
 - `ml/labeling_rules.py` — weak-supervision category rules (tune for your vendors).
 - `ml/train_classifier.py` — trains the TF-IDF + linear SVM classifier.
 - `ml/evaluate_alerts.py` — evaluates alert rules against ClickHouse, fires webhooks.
-- `systemd/` — unit files for the classifier, resolver timer, alert evaluator timer, and re-verify timer.
+- `ml/log_assistant_indexer.py` — embeds new events into OpenSearch for the Log Assistant's semantic search/ask features (see "Log Assistant" above).
+- `opensearch/` — the log-embedding index's mapping (`log_events_index.json`) and its one-time setup script.
+- `systemd/` — unit files for the classifier, resolver timer, alert evaluator timer, re-verify timer, and the Log Assistant indexer.
 - `grafana/` — provisioned datasource + starter dashboard.
-- `web/` — FastAPI + React admin app for managing SNMP credentials and viewing device status (see `web/README.md`).
+- `web/` — FastAPI + React admin app, including Log Search, the anomaly pages, Query Console, and Log Assistant (see `web/README.md`).

@@ -14,6 +14,22 @@ class Settings(BaseSettings):
     clickhouse_user: str = "default"
     clickhouse_password: str = ""
 
+    # Log Assistant (semantic search + local-LLM "ask") -- see README.
+    # Populated by ml/log_assistant_indexer.py; same index name/URL both
+    # sides must agree on (see opensearch/setup_index.py).
+    opensearch_url: str = "http://localhost:9200"
+    opensearch_index: str = "syslog_ml_log_events"
+    ollama_url: str = "http://localhost:11434"
+    # Must match ml/log_assistant_indexer.py's OLLAMA_EMBED_MODEL -- a
+    # question is embedded with this model to kNN-search against vectors
+    # the indexer produced with it; mismatched models search meaninglessly.
+    ollama_embed_model: str = "nomic-embed-text"
+    # The larger model that turns retrieved log lines into an answer.
+    # Pick one that actually fits the host's RAM (see README's Log
+    # Assistant section for a memory budget) -- nothing here enforces that.
+    ollama_chat_model: str = "llama3.1:8b-instruct-q4_K_M"
+    ollama_timeout_seconds: float = 60.0
+
     jwt_secret: str = "changeme-generate-a-real-secret-with-openssl-rand-hex-32"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 8

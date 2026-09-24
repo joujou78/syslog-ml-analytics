@@ -244,3 +244,36 @@ export interface VendorCategorySummaryRow {
   first_seen: string
   last_seen: string
 }
+
+export interface LogAssistantQuery {
+  question: string
+  source_ip?: string
+  vendor?: string
+  start?: string
+  end?: string
+  limit?: number
+}
+
+export interface LogHit {
+  event_time: string
+  source_ip: string
+  hostname: string
+  vendor: string
+  severity: string
+  program: string
+  predicted_category: string
+  message: string
+  is_anomaly: boolean
+  anomaly_reasons: string[]
+  score: number
+}
+
+export interface SemanticSearchResponse {
+  items: LogHit[]
+}
+
+export interface AskResponse {
+  answer: string
+  sources: LogHit[]
+  model: string
+}

@@ -13,6 +13,7 @@ export function Layout() {
             Devices
           </NavLink>
           <NavLink to="/logs">Log Search</NavLink>
+          <NavLink to="/log-assistant">Log Assistant</NavLink>
           <NavLink to="/anomaly-windows">Anomaly Windows</NavLink>
           <NavLink to="/anomaly-summary">Anomaly Summary</NavLink>
           <NavLink to="/alerts">Alerts</NavLink>

@@ -240,6 +240,25 @@ label {
   font-size: 13px;
 }
 
+.assistant-answer {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin: 16px 0 24px;
+  max-width: 720px;
+}
+
+.assistant-answer strong {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.assistant-answer p {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+}
+
 .page-hint {
   color: var(--text-dim);
   font-size: 13px;

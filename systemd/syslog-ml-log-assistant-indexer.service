@@ -1,0 +1,24 @@
+[Unit]
+Description=Syslog ML Log Assistant indexer (embed events into OpenSearch for semantic search)
+After=network.target clickhouse-server.service opensearch.service ollama.service
+Wants=clickhouse-server.service opensearch.service ollama.service
+
+[Service]
+Type=simple
+User=syslog-ml
+Group=syslog-ml
+WorkingDirectory=/opt/syslog-ml/ml
+ExecStart=/opt/syslog-ml/venv/bin/python log_assistant_indexer.py
+EnvironmentFile=-/etc/syslog-ml/clickhouse.env
+Environment=CLICKHOUSE_HOST=localhost
+Environment=CLICKHOUSE_PORT=8123
+Environment=OPENSEARCH_URL=http://localhost:9200
+Environment=OPENSEARCH_INDEX=syslog_ml_log_events
+Environment=OLLAMA_URL=http://localhost:11434
+Environment=OLLAMA_EMBED_MODEL=nomic-embed-text
+Environment=LOG_ASSISTANT_CHECKPOINT_FILE=/var/lib/syslog-ml/log_assistant_indexer.checkpoint
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

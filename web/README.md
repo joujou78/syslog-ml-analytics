@@ -183,6 +183,37 @@ substitute for the admin knowing what they're running. There is
 deliberately no query history or saved-queries feature (yet) — the audit
 log is the record.
 
+**Log Assistant** (`POST /api/log-assistant/search` and `/ask`, "Log
+Assistant" in the nav) is a different kind of lookup than everything
+above: a plain-language question, answered by finding log lines that are
+semantically *related* to it (via embeddings + OpenSearch k-NN search, not
+exact keyword matching) and, for `/ask`, having a local LLM (Ollama) read
+those lines and write an answer. See the pipeline README's "Log Assistant"
+section for the indexing pipeline (`ml/log_assistant_indexer.py`) and the
+OpenSearch/Ollama install steps this depends on. `/search` alone (the
+page's "Search only" button) skips the LLM call entirely and just returns
+matching log lines with their similarity score — useful when you want
+results in under a second instead of waiting on CPU-bound inference.
+Both endpoints take the same optional `source_ip`/`vendor`/`start`/`end`
+filters as Log Search, applied as OpenSearch k-NN *pre*-filters (not a
+post-filter on the unfiltered top-k — see `log_assistant_service.py`'s
+`_build_query`, which needs the index's `lucene` engine specifically for
+this to work correctly at all). Open to any authenticated role, same as
+Log Search — the LLM call being slow on CPU-only hardware is a
+performance characteristic for whoever asks, not a reason to restrict who
+can.
+
+Anomaly Windows and Anomaly Summary each add an **"Explain with AI"**
+link per row, pre-filling a question plus that row's device and a padded
+time range around it (the flagged instant/window itself padded with
+before/after minutes — see `utils/time.ts`'s `padWindow` — since an LLM
+asked about one bare timestamp has nothing to reason over). Anomaly
+Summary's link anchors on `last_seen`, not `first_seen` like its own Log
+Search drill-down links — deliberately different, since "explain this"
+is about what's happening *now* (or most recently), while the Log Search
+link's `first_seen` anchor exists only to keep a cumulative count's
+default 24h window from looking empty.
+
 ## Why this stack
 
 - **FastAPI**: shares Python with the rest of the pipeline (`ml/`), async,
@@ -422,6 +453,16 @@ then log in with the admin account from Step 2.
 - Password reset / account recovery isn't built — the only way to regain
   access if the sole admin's password is lost is `scripts/create_admin.py`
   won't help (it refuses existing usernames) or a manual DB update.
+- **Log Assistant's OpenSearch/Ollama calls were never exercised against
+  real OpenSearch or Ollama** — this session's sandbox couldn't reach
+  either service to install them (see the pipeline README's "Log
+  Assistant" section for why, and exactly what *was* verified instead:
+  the real `opensearch-py` client library, and the full FastAPI route
+  stack against mocked responses shaped like each service's documented
+  API). If a request to `/log-assistant/search` or `/ask` fails after you
+  install the real services, a `502` response means the backend reached
+  this code path but OpenSearch or Ollama itself returned an error or
+  wasn't reachable — check `journalctl -u opensearch`/`-u ollama` first.
 
 ## Roadmap (not yet built)
 

@@ -1,7 +1,25 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { anomalyWindowsApi } from '../api/anomalyWindows'
 import type { AnomalyWindow, AnomalyWindowFilters } from '../types'
-import { formatBeirutDateTime } from '../utils/time'
+import { formatBeirutDateTime, padWindow } from '../utils/time'
+
+// +/- padding around the flagged 5-minute window itself -- an LLM asked
+// about one bare window has nothing to reason over; the surrounding
+// context is what lets it say what else was going on around the shift.
+function explainLink(w: AnomalyWindow) {
+  const { start, end } = padWindow(w.window_start, 10, 15)
+  const params = new URLSearchParams({
+    source_ip: w.source_ip,
+    start,
+    end,
+    question:
+      `${w.hostname}'s mix of log message types was flagged as unusual around this time ` +
+      `(score ${w.anomaly_score.toFixed(3)}, scored against its ${w.model_scope} model). ` +
+      'What was happening in its logs that might explain the shift?',
+  })
+  return `/log-assistant?${params.toString()}`
+}
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 500]
 const EMPTY_FILTERS: AnomalyWindowFilters = { only_anomalies: true }
@@ -140,6 +158,7 @@ export function AnomalyWindows() {
             <th>Model</th>
             <th>Score</th>
             <th>Events in window</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -154,11 +173,14 @@ export function AnomalyWindows() {
               </td>
               <td className="mono">{w.anomaly_score.toFixed(3)}</td>
               <td>{w.event_count.toLocaleString()}</td>
+              <td>
+                <Link to={explainLink(w)}>Explain with AI</Link>
+              </td>
             </tr>
           ))}
           {items?.length === 0 && !loading && (
             <tr>
-              <td colSpan={7}>No anomaly windows match these filters.</td>
+              <td colSpan={8}>No anomaly windows match these filters.</td>
             </tr>
           )}
         </tbody>
