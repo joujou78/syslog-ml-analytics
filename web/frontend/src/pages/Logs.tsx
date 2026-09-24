@@ -86,13 +86,12 @@ export function Logs() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [filterOptions, setFilterOptions] = useState<LogFilterOptions>({ vendors: [], programs: [] })
   // Message cells are truncated to one line by default (some vendors emit
-  // very long structured payloads) -- clicking one expands it in place,
-  // wrapping onto multiple lines instead of overflowing the table.
-  // Row-index-keyed, not persisted across a reload/refresh (see `load`
-  // below), since "row 3" meaning something different after a re-search or
-  // auto-refresh reshuffles the page is more confusing than losing the
-  // expansion.
-  const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set())
+  // very long structured payloads) -- clicking one opens the full text in
+  // a small modal instead of overflowing the table. Holding the message
+  // string itself (not a row index) means it survives a reload/refresh
+  // without needing to be cleared -- there's nothing row-position-specific
+  // to go stale.
+  const [modalMessage, setModalMessage] = useState<string | null>(null)
 
   useEffect(() => {
     logsApi.filterOptions().then(setFilterOptions).catch(() => {
@@ -101,6 +100,15 @@ export function Logs() {
       // still works.
     })
   }, [])
+
+  useEffect(() => {
+    if (!modalMessage) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setModalMessage(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [modalMessage])
 
   const load = (silent = false) => {
     if (!silent) {
@@ -113,7 +121,6 @@ export function Logs() {
         setItems(res.items)
         setHasMore(res.has_more)
         setLastUpdated(new Date())
-        setExpandedRows(new Set())
       })
       .catch(() => setError('Could not search logs — is ClickHouse reachable from the API?'))
       .finally(() => {
@@ -133,15 +140,6 @@ export function Logs() {
     const interval = setInterval(() => load(true), autoRefreshMs)
     return () => clearInterval(interval)
   }, [autoRefreshMs, filters, pageSize, offset])
-
-  function toggleExpanded(i: number) {
-    setExpandedRows((prev) => {
-      const next = new Set(prev)
-      if (next.has(i)) next.delete(i)
-      else next.add(i)
-      return next
-    })
-  }
 
   function applyFilters(e: React.FormEvent) {
     e.preventDefault()
@@ -351,11 +349,7 @@ export function Logs() {
                   </span>
                 ))}
               </td>
-              <td
-                className={`mono log-message${expandedRows.has(i) ? ' expanded' : ''}`}
-                onClick={() => toggleExpanded(i)}
-                title={entry.message}
-              >
+              <td className="mono log-message" onClick={() => setModalMessage(entry.message)} title={entry.message}>
                 {entry.message}
               </td>
             </tr>
@@ -379,6 +373,20 @@ export function Logs() {
           Showing {items?.length ? offset + 1 : 0}–{offset + (items?.length ?? 0)}
         </span>
       </div>
+
+      {modalMessage && (
+        <div className="modal-backdrop" onClick={() => setModalMessage(null)}>
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <strong>Full message</strong>
+              <button type="button" onClick={() => setModalMessage(null)}>
+                Close
+              </button>
+            </div>
+            <pre className="modal-body mono">{modalMessage}</pre>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

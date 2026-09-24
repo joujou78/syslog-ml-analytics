@@ -323,11 +323,41 @@ label {
   text-decoration-color: var(--text-dim);
 }
 
-.log-message.expanded {
-  max-width: 640px;
-  overflow: visible;
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: min(640px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-body {
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+  font-size: 13px;
 }
 
 .badge-severity-emerg,
