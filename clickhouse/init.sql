@@ -90,9 +90,13 @@ GROUP BY minute, hostname, vendor, severity, predicted_category;
 -- each message arrives): this is a per-(device, time window) signal that
 -- can only be judged once a window's worth of data exists, so it's
 -- computed by a periodic batch job, not at insert time. One row per
--- window per device; ReplacingMergeTree(scored_at) because a window gets
--- rescored (and its row replaced) on every retrain cycle while it's
--- still the most recent complete window.
+-- window per device, scored exactly once (the detector's own checkpoint
+-- ensures a window is never re-evaluated once scored, even as its
+-- device's model improves with more history later -- deliberately, to
+-- avoid re-scoring and re-writing a device's entire history every cycle).
+-- ReplacingMergeTree(scored_at) exists only to dedupe the rare case where
+-- a checkpoint-load failure after a restart causes a brief backfill
+-- overlap, not for routine ongoing rescoring.
 CREATE TABLE IF NOT EXISTS syslog_ml.device_window_anomalies
 (
     window_start        DateTime,

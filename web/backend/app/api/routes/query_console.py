@@ -38,7 +38,9 @@ async def execute_query(
 
     try:
         return query_console_service.execute_query(client, payload.query)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     except Exception as exc:
+        # Covers both this service's own ValueError (empty query) and any
+        # ClickHouse driver exception -- both are just "the query as
+        # submitted didn't work", surfaced to the admin as-is so they can
+        # see exactly what ClickHouse said, not a generic 500.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

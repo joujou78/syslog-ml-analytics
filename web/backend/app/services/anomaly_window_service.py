@@ -24,10 +24,11 @@ def list_anomaly_windows(
     ml/template_mix_anomaly.py), most recent first.
 
     `FINAL` on device_window_anomalies: it's a ReplacingMergeTree keyed on
-    (source_ip, window_start) that gets rewritten as new retrain cycles
-    rescore recent windows, so an unmerged duplicate is possible between
-    merges. Fine to force here (unlike on `events`) -- this table is a
-    tiny fraction of the size and not on the hot ingest path.
+    (source_ip, window_start), guarding against the rare duplicate a
+    checkpoint-restart overlap could leave unmerged -- each window is
+    otherwise scored exactly once, never routinely rescored. Fine to
+    force here (unlike on `events`) -- this table is a tiny fraction of
+    the size and not on the hot ingest path.
 
     hostname isn't stored on device_window_anomalies itself (a device's
     resolved identity can change after the fact); joined from `events`

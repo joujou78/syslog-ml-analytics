@@ -79,7 +79,10 @@ device's own model or a pooled vendor baseline. hostname is joined live
 from `events` (not stored on the anomaly table itself, since a device's
 resolved identity can change after the fact) using the same
 `FINAL`-qualified read pattern needed because the underlying table is a
-`ReplacingMergeTree` that gets rewritten as windows are rescored.
+`ReplacingMergeTree` -- each window is scored exactly once (see
+ml/template_mix_anomaly.py's own note on why), so `FINAL` here is only
+guarding against the rare checkpoint-restart overlap case, not routine
+ongoing rescoring.
 
 **Anomaly Summary** (`GET /api/anomaly-summary/devices` and `/vendors`,
 "Anomaly Summary" in the nav) answers a different question than Anomaly

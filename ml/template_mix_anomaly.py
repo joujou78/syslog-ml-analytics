@@ -74,13 +74,28 @@ def _window_floor(dt: datetime) -> datetime:
     return epoch.replace(minute=minutes, second=0, microsecond=0)
 
 
-def _vectorize(window_counts: dict[str, int], top_k: list[str]) -> list[int]:
+def _vectorize(window_counts: dict[str, int], top_k: list[str]) -> list[float]:
     """window_counts: template_id -> count for one window. Projects it into
-    the fixed [top_k[0]_count, ..., top_k[-1]_count, other_count] shape."""
+    the fixed [top_k[0]_share, ..., top_k[-1]_share, other_share] shape --
+    each template's SHARE of the window's total events, not its raw count.
+
+    Raw counts would conflate volume with mix: the vendor-pooled fallback
+    model in particular is trained across devices whose overall traffic
+    volume can differ by orders of magnitude, so a low-traffic device
+    would look "anomalous" against a model shaped by a high-traffic
+    device's much larger raw numbers on every single window, even when
+    its own proportional mix hasn't changed at all. Volume shifts are
+    already a separate, dedicated signal (volume_spike in
+    DeviceBaselineCache) -- this one should only fire on a genuine change
+    in *what* a device logs, not *how much*.
+    """
     top_k_set = set(top_k)
-    vector = [window_counts.get(t, 0) for t in top_k]
+    total = sum(window_counts.values())
+    if total == 0:
+        return [0.0] * (len(top_k) + 1)
+    vector = [window_counts.get(t, 0) / total for t in top_k]
     other = sum(count for template, count in window_counts.items() if template not in top_k_set)
-    vector.append(other)
+    vector.append(other / total)
     return vector
 
 

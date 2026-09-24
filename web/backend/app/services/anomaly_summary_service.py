@@ -1,10 +1,12 @@
+import asyncio
 import csv
 import io
 from datetime import datetime
 from xml.sax.saxutils import escape
 
 from clickhouse_connect.driver.client import Client
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AnomalyAcknowledgment, AuditLog, User
@@ -107,8 +109,16 @@ def list_device_summary(client: Client) -> list[dict]:
 
 
 async def list_device_summary_with_acks(client: Client, db: AsyncSession) -> list[DeviceAnomalySummaryRow]:
-    rows = list_device_summary(client)
-    acks = await _ack_lookup(db)
+    # The ClickHouse aggregate (a full, unbounded scan -- see this file's
+    # own cost caveat) and the Postgres ack lookup are independent; run
+    # them concurrently instead of paying both latencies back-to-back.
+    # clickhouse_connect's client is synchronous, so it needs to_thread to
+    # actually overlap with the async Postgres query rather than just
+    # being awaited in sequence disguised as concurrency.
+    rows, acks = await asyncio.gather(
+        asyncio.to_thread(list_device_summary, client),
+        _ack_lookup(db),
+    )
     items = []
     for row in rows:
         key = (row["source_ip"], row["anomaly_reason"])
@@ -157,18 +167,21 @@ def list_vendor_category_summary(client: Client) -> list[VendorCategorySummaryRo
 
 
 async def acknowledge(db: AsyncSession, source_ip: str, anomaly_reason: str, payload: AcknowledgeRequest, actor: User) -> None:
-    existing = await db.execute(
-        select(AnomalyAcknowledgment).where(
-            AnomalyAcknowledgment.source_ip == source_ip,
-            AnomalyAcknowledgment.anomaly_reason == anomaly_reason,
-        )
+    # A check-then-insert here would race: two concurrent acknowledges for
+    # the same (source_ip, anomaly_reason) could both see no existing row
+    # and both try to insert, and the second would hit
+    # uq_anomaly_ack_device_reason as an unhandled IntegrityError instead
+    # of just merging its note onto the existing ack. An atomic upsert
+    # sidesteps the race entirely instead of racing then handling the
+    # conflict after the fact.
+    stmt = pg_insert(AnomalyAcknowledgment).values(
+        source_ip=source_ip, anomaly_reason=anomaly_reason, note=payload.note, acknowledged_by=actor.id,
     )
-    row = existing.scalars().first()
-    if row is None:
-        row = AnomalyAcknowledgment(source_ip=source_ip, anomaly_reason=anomaly_reason)
-        db.add(row)
-    row.note = payload.note
-    row.acknowledged_by = actor.id
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_anomaly_ack_device_reason",
+        set_={"note": payload.note, "acknowledged_by": actor.id, "acknowledged_at": func.now()},
+    )
+    await db.execute(stmt)
     db.add(AuditLog(
         actor_id=actor.id, action="anomaly.acknowledge",
         target=f"{source_ip}:{anomaly_reason}", details={"note": payload.note},
