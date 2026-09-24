@@ -63,6 +63,26 @@ sudo systemctl status ollama       # confirm "active (running)"
 ollama list                        # confirm both models are present
 ```
 
+**Warm up both models before enabling the indexer or restarting the backend.**
+Loading a model into memory for the first time is far slower than any later
+call once it's warm — confirmed on net-flow's 4-core box: the *first* embed
+call (which also had to load the model) took close to 20 minutes under CPU
+contention with the rest of the stack, well past any reasonable request
+timeout, even though every call afterward was fast. Doing that load here,
+with no timeout and nothing else waiting on it, means step 3's indexer gets
+a warm model on its very first real attempt instead of potentially timing
+out and retrying:
+
+```bash
+curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input":["warm up"]}' > /dev/null
+curl -s http://localhost:11434/api/chat -d '{"model":"llama3.1:8b-instruct-q4_K_M","messages":[{"role":"user","content":"hi"}],"stream":false}' > /dev/null
+```
+
+Both may take a while the first time (this is expected and fine — there's no
+timeout here to race against). Once they return, the models stay loaded in
+Ollama's memory for its default keep-alive window, ready for the indexer and
+backend to use immediately.
+
 ## 3. Create the OpenSearch index and enable the indexer
 
 ```bash

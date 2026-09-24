@@ -56,7 +56,13 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 # outputs 768-dim vectors. Swapping models means recreating the index (a
 # knn_vector field's dimension can't be changed in place).
 OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "30"))
+# Confirmed on net-flow: Ollama loading even this small (274MB) embedding
+# model for the first time can take far longer than a normal single-batch
+# embed call once warm, especially on a CPU-only host (no GPU) also running
+# other CPU-bound services -- 30s was not enough even before accounting for
+# that cold-load cost. See README's Log Assistant section for the
+# recommended pre-warm step that avoids paying this cost inside a request.
+OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "60"))
 
 BATCH_SIZE = int(os.environ.get("INDEXER_BATCH_SIZE", "200"))
 POLL_SECONDS = float(os.environ.get("INDEXER_POLL_SECONDS", "30"))

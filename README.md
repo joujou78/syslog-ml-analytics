@@ -849,6 +849,20 @@ ollama pull nomic-embed-text                 # embedding model -- must match OLL
 ollama pull llama3.1:8b-instruct-q4_K_M       # chat model -- must match SYSLOG_ML_OLLAMA_CHAT_MODEL below
 ```
 
+**Warm both models up before enabling the indexer or restarting the
+backend.** Loading a model for the first time is far slower than any later
+call once it's warm -- confirmed on a 4-core deploy target: the indexer's
+first embed call (which also had to load the model) took close to 20
+minutes under CPU contention with the rest of the stack, well past any
+reasonable request timeout, even though every call after that was fast.
+Doing the load here, with nothing else waiting on it, means the indexer's
+first real attempt gets a warm model instead of potentially timing out:
+
+```bash
+curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input":["warm up"]}' > /dev/null
+curl -s http://localhost:11434/api/chat -d '{"model":"llama3.1:8b-instruct-q4_K_M","messages":[{"role":"user","content":"hi"}],"stream":false}' > /dev/null
+```
+
 **Create the OpenSearch index**, then enable the indexer:
 
 ```bash
