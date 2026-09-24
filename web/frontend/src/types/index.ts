@@ -109,9 +109,11 @@ export interface LogSearchFilters {
   end?: string
   hostname?: string
   source_ip?: string
+  vendor?: string
   program?: string
   severity?: string
   predicted_category?: string
+  anomaly_reason?: string
   q?: string
   only_anomalies?: boolean
   limit?: number
@@ -213,6 +215,25 @@ export interface DeviceAnomalySummaryRow {
 export interface VendorAnomalySummaryRow {
   vendor: string
   anomaly_reason: string
+  device_count: number
+  event_count: number
+  first_seen: string
+  last_seen: string
+}
+
+export interface DeviceCategorySummaryRow {
+  source_ip: string
+  hostname: string
+  vendor: string
+  predicted_category: string
+  event_count: number
+  first_seen: string
+  last_seen: string
+}
+
+export interface VendorCategorySummaryRow {
+  vendor: string
+  predicted_category: string
   device_count: number
   event_count: number
   first_seen: string

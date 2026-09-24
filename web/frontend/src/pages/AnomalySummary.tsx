@@ -1,14 +1,22 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { anomalySummaryApi } from '../api/anomalySummary'
 import { useAuth } from '../auth/AuthContext'
-import type { DeviceAnomalySummaryRow, VendorAnomalySummaryRow } from '../types'
+import type {
+  DeviceAnomalySummaryRow, DeviceCategorySummaryRow, VendorAnomalySummaryRow, VendorCategorySummaryRow,
+} from '../types'
 import { extractErrorMessage } from '../utils/errors'
 import { formatBeirutDateTime } from '../utils/time'
 
 type View = 'device' | 'vendor'
+type Metric = 'anomaly' | 'category'
 
-function rowKey(sourceIp: string, reason: string) {
-  return `${sourceIp}::${reason}`
+function logSearchLink(params: Record<string, string>) {
+  return `/logs?${new URLSearchParams(params).toString()}`
+}
+
+function rowKey(sourceIp: string, type: string) {
+  return `${sourceIp}::${type}`
 }
 
 export function AnomalySummary() {
@@ -16,8 +24,13 @@ export function AnomalySummary() {
   const canManage = user?.role === 'admin' || user?.role === 'analyst'
 
   const [view, setView] = useState<View>('device')
-  const [deviceRows, setDeviceRows] = useState<DeviceAnomalySummaryRow[] | null>(null)
-  const [vendorRows, setVendorRows] = useState<VendorAnomalySummaryRow[] | null>(null)
+  const [metric, setMetric] = useState<Metric>('anomaly')
+
+  const [anomalyDeviceRows, setAnomalyDeviceRows] = useState<DeviceAnomalySummaryRow[] | null>(null)
+  const [anomalyVendorRows, setAnomalyVendorRows] = useState<VendorAnomalySummaryRow[] | null>(null)
+  const [categoryDeviceRows, setCategoryDeviceRows] = useState<DeviceCategorySummaryRow[] | null>(null)
+  const [categoryVendorRows, setCategoryVendorRows] = useState<VendorCategorySummaryRow[] | null>(null)
+
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
@@ -27,16 +40,21 @@ export function AnomalySummary() {
   const load = () => {
     setLoading(true)
     setError(null)
-    const request = view === 'device' ? anomalySummaryApi.devices().then(setDeviceRows) : anomalySummaryApi.vendors().then(setVendorRows)
+    let request: Promise<unknown>
+    if (metric === 'anomaly') {
+      request = view === 'device' ? anomalySummaryApi.devices().then(setAnomalyDeviceRows) : anomalySummaryApi.vendors().then(setAnomalyVendorRows)
+    } else {
+      request = view === 'device' ? anomalySummaryApi.devicesByCategory().then(setCategoryDeviceRows) : anomalySummaryApi.vendorsByCategory().then(setCategoryVendorRows)
+    }
     request
-      .catch(() => setError('Could not load anomaly summary — is ClickHouse reachable from the API?'))
+      .catch(() => setError('Could not load the summary — is ClickHouse reachable from the API?'))
       .finally(() => setLoading(false))
   }
 
   useEffect(() => {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view])
+  }, [view, metric])
 
   async function handleAcknowledge(row: DeviceAnomalySummaryRow) {
     const key = rowKey(row.source_ip, row.anomaly_reason)
@@ -71,21 +89,41 @@ export function AnomalySummary() {
   function handleExport(format: 'csv' | 'xml') {
     setExporting(true)
     anomalySummaryApi
-      .export(view, format)
+      .export(view, metric, format)
       .catch(() => setError('Could not export the report'))
       .finally(() => setExporting(false))
   }
 
+  const typeColumnLabel = metric === 'anomaly' ? 'Anomaly type' : 'Category'
+
   return (
     <div>
-      <h2>Anomaly summary</h2>
+      <h2>{metric === 'anomaly' ? 'Anomaly summary' : 'Category summary'}</h2>
       <p className="page-hint">
-        Every anomaly type each device (or vendor) has ever produced, counted from the very start of your data — not
-        a rolling window like Log Search. Acknowledging a row marks it as reviewed/handled; it stays acknowledged
-        until someone explicitly un-acknowledges it, even if the same type of anomaly happens again later.
+        {metric === 'anomaly' ? (
+          <>
+            Every anomaly type each device (or vendor) has ever produced, counted from the very start of your data —
+            not a rolling window like Log Search. Acknowledging a row marks it as reviewed/handled; it stays
+            acknowledged until someone explicitly un-acknowledges it, even if the same type of anomaly happens again
+            later.
+          </>
+        ) : (
+          <>
+            Every message category (AUTH, SECURITY, HARDWARE, NETWORK, ...) each device (or vendor) has ever
+            produced, counted from the very start of your data — covers all messages, not just anomalies, so there's
+            nothing to acknowledge here.
+          </>
+        )}
       </p>
 
       <div className="form-actions" style={{ alignItems: 'center' }}>
+        <label style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          Metric
+          <select value={metric} onChange={(e) => setMetric(e.target.value as Metric)}>
+            <option value="anomaly">Anomaly type</option>
+            <option value="category">Category</option>
+          </select>
+        </label>
         <label style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
           View
           <select value={view} onChange={(e) => setView(e.target.value as View)}>
@@ -104,14 +142,14 @@ export function AnomalySummary() {
       {error && <p className="form-error">{error}</p>}
       {loading && <p className="page-hint">Loading…</p>}
 
-      {view === 'device' && (
+      {view === 'device' && metric === 'anomaly' && (
         <table className="data-table">
           <thead>
             <tr>
               <th>Hostname</th>
               <th>Source IP</th>
               <th>Vendor</th>
-              <th>Anomaly type</th>
+              <th>{typeColumnLabel}</th>
               <th>Count</th>
               <th>First seen</th>
               <th>Last seen</th>
@@ -120,7 +158,7 @@ export function AnomalySummary() {
             </tr>
           </thead>
           <tbody>
-            {deviceRows?.map((r) => {
+            {anomalyDeviceRows?.map((r) => {
               const key = rowKey(r.source_ip, r.anomaly_reason)
               return (
                 <tr key={key}>
@@ -128,7 +166,11 @@ export function AnomalySummary() {
                   <td className="mono">{r.source_ip}</td>
                   <td>{r.vendor}</td>
                   <td>{r.anomaly_reason}</td>
-                  <td>{r.event_count.toLocaleString()}</td>
+                  <td>
+                    <Link to={logSearchLink({ source_ip: r.source_ip, anomaly_reason: r.anomaly_reason })}>
+                      {r.event_count.toLocaleString()}
+                    </Link>
+                  </td>
                   <td>{formatBeirutDateTime(r.first_seen)}</td>
                   <td>{formatBeirutDateTime(r.last_seen)}</td>
                   <td>
@@ -166,7 +208,7 @@ export function AnomalySummary() {
                 </tr>
               )
             })}
-            {deviceRows?.length === 0 && !loading && (
+            {anomalyDeviceRows?.length === 0 && !loading && (
               <tr>
                 <td colSpan={canManage ? 9 : 8}>No anomalies recorded yet.</td>
               </tr>
@@ -175,12 +217,12 @@ export function AnomalySummary() {
         </table>
       )}
 
-      {view === 'vendor' && (
+      {view === 'vendor' && metric === 'anomaly' && (
         <table className="data-table">
           <thead>
             <tr>
               <th>Vendor</th>
-              <th>Anomaly type</th>
+              <th>{typeColumnLabel}</th>
               <th>Devices affected</th>
               <th>Total events</th>
               <th>First seen</th>
@@ -188,19 +230,97 @@ export function AnomalySummary() {
             </tr>
           </thead>
           <tbody>
-            {vendorRows?.map((r) => (
+            {anomalyVendorRows?.map((r) => (
               <tr key={`${r.vendor}::${r.anomaly_reason}`}>
                 <td>{r.vendor}</td>
                 <td>{r.anomaly_reason}</td>
                 <td>{r.device_count.toLocaleString()}</td>
-                <td>{r.event_count.toLocaleString()}</td>
+                <td>
+                  <Link to={logSearchLink({ vendor: r.vendor, anomaly_reason: r.anomaly_reason })}>
+                    {r.event_count.toLocaleString()}
+                  </Link>
+                </td>
                 <td>{formatBeirutDateTime(r.first_seen)}</td>
                 <td>{formatBeirutDateTime(r.last_seen)}</td>
               </tr>
             ))}
-            {vendorRows?.length === 0 && !loading && (
+            {anomalyVendorRows?.length === 0 && !loading && (
               <tr>
                 <td colSpan={6}>No anomalies recorded yet.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      )}
+
+      {view === 'device' && metric === 'category' && (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Hostname</th>
+              <th>Source IP</th>
+              <th>Vendor</th>
+              <th>{typeColumnLabel}</th>
+              <th>Count</th>
+              <th>First seen</th>
+              <th>Last seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {categoryDeviceRows?.map((r) => (
+              <tr key={rowKey(r.source_ip, r.predicted_category)}>
+                <td>{r.hostname}</td>
+                <td className="mono">{r.source_ip}</td>
+                <td>{r.vendor}</td>
+                <td>{r.predicted_category}</td>
+                <td>
+                  <Link to={logSearchLink({ source_ip: r.source_ip, predicted_category: r.predicted_category })}>
+                    {r.event_count.toLocaleString()}
+                  </Link>
+                </td>
+                <td>{formatBeirutDateTime(r.first_seen)}</td>
+                <td>{formatBeirutDateTime(r.last_seen)}</td>
+              </tr>
+            ))}
+            {categoryDeviceRows?.length === 0 && !loading && (
+              <tr>
+                <td colSpan={7}>No events recorded yet.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      )}
+
+      {view === 'vendor' && metric === 'category' && (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Vendor</th>
+              <th>{typeColumnLabel}</th>
+              <th>Devices affected</th>
+              <th>Total events</th>
+              <th>First seen</th>
+              <th>Last seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {categoryVendorRows?.map((r) => (
+              <tr key={`${r.vendor}::${r.predicted_category}`}>
+                <td>{r.vendor}</td>
+                <td>{r.predicted_category}</td>
+                <td>{r.device_count.toLocaleString()}</td>
+                <td>
+                  <Link to={logSearchLink({ vendor: r.vendor, predicted_category: r.predicted_category })}>
+                    {r.event_count.toLocaleString()}
+                  </Link>
+                </td>
+                <td>{formatBeirutDateTime(r.first_seen)}</td>
+                <td>{formatBeirutDateTime(r.last_seen)}</td>
+              </tr>
+            ))}
+            {categoryVendorRows?.length === 0 && !loading && (
+              <tr>
+                <td colSpan={6}>No events recorded yet.</td>
               </tr>
             )}
           </tbody>

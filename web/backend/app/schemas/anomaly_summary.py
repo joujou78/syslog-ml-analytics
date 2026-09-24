@@ -35,3 +35,28 @@ class VendorAnomalySummaryRow(BaseModel):
     event_count: int
     first_seen: datetime
     last_seen: datetime
+
+
+class DeviceCategorySummaryRow(BaseModel):
+    """One (device, predicted_category) pair -- ALL events, not just
+    anomalies, since a category (AUTH, SECURITY, HARDWARE, ...) is a
+    classification of every message, not an anomaly signal. No
+    acknowledgment here: unlike an anomaly type, a category isn't
+    something to mark as 'handled'."""
+
+    source_ip: str
+    hostname: str
+    vendor: str
+    predicted_category: str
+    event_count: int
+    first_seen: datetime
+    last_seen: datetime
+
+
+class VendorCategorySummaryRow(BaseModel):
+    vendor: str
+    predicted_category: str
+    device_count: int
+    event_count: int
+    first_seen: datetime
+    last_seen: datetime

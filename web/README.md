@@ -112,6 +112,26 @@ are affected — not individually acknowledgable, since an ack is
 meaningful per-device (you fix one specific box), not per-vendor. Export
 (CSV/XML) respects whichever view is currently selected.
 
+A separate **Metric** selector switches the whole page from "Anomaly
+type" to **Category** (`GET /api/anomaly-summary/devices/by-category` and
+`/vendors/by-category`) — the same (device or vendor) × count report
+shape, but grouped by `predicted_category` (AUTH, SECURITY, HARDWARE,
+NETWORK, ...) over *all* events, not just anomalous ones, and with no
+acknowledgment column (a category isn't an issue to mark "handled").
+Export takes the same `group_by` toggle plus a `metric=anomaly|category`
+parameter.
+
+Every count in either metric is a link into **Log Search**, pre-filtered
+to exactly that row (`source_ip` + `anomaly_reason`/`predicted_category`
+for a device row, `vendor` + the same for a vendor rollup row) — so
+"how many times" always has a "show me which ones" one click away. This
+needed two additions to Log Search itself: `vendor` and `anomaly_reason`
+filters (the latter via `has(anomaly_reasons, ...)`, since that column is
+an array — an event can carry more than one reason), and Log Search now
+reads its initial filter state from the URL's query string on mount (once,
+not kept in sync afterward) so a link like `/logs?vendor=cisco&anomaly_reason=severity_spike`
+actually lands pre-filled instead of on an empty form.
+
 **Query Console** (`POST /api/query-console/execute`, "Query Console" in
 the admin nav) is full, unrestricted SQL access against ClickHouse from
 the browser — including `ALTER`, `DELETE`, `DROP`, and `TRUNCATE`. This is

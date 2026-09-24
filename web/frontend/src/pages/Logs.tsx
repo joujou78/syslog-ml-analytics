@@ -1,7 +1,31 @@
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { logsApi } from '../api/logs'
 import type { LogEntry, LogSearchFilters } from '../types'
 import { formatBeirutDateTime, formatBeirutTime } from '../utils/time'
+
+type StringFilterKey =
+  | 'start' | 'end' | 'hostname' | 'source_ip' | 'vendor' | 'program' | 'severity' | 'predicted_category'
+  | 'anomaly_reason' | 'q'
+
+const URL_FILTER_KEYS: StringFilterKey[] = [
+  'start', 'end', 'hostname', 'source_ip', 'vendor', 'program', 'severity', 'predicted_category', 'anomaly_reason', 'q',
+]
+
+// Lets another page (e.g. Anomaly Summary's "View in Log Search" links)
+// deep-link straight into a pre-filled search instead of only ever
+// landing on an empty form -- read once on mount, not kept in sync with
+// the URL afterward (Log Search's own filter state is the source of
+// truth from that point on, same as before this existed).
+function filtersFromSearchParams(params: URLSearchParams): LogSearchFilters {
+  const filters: LogSearchFilters = {}
+  for (const key of URL_FILTER_KEYS) {
+    const value = params.get(key)
+    if (value) filters[key] = value
+  }
+  if (params.get('only_anomalies') === 'true') filters.only_anomalies = true
+  return filters
+}
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
 
@@ -26,8 +50,13 @@ function SeverityBadge({ severity }: { severity: string }) {
 }
 
 export function Logs() {
-  const [filters, setFilters] = useState<LogSearchFilters>(EMPTY_FILTERS)
-  const [pendingFilters, setPendingFilters] = useState<LogSearchFilters>(EMPTY_FILTERS)
+  const [searchParams] = useSearchParams()
+  const initialFilters = () => {
+    const fromUrl = filtersFromSearchParams(searchParams)
+    return Object.keys(fromUrl).length ? fromUrl : EMPTY_FILTERS
+  }
+  const [filters, setFilters] = useState<LogSearchFilters>(initialFilters)
+  const [pendingFilters, setPendingFilters] = useState<LogSearchFilters>(initialFilters)
   const [pageSize, setPageSize] = useState(50)
   const [offset, setOffset] = useState(0)
   const [items, setItems] = useState<LogEntry[] | null>(null)
@@ -133,6 +162,19 @@ export function Logs() {
           <label>
             Source IP
             <input type="text" value={pendingFilters.source_ip ?? ''} onChange={(e) => updateField('source_ip', e.target.value)} />
+          </label>
+          <label>
+            Vendor
+            <input type="text" value={pendingFilters.vendor ?? ''} onChange={(e) => updateField('vendor', e.target.value)} />
+          </label>
+          <label>
+            Anomaly type
+            <input
+              type="text"
+              value={pendingFilters.anomaly_reason ?? ''}
+              onChange={(e) => updateField('anomaly_reason', e.target.value)}
+              placeholder="e.g. severity_spike, volume_spike"
+            />
           </label>
           <label>
             Program

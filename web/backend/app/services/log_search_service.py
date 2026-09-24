@@ -16,7 +16,7 @@ MAX_LIMIT = 1000
 # response.
 EXPORT_MAX_ROWS = 50_000
 
-_EQUALITY_FILTERS = ("hostname", "source_ip", "program", "severity", "predicted_category")
+_EQUALITY_FILTERS = ("hostname", "source_ip", "vendor", "program", "severity", "predicted_category")
 
 _EXPORT_COLUMNS = [
     "event_time", "source_ip", "hostname", "vendor", "severity", "program", "pid",
@@ -31,9 +31,11 @@ def _build_conditions(
     end: datetime | None,
     hostname: str | None,
     source_ip: str | None,
+    vendor: str | None,
     program: str | None,
     severity: str | None,
     predicted_category: str | None,
+    anomaly_reason: str | None,
     keyword: str | None,
     only_anomalies: bool,
 ) -> tuple[list[str], dict, datetime, datetime]:
@@ -48,6 +50,7 @@ def _build_conditions(
     filter_values = {
         "hostname": hostname,
         "source_ip": source_ip,
+        "vendor": vendor,
         "program": program,
         "severity": severity,
         "predicted_category": predicted_category,
@@ -61,6 +64,13 @@ def _build_conditions(
         if value:
             conditions.append(f"{field} = %({field})s")
             params[field] = value
+
+    # anomaly_reasons is an array column -- has() checks membership, not
+    # equality, so it's handled separately from the plain-equality fields
+    # above (an event can carry more than one reason at once).
+    if anomaly_reason:
+        conditions.append("has(anomaly_reasons, %(anomaly_reason)s)")
+        params["anomaly_reason"] = anomaly_reason
 
     if keyword:
         conditions.append("positionCaseInsensitive(message, %(keyword)s) > 0")
@@ -79,9 +89,11 @@ def search_logs(
     end: datetime | None = None,
     hostname: str | None = None,
     source_ip: str | None = None,
+    vendor: str | None = None,
     program: str | None = None,
     severity: str | None = None,
     predicted_category: str | None = None,
+    anomaly_reason: str | None = None,
     keyword: str | None = None,
     only_anomalies: bool = False,
     limit: int = 100,
@@ -105,9 +117,9 @@ def search_logs(
     limit = max(1, min(limit, MAX_LIMIT))
     offset = max(0, offset)
     conditions, params, start, end = _build_conditions(
-        start=start, end=end, hostname=hostname, source_ip=source_ip, program=program,
-        severity=severity, predicted_category=predicted_category, keyword=keyword,
-        only_anomalies=only_anomalies,
+        start=start, end=end, hostname=hostname, source_ip=source_ip, vendor=vendor, program=program,
+        severity=severity, predicted_category=predicted_category, anomaly_reason=anomaly_reason,
+        keyword=keyword, only_anomalies=only_anomalies,
     )
 
     params["fetch_limit"] = limit + 1
@@ -197,9 +209,11 @@ def export_logs(
     end: datetime | None = None,
     hostname: str | None = None,
     source_ip: str | None = None,
+    vendor: str | None = None,
     program: str | None = None,
     severity: str | None = None,
     predicted_category: str | None = None,
+    anomaly_reason: str | None = None,
     keyword: str | None = None,
     only_anomalies: bool = False,
 ) -> tuple[bytes, str, str, bool]:
@@ -212,9 +226,9 @@ def export_logs(
     silently returning a partial one.
     """
     conditions, params, start, end = _build_conditions(
-        start=start, end=end, hostname=hostname, source_ip=source_ip, program=program,
-        severity=severity, predicted_category=predicted_category, keyword=keyword,
-        only_anomalies=only_anomalies,
+        start=start, end=end, hostname=hostname, source_ip=source_ip, vendor=vendor, program=program,
+        severity=severity, predicted_category=predicted_category, anomaly_reason=anomaly_reason,
+        keyword=keyword, only_anomalies=only_anomalies,
     )
     params["fetch_limit"] = EXPORT_MAX_ROWS + 1
 
