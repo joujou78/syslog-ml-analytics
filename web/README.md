@@ -186,11 +186,14 @@ log is the record.
 **Log Assistant** (`POST /api/log-assistant/search` and `/ask`, "Log
 Assistant" in the nav) is a different kind of lookup than everything
 above: a plain-language question, answered by finding log lines that are
-semantically *related* to it (via embeddings + OpenSearch k-NN search, not
-exact keyword matching) and, for `/ask`, having a local LLM (Ollama) read
-those lines and write an answer. See the pipeline README's "Log Assistant"
-section for the indexing pipeline (`ml/log_assistant_indexer.py`) and the
-OpenSearch/Ollama install steps this depends on. `/search` alone (the
+semantically *related* to it via embeddings + OpenSearch, fused with a
+BM25 keyword match so an exact IP/hostname/error code in the question
+still reliably surfaces the lines containing it (see the pipeline
+README's "Retrieval is hybrid, not pure vector search" for why) and, for
+`/ask`, having a local LLM (Ollama) read those lines and write an answer.
+See the pipeline README's "Log Assistant" section for the indexing
+pipeline (`ml/log_assistant_indexer.py`) and the OpenSearch/Ollama install
+steps this depends on. `/search` alone (the
 page's "Search only" button) skips the LLM call entirely and just returns
 matching log lines with their similarity score — useful when you want
 results in under a second instead of waiting on CPU-bound inference.

@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # Assistant section for a memory budget) -- nothing here enforces that.
     ollama_chat_model: str = "llama3.1:8b-instruct-q4_K_M"
     ollama_timeout_seconds: float = 60.0
+    # Empty means "use the built-in prompts/log_assistant_system.txt next to
+    # the service code" (see log_assistant_service.py) -- override only to
+    # point at a different file without touching the shipped default.
+    log_assistant_system_prompt_file: str = ""
 
     jwt_secret: str = "changeme-generate-a-real-secret-with-openssl-rand-hex-32"
     jwt_algorithm: str = "HS256"

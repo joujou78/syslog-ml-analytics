@@ -83,7 +83,13 @@ timeout here to race against). Once they return, the models stay loaded in
 Ollama's memory for its default keep-alive window, ready for the indexer and
 backend to use immediately.
 
-## 3. Create the OpenSearch index and enable the indexer
+## 3. Create the OpenSearch index + hybrid-search pipeline, and enable the indexer
+
+`setup_index.py` now also creates a search pipeline that fuses BM25 keyword
+matching with the k-NN vector search (RRF) and sets it as this index's
+default — pure vector search alone misses exact IPs/hostnames/error codes
+that a keyword match catches instantly. See README's Log Assistant section
+for the full rationale.
 
 ```bash
 sudo -u syslog-ml /opt/syslog-ml/venv/bin/pip install -r /opt/syslog-ml/ml/requirements.txt

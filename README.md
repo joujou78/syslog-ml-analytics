@@ -775,11 +775,12 @@ baselines, template-mix outliers). This is a different kind of feature:
 answering a question typed in plain language — "why has sw1 been logging
 interface errors this morning?" — by finding the log lines that are
 semantically *related* to it (even if they don't share the same words) and
-having a local LLM read them and answer. Modeled on
-[sislogIQ](https://github.com/Toxa/sislogIQ)'s architecture: OpenSearch's
-vector (k-NN) search for retrieval, [Ollama](https://ollama.com) for local
-inference — nothing here calls out to an external API; the whole thing
-runs on your own hardware.
+having a local LLM read them and answer. Modeled on the design
+[sislogIQ](https://github.com/Toxa/sislogIQ) describes (that repo itself
+ships only a README, no working code — this project's own implementation
+is what actually exists): OpenSearch for retrieval, [Ollama](https://ollama.com)
+for local inference — nothing here calls out to an external API; the whole
+thing runs on your own hardware.
 
 **Architecture**: a new standalone process, `ml/log_assistant_indexer.py`
 (its own systemd service, deliberately separate from `consumer.py` — see
@@ -792,6 +793,24 @@ to an LLM as context and return its answer — the **Log Assistant** page in
 the web UI). Anomaly Windows and Anomaly Summary both link into it with an
 **"Explain with AI"** action that pre-fills a question and the relevant
 device/time range.
+
+**Retrieval is hybrid, not pure vector search.** A vector-only k-NN search
+is weak on exactly the things network logs are full of and embeddings
+represent poorly: exact IP addresses, hostnames, error codes, session IDs
+— typing an IP into the question should reliably find every line
+containing it, which semantic similarity alone doesn't guarantee.
+`opensearch/setup_index.py` sets up a search pipeline that fuses a BM25
+keyword match (on the raw `message` field) with the k-NN vector clause
+using reciprocal rank fusion (RRF, native to OpenSearch 2.19+) as the
+index's default pipeline, so both `search` and `ask` get the benefit
+without the query code needing to know the pipeline exists.
+
+**The LLM's system prompt lives in a file, not in code**:
+`web/backend/app/prompts/log_assistant_system.txt`. Edit it and restart
+`syslog-ml-web-api` to change how the assistant is instructed to answer —
+no code change needed. Override `SYSLOG_ML_LOG_ASSISTANT_SYSTEM_PROMPT_FILE`
+to point at a different file entirely; a missing/unreadable file falls
+back to a built-in default rather than breaking "Ask".
 
 **Hardware note**: this needs real headroom — see this repo's own
 deploy history for a concrete example. A 4-core/7.8GB VM already running
@@ -863,7 +882,7 @@ curl -s http://localhost:11434/api/embed -d '{"model":"nomic-embed-text","input"
 curl -s http://localhost:11434/api/chat -d '{"model":"llama3.1:8b-instruct-q4_K_M","messages":[{"role":"user","content":"hi"}],"stream":false}' > /dev/null
 ```
 
-**Create the OpenSearch index**, then enable the indexer:
+**Create the OpenSearch index and hybrid-search pipeline**, then enable the indexer:
 
 ```bash
 sudo -u syslog-ml /opt/syslog-ml/venv/bin/pip install -r /opt/syslog-ml/ml/requirements.txt
@@ -888,18 +907,30 @@ SYSLOG_ML_OLLAMA_CHAT_MODEL=llama3.1:8b-instruct-q4_K_M
 couldn't reach `opensearch.org` or `ollama.com` (blocked by that sandbox's
 own egress proxy — not a constraint that applies to your own server), so
 none of the OpenSearch/Ollama-facing code paths could be run end-to-end
-against the real services while writing them. What *was* verified:
-`opensearch-py`'s real client library confirms the query/index-creation
-code matches its actual method signatures, and the full FastAPI route
-stack (`/log-assistant/search`, `/log-assistant/ask`, error handling,
-request validation) was tested against a mocked OpenSearch client and
-mocked Ollama HTTP responses, including the exact JSON shapes those two
+against the real services while writing them. Semantic search alone (no
+chat model) has since been confirmed live against a real OpenSearch +
+Ollama install; the "Ask" chat path has not yet, on this project's own
+memory-constrained deploy target (see below). The **hybrid-search
+pipeline** (RRF fusion, `opensearch/setup_index.py`'s
+`_ensure_hybrid_pipeline` and `log_assistant_service.py`'s `hybrid` query)
+is newer still and hasn't been run against a live OpenSearch at all --
+its `opensearch-py` client calls (`search_pipeline.put`,
+`indices.put_settings`) were confirmed to match that library's real
+method signatures, and the request-body shape was cross-checked against
+OpenSearch's own documented syntax, but treat the first real search after
+installing this as that feature's actual smoke test: if a search comes
+back empty or errors where the old vector-only version wouldn't have,
+check `journalctl -u syslog-ml-web-api` and confirm
+`GET /syslog_ml_log_events/_settings` shows `index.search.default_pipeline`
+set to `log_assistant_hybrid_rrf` (or your `HYBRID_SEARCH_PIPELINE`
+override). What *was* verified: the full FastAPI route stack
+(`/log-assistant/search`, `/log-assistant/ask`, error handling, request
+validation) was tested against a mocked OpenSearch client and mocked
+Ollama HTTP responses, including the exact JSON shapes those two
 services' documented APIs return. The frontend page and its "Explain with
-AI" deep links were verified in a real browser. Treat the first real
-question you ask after installing this as the actual smoke test, and
-check both services' own logs (`journalctl -u opensearch`, `journalctl -u
-ollama`, `journalctl -u syslog-ml-log-assistant-indexer`) if it doesn't
-work as expected.
+AI" deep links were verified in a real browser. Check both services' own
+logs (`journalctl -u opensearch`, `journalctl -u ollama`, `journalctl -u
+syslog-ml-log-assistant-indexer`) if anything doesn't work as expected.
 
 ## Files
 

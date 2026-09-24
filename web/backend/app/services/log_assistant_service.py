@@ -20,6 +20,7 @@ after installing OpenSearch/Ollama for real.
 """
 import asyncio
 import logging
+import pathlib
 
 import httpx
 from opensearchpy import OpenSearch
@@ -29,12 +30,33 @@ from app.schemas.log_assistant import AskResponse, LogAssistantQuery, LogHit
 
 log = logging.getLogger("log_assistant_service")
 
-_SYSTEM_PROMPT = (
+# Same design idea sislogIQ's own README documents (a prompts/ folder next
+# to the code, editable without a code change) -- kept as a fallback
+# in-code default too, so a missing/misconfigured file degrades to a
+# working prompt instead of breaking "Ask" entirely.
+_DEFAULT_PROMPT_PATH = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "log_assistant_system.txt"
+_FALLBACK_SYSTEM_PROMPT = (
     "You are a network log analysis assistant. Answer the question using ONLY the "
     "log excerpts provided below -- do not assume anything about the network that "
     "isn't shown in them. If the excerpts don't contain enough information to "
     "answer, say so plainly instead of guessing."
 )
+
+
+def _load_system_prompt() -> str:
+    path = pathlib.Path(settings.log_assistant_system_prompt_file) if settings.log_assistant_system_prompt_file else _DEFAULT_PROMPT_PATH
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        return text or _FALLBACK_SYSTEM_PROMPT
+    except OSError:
+        log.warning("Log Assistant system prompt file not found/readable at %s, using built-in default", path)
+        return _FALLBACK_SYSTEM_PROMPT
+
+
+# Read once at process start, same as every other setting here -- edit the
+# file and restart syslog-ml-web-api to apply, consistent with how every
+# other config change in this project (env vars, systemd overrides) works.
+_SYSTEM_PROMPT = _load_system_prompt()
 
 
 async def _embed(question: str) -> list[float]:
@@ -69,8 +91,26 @@ def _build_query(vector: list[float], query: LogAssistantQuery) -> dict:
         # could come back empty even when matching documents exist, simply
         # because none of them happened to be in the unfiltered top-k.
         knn_clause["filter"] = {"bool": {"filter": filters}}
+    knn_query: dict = {"knn": {"embedding": knn_clause}}
 
-    return {"size": query.limit, "query": {"knn": {"embedding": knn_clause}}}
+    # Vector search alone is weak on the things network logs are full of and
+    # embeddings represent poorly -- exact IPs, hostnames, error codes,
+    # session IDs. "172.22.21.165" or "ACSSERVER" typed into the question
+    # should find every log line containing it; a keyword match query
+    # guarantees that in a way semantic similarity alone doesn't. Filters
+    # are duplicated onto this clause too (not shared with the knn clause
+    # above) -- a hybrid query fuses two INDEPENDENT result sets, so a
+    # filter applied to only one clause would leave the other one
+    # unfiltered in the final fused ranking.
+    match_query: dict = {"match": {"message": query.question}}
+    if filters:
+        match_query = {"bool": {"must": [match_query], "filter": filters}}
+
+    # Fused by this index's default search pipeline (RRF -- see
+    # opensearch/setup_index.py's _ensure_hybrid_pipeline), not specified
+    # per-query here, so both this and semantic_search() get hybrid
+    # ranking without either needing to know the pipeline's name.
+    return {"size": query.limit, "query": {"hybrid": {"queries": [match_query, knn_query]}}}
 
 
 def _hit_to_log_hit(hit: dict) -> LogHit:
