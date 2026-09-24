@@ -208,14 +208,14 @@ def _export_csv(rows: list, columns: list[str]) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def _export_xml(rows: list, columns: list[str]) -> bytes:
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<summary>"]
+def _export_xml(rows: list, columns: list[str], root: str) -> bytes:
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', f"<{root}>"]
     for r in rows:
         lines.append("  <row>")
         for col in columns:
             lines.append(f"    <{col}>{escape(_fmt(getattr(r, col)))}</{col}>")
         lines.append("  </row>")
-    lines.append("</summary>")
+    lines.append(f"</{root}>")
     return "\n".join(lines).encode("utf-8")
 
 
@@ -224,7 +224,7 @@ def export_device_summary_csv(rows: list[DeviceAnomalySummaryRow]) -> bytes:
 
 
 def export_device_summary_xml(rows: list[DeviceAnomalySummaryRow]) -> bytes:
-    return _export_xml(rows, _DEVICE_EXPORT_COLUMNS)
+    return _export_xml(rows, _DEVICE_EXPORT_COLUMNS, "anomaly_summary")
 
 
 def export_vendor_summary_csv(rows: list[VendorAnomalySummaryRow]) -> bytes:
@@ -232,7 +232,7 @@ def export_vendor_summary_csv(rows: list[VendorAnomalySummaryRow]) -> bytes:
 
 
 def export_vendor_summary_xml(rows: list[VendorAnomalySummaryRow]) -> bytes:
-    return _export_xml(rows, _VENDOR_EXPORT_COLUMNS)
+    return _export_xml(rows, _VENDOR_EXPORT_COLUMNS, "anomaly_summary")
 
 
 def export_device_category_csv(rows: list[DeviceCategorySummaryRow]) -> bytes:
@@ -240,7 +240,7 @@ def export_device_category_csv(rows: list[DeviceCategorySummaryRow]) -> bytes:
 
 
 def export_device_category_xml(rows: list[DeviceCategorySummaryRow]) -> bytes:
-    return _export_xml(rows, _DEVICE_CATEGORY_EXPORT_COLUMNS)
+    return _export_xml(rows, _DEVICE_CATEGORY_EXPORT_COLUMNS, "category_summary")
 
 
 def export_vendor_category_csv(rows: list[VendorCategorySummaryRow]) -> bytes:
@@ -248,4 +248,4 @@ def export_vendor_category_csv(rows: list[VendorCategorySummaryRow]) -> bytes:
 
 
 def export_vendor_category_xml(rows: list[VendorCategorySummaryRow]) -> bytes:
-    return _export_xml(rows, _VENDOR_CATEGORY_EXPORT_COLUMNS)
+    return _export_xml(rows, _VENDOR_CATEGORY_EXPORT_COLUMNS, "category_summary")

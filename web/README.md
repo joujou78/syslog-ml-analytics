@@ -121,6 +121,19 @@ acknowledgment column (a category isn't an issue to mark "handled").
 Export takes the same `group_by` toggle plus a `metric=anomaly|category`
 parameter.
 
+**Honest cost caveat, worse than the anomaly metric's already-noted one**:
+Category's queries scan and aggregate *all* of `syslog_ml.events` with no
+time bound and no `is_anomaly` filter (every event has a category; only
+some are anomalies), and since `events` now retains data indefinitely (no
+TTL — see the pipeline README), this full scan only gets more expensive
+as the table grows, with nothing here capping it. Accepted deliberately,
+consistent with wanting genuinely cumulative "since the start" counts
+rather than a rolling window — but if it becomes slow in practice, the
+fix is a periodic pre-aggregated rollup (the same pattern
+`device_window_anomalies` already uses for the windowed anomaly
+detector), not silently adding a time filter that would quietly change
+what the numbers mean.
+
 Every count in either metric is a link into **Log Search**, pre-filtered
 to exactly that row (`source_ip` + `anomaly_reason`/`predicted_category`
 for a device row, `vendor` + the same for a vendor rollup row) — so
@@ -130,7 +143,10 @@ filters (the latter via `has(anomaly_reasons, ...)`, since that column is
 an array — an event can carry more than one reason), and Log Search now
 reads its initial filter state from the URL's query string on mount (once,
 not kept in sync afterward) so a link like `/logs?vendor=cisco&anomaly_reason=severity_spike`
-actually lands pre-filled instead of on an empty form.
+actually lands pre-filled instead of on an empty form. The link also
+carries `start=<that row's first_seen>`, since without it Log Search's own
+24h default window would silently show "no results" for a cumulative
+count that includes events far older than a day.
 
 **Query Console** (`POST /api/query-console/execute`, "Query Console" in
 the admin nav) is full, unrestricted SQL access against ClickHouse from

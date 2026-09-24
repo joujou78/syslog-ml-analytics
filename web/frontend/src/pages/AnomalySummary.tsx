@@ -15,6 +15,17 @@ function logSearchLink(params: Record<string, string>) {
   return `/logs?${new URLSearchParams(params).toString()}`
 }
 
+// Anomaly/Category Summary counts are cumulative from the very start of
+// the data, but Log Search defaults to the last 24h when no start/end is
+// given -- without this, a drill-down link for anything older than a day
+// would silently land on "No log entries match these filters" despite
+// the linked count being nonzero. Sliced to datetime-local's expected
+// "YYYY-MM-DDTHH:MM" shape (first 16 chars of the ISO string) so the
+// Start field also displays correctly, not just works.
+function withStart(params: Record<string, string>, firstSeen: string) {
+  return { ...params, start: firstSeen.slice(0, 16) }
+}
+
 function rowKey(sourceIp: string, type: string) {
   return `${sourceIp}::${type}`
 }
@@ -167,7 +178,7 @@ export function AnomalySummary() {
                   <td>{r.vendor}</td>
                   <td>{r.anomaly_reason}</td>
                   <td>
-                    <Link to={logSearchLink({ source_ip: r.source_ip, anomaly_reason: r.anomaly_reason })}>
+                    <Link to={logSearchLink(withStart({ source_ip: r.source_ip, anomaly_reason: r.anomaly_reason }, r.first_seen))}>
                       {r.event_count.toLocaleString()}
                     </Link>
                   </td>
@@ -236,7 +247,7 @@ export function AnomalySummary() {
                 <td>{r.anomaly_reason}</td>
                 <td>{r.device_count.toLocaleString()}</td>
                 <td>
-                  <Link to={logSearchLink({ vendor: r.vendor, anomaly_reason: r.anomaly_reason })}>
+                  <Link to={logSearchLink(withStart({ vendor: r.vendor, anomaly_reason: r.anomaly_reason }, r.first_seen))}>
                     {r.event_count.toLocaleString()}
                   </Link>
                 </td>
@@ -274,7 +285,7 @@ export function AnomalySummary() {
                 <td>{r.vendor}</td>
                 <td>{r.predicted_category}</td>
                 <td>
-                  <Link to={logSearchLink({ source_ip: r.source_ip, predicted_category: r.predicted_category })}>
+                  <Link to={logSearchLink(withStart({ source_ip: r.source_ip, predicted_category: r.predicted_category }, r.first_seen))}>
                     {r.event_count.toLocaleString()}
                   </Link>
                 </td>
@@ -310,7 +321,7 @@ export function AnomalySummary() {
                 <td>{r.predicted_category}</td>
                 <td>{r.device_count.toLocaleString()}</td>
                 <td>
-                  <Link to={logSearchLink({ vendor: r.vendor, predicted_category: r.predicted_category })}>
+                  <Link to={logSearchLink(withStart({ vendor: r.vendor, predicted_category: r.predicted_category }, r.first_seen))}>
                     {r.event_count.toLocaleString()}
                   </Link>
                 </td>
