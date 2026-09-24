@@ -48,7 +48,14 @@ def _load_system_prompt() -> str:
     try:
         text = path.read_text(encoding="utf-8").strip()
         return text or _FALLBACK_SYSTEM_PROMPT
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # OSError: missing file, permissions, is-a-directory. UnicodeDecodeError
+        # (a ValueError subclass, NOT an OSError): the file exists and is
+        # readable but isn't valid UTF-8 (e.g. saved from a Windows editor
+        # in some other encoding) -- read_text() raises this separately, and
+        # since this runs at import time, letting it propagate would crash
+        # the whole FastAPI app on startup, not just degrade "Ask" the way
+        # a missing file does.
         log.warning("Log Assistant system prompt file not found/readable at %s, using built-in default", path)
         return _FALLBACK_SYSTEM_PROMPT
 

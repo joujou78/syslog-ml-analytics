@@ -27,7 +27,15 @@ class LogHit(BaseModel):
     message: str
     is_anomaly: bool
     anomaly_reasons: list[str]
-    score: float  # OpenSearch's kNN similarity score for this query, not a stored value
+    # OpenSearch's own relevance score for this query, not a stored value --
+    # since log_assistant_service.py's query is a `hybrid` query fused by
+    # the index's RRF search pipeline (see opensearch/setup_index.py), this
+    # is an RRF rank-fusion score (roughly the sum of 1/(rank_constant+rank)
+    # across the BM25 and k-NN sub-queries), NOT a k-NN cosine-similarity
+    # value -- small (well under 1) and only meaningful for ordering hits
+    # relative to each other in one response, not as an absolute quality
+    # threshold or a number comparable across different queries.
+    score: float
 
 
 class SemanticSearchResponse(BaseModel):
