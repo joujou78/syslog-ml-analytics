@@ -68,6 +68,8 @@ ollama list                        # confirm both models are present
 ```bash
 sudo -u syslog-ml /opt/syslog-ml/venv/bin/pip install -r /opt/syslog-ml/ml/requirements.txt
 sudo -u syslog-ml /opt/syslog-ml/venv/bin/python /opt/syslog-ml/opensearch/setup_index.py
+sudo cp /opt/syslog-ml/systemd/syslog-ml-log-assistant-indexer.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable --now syslog-ml-log-assistant-indexer
 sudo systemctl status syslog-ml-log-assistant-indexer   # confirm "active (running)"
 journalctl -u syslog-ml-log-assistant-indexer -f        # watch it embed real events; Ctrl-C once you see it running cleanly

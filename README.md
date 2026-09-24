@@ -854,6 +854,8 @@ ollama pull llama3.1:8b-instruct-q4_K_M       # chat model -- must match SYSLOG_
 ```bash
 sudo -u syslog-ml /opt/syslog-ml/venv/bin/pip install -r /opt/syslog-ml/ml/requirements.txt
 sudo -u syslog-ml /opt/syslog-ml/venv/bin/python /opt/syslog-ml/opensearch/setup_index.py
+sudo cp /opt/syslog-ml/systemd/syslog-ml-log-assistant-indexer.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable --now syslog-ml-log-assistant-indexer
 ```
 
