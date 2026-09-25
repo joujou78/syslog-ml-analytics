@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { alertsApi } from '../api/alerts'
+import { deviceSilenceApi } from '../api/deviceSilence'
 import { useAuth } from '../auth/AuthContext'
-import type { AlertEvent, AlertRule, AlertRuleInput } from '../types'
+import type { AlertEvent, AlertRule, AlertRuleInput, DeviceSilence } from '../types'
 import { extractErrorMessage } from '../utils/errors'
-import { formatBeirutDateTime } from '../utils/time'
+import { formatBeirutDateTime, formatDurationMinutes } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
 
@@ -41,6 +42,7 @@ export function Alerts() {
 
   const [rules, setRules] = useState<AlertRule[] | null>(null)
   const [history, setHistory] = useState<AlertEvent[] | null>(null)
+  const [silentDevices, setSilentDevices] = useState<DeviceSilence[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [form, setForm] = useState<AlertRuleInput>(EMPTY_FORM)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -49,6 +51,7 @@ export function Alerts() {
   const load = () => {
     alertsApi.listRules().then(setRules).catch(() => setError('Could not load alert rules'))
     alertsApi.history().then(setHistory).catch(() => setError('Could not load alert history'))
+    deviceSilenceApi.list().then(setSilentDevices).catch(() => setError('Could not load silent devices'))
   }
 
   useEffect(() => {
@@ -114,6 +117,47 @@ export function Alerts() {
         and won't fire again until <em>cooldown</em> has passed since its last trigger. Leave a filter blank to
         match any value for that field.
       </p>
+
+      <h3>Currently silent devices</h3>
+      <p className="page-hint">
+        A device flagged here has gone quiet for far longer than its own historical logging pattern would predict
+        (not a fixed timeout — a chatty device and a quiet one have very different normal gaps). This can mean it
+        crashed, lost connectivity, or was tampered with. It clears automatically once the device logs again.
+      </p>
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>Device</th>
+            <th>Silent for</th>
+            <th>Normally logs every</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {silentDevices?.map((d) => {
+            // Every row here is currently silent by definition (see
+            // DeviceSilenceRead's backing table docstring) -- silence
+            // duration is just "how long since last_seen_at", computed
+            // client-side so it keeps ticking up between page loads
+            // rather than freezing at whatever it was when the backend
+            // last responded.
+            const silenceMinutes = (Date.now() - new Date(d.last_seen_at).getTime()) / 60_000
+            return (
+              <tr key={d.source_ip}>
+                <td>{d.hostname ?? d.source_ip}</td>
+                <td className="mono">{formatDurationMinutes(silenceMinutes)}</td>
+                <td className="mono">{formatDurationMinutes(d.expected_interval_minutes)}</td>
+                <td className="mono">{formatBeirutDateTime(d.last_seen_at)}</td>
+              </tr>
+            )
+          })}
+          {silentDevices?.length === 0 && (
+            <tr>
+              <td colSpan={4}>No devices are currently silent.</td>
+            </tr>
+          )}
+        </tbody>
+      </table>
 
       {canManage && (
         <form className="credential-form" onSubmit={handleSubmit}>

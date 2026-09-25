@@ -51,3 +51,14 @@ export function padWindow(iso: string, beforeMinutes: number, afterMinutes: numb
   const end = new Date(center.getTime() + afterMinutes * 60_000)
   return { start: toDatetimeLocalUtc(start), end: toDatetimeLocalUtc(end) }
 }
+
+// A device-silence duration in minutes (often hours+) reads better as
+// "5h 12m" than a bare minute count -- this only goes up to hours since
+// nothing in this codebase's silence detection expects multi-day gaps to
+// be common enough to need a "d" unit too.
+export function formatDurationMinutes(totalMinutes: number): string {
+  const minutes = Math.round(totalMinutes)
+  const hours = Math.floor(minutes / 60)
+  const remainder = minutes % 60
+  return hours > 0 ? `${hours}h ${remainder}m` : `${remainder}m`
+}

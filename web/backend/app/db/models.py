@@ -211,3 +211,30 @@ class AuditLog(Base):
     target: Mapped[str] = mapped_column(String(255), nullable=False)
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeviceSilenceState(Base):
+    """
+    Currently-silent devices: a device whose own historical logging rate
+    would predict activity by now, but hasn't logged in that long.
+    Evaluated by ml/detect_silent_devices.py, not by this web process --
+    same reasoning as AlertRule/AlertEvent being evaluated by
+    evaluate_alerts.py (see that script's own module docstring for why
+    a device-relative threshold is used instead of a fixed timeout).
+
+    One row per currently-silent device (upserted, keyed by source_ip,
+    not a surrogate UUID -- there's exactly one live state per device,
+    never a history of past silences), deleted entirely once the device
+    logs again -- this table always reflects live state, not history,
+    same "currently true" semantics as AnomalyAcknowledgment rather than
+    AlertEvent's append-only log.
+    """
+    __tablename__ = "device_silence_state"
+
+    source_ip: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    expected_interval_minutes: Mapped[float] = mapped_column(nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    silence_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

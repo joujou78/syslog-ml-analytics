@@ -79,7 +79,24 @@ separate process, `ml/evaluate_alerts.py`, does the actual evaluation
 against ClickHouse and writes `alert_events` — see the pipeline README's
 "Alerting" section for how that worker runs. Rule management is
 admin/analyst; viewing rules and history is open to any authenticated
-role, same split as `/devices`.
+role, same split as `/devices`. The same page's **"Currently silent
+devices"** section (`GET /api/device-silence`) is a different kind of
+alert — not rule-based, but a device whose own historical logging pattern
+predicts activity by now and hasn't logged in that long. See the pipeline
+README's "Device-silence detection" section for the worker
+(`ml/detect_silent_devices.py`) that maintains this; the page itself is a
+read-only view over `device_silence_state`, open to any authenticated
+role like the rest of this page.
+
+**Audit Log** ("Audit Log" in the nav, admin-only) is a read-only view
+(`GET /api/audit`, `/api/audit/actions`) over `audit_log` — a record of
+every administrative action across the system (alert rules, SNMP
+credentials, relay source IPs, anomaly acknowledgments, query console
+usage), written by each of those features' own service functions. Admin-
+only because it's broader-reaching than any single page it covers, not
+because any individual entry is more sensitive than what its own page
+already shows (a credential's audit target is its `ip_or_cidr`, never the
+actual community string or passphrase).
 
 **Anomaly Windows** (`GET /api/anomaly-windows`, "Anomaly Windows" in the
 nav) is a read-only, paginated view over `syslog_ml.device_window_anomalies`
@@ -442,6 +459,21 @@ then log in with the admin account from Step 2.
   by the credential-pool work — it just took a real multi-candidate pool
   test against a real device to surface clearly. Confirmed against a real
   local `snmpd`: `-v v2c` fails with exit code 1, `-v 2c` succeeds.
+- **Audit Log and device-silence detection were verified against a real
+  local ClickHouse and Postgres both** (a real, if very old, ClickHouse
+  server — not just mocked — became available in this session's sandbox
+  after installing it directly, better coverage than most of this file's
+  other entries could get): the audit log's join/ordering/action-filter
+  query, and `ml/detect_silent_devices.py`'s full newly-silent /
+  still-silent-within-cooldown / recovered state machine, including the
+  Postgres migration's upgrade and downgrade both applying cleanly. Also
+  verified in a real browser (Playwright) end to end — login, nav,
+  render, filter — via `e2e/test_audit_log.mjs` and
+  `e2e/test_device_silence.mjs`. Not verified against your actual device
+  traffic's real inter-arrival patterns, so the default
+  `SILENCE_MULTIPLIER`/`SILENCE_MIN_MINUTES` may need tuning once you see
+  real data — see the pipeline README's "Device-silence detection"
+  section.
 - The multi-signal anomaly detection (`always_severe`, `security_content`,
   `severity_spike`, `volume_spike`, plus the pre-existing `rare_template`)
   was verified with real inputs run through the actual `to_row()`/

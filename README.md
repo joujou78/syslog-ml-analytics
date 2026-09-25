@@ -258,6 +258,7 @@ sudo systemctl restart rsyslog
 sudo cp systemd/syslog-ml-classifier.service systemd/syslog-ml-resolver.service systemd/syslog-ml-resolver.timer /etc/systemd/system/
 sudo cp systemd/syslog-ml-alert-evaluator.service systemd/syslog-ml-alert-evaluator.timer /etc/systemd/system/
 sudo cp systemd/syslog-ml-reverify.service systemd/syslog-ml-reverify.timer /etc/systemd/system/
+sudo cp systemd/syslog-ml-silence-detector.service systemd/syslog-ml-silence-detector.timer /etc/systemd/system/
 
 # The resolver, the alert evaluator, and the re-verify job all need
 # credentials for the shared Postgres DB (the alert evaluator only reads
@@ -274,6 +275,7 @@ sudo systemctl enable --now syslog-ml-classifier.service
 sudo systemctl enable --now syslog-ml-resolver.timer
 sudo systemctl enable --now syslog-ml-alert-evaluator.timer
 sudo systemctl enable --now syslog-ml-reverify.timer
+sudo systemctl enable --now syslog-ml-silence-detector.timer
 ```
 
 **Checkpoint:**
@@ -284,6 +286,7 @@ sudo journalctl -u syslog-ml-classifier -f              # confirm it's processin
 clickhouse-client --query "SELECT count() FROM syslog_ml.events"
 clickhouse-client --query "SELECT count() FROM syslog_ml.events WHERE is_anomaly = 1"
 sudo journalctl -u syslog-ml-alert-evaluator -f         # confirm it runs every minute, no errors
+sudo journalctl -u syslog-ml-silence-detector -f        # confirm it runs every 10 minutes, no errors
 ```
 
 ### Anomaly flagging
@@ -441,6 +444,38 @@ with a Slack incoming webhook, PagerDuty, or any endpoint that accepts a
 POST). There's no email delivery in this version — a webhook was the
 simplest channel to build and test without requiring SMTP credentials;
 point it at a service that turns webhooks into email/SMS if you need that.
+
+### Device-silence detection
+
+Every anomaly signal above (`rare_template`, `always_severe`,
+`security_content`, `severity_spike`, `volume_spike`,
+`unusual_template_mix`) detects a device logging too much or unusually.
+None of them detect a device that stops logging entirely — for a security
+appliance or network switch, that can mean it crashed, lost connectivity,
+or was tampered with, and without this it's invisible.
+
+`ml/detect_silent_devices.py` (run every 10 minutes by
+`syslog-ml-silence-detector.timer`) learns each device's own average
+inter-arrival time from `SILENCE_BASELINE_WINDOW_DAYS` (default 7) of
+history — deliberately device-relative, not a fixed timeout, since a
+firewall logging every few seconds and a switch logging every few hours
+are both "silent" at wildly different absolute gaps. A device needs at
+least `SILENCE_MIN_BASELINE_EVENTS` (default 20) events in that window
+before its baseline is trusted at all. It's flagged once the actual gap
+since last-seen exceeds `SILENCE_MULTIPLIER` (default 10) times that
+baseline, with `SILENCE_MIN_MINUTES` (default 30) as an absolute floor so
+a very chatty device isn't flagged over an ordinary few-minute pause.
+
+State lives in Postgres (`device_silence_state`, one row per *currently*
+silent device — deleted the moment it logs again, so this table always
+reflects live state, not history) and shows up in the web app's Alerts
+page under "Currently silent devices," visible to any authenticated role
+the same as alert rules/history. A transition either way (newly silent,
+or recovered) POSTs to `SILENCE_WEBHOOK_URL` if configured, same payload
+shape and Slack/PagerDuty/generic-endpoint compatibility as
+`evaluate_alerts.py`'s webhooks; a device that stays silent re-notifies
+only every `SILENCE_RENOTIFY_MINUTES` (default 240), not on every 10-minute
+run, so an ongoing outage doesn't spam the channel.
 
 ### Passive vendor detection (no SNMP credential needed)
 

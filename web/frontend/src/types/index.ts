@@ -203,6 +203,15 @@ export interface AlertEvent {
   notify_error: string | null
 }
 
+export interface DeviceSilence {
+  source_ip: string
+  hostname: string | null
+  expected_interval_minutes: number
+  last_seen_at: string
+  silence_started_at: string | null
+  last_notified_at: string | null
+}
+
 export interface AuditLogEntry {
   id: string
   actor_id: string | null
