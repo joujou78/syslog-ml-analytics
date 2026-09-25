@@ -915,6 +915,22 @@ None of this applies if your CPU has AVX2/FMA (most anything from 2014
 onward) — indexing every event and getting fast chat responses should
 both just work at the RAM budget above.
 
+- **A backfill can still starve an interactive chat request even on
+  AVX2/FMA hardware.** The throughput numbers above are averages; the
+  indexer's poll loop (`run_cycle` in `ml/log_assistant_indexer.py`)
+  fetches and embeds batch after batch back-to-back with no pause while a
+  backlog exists, so all cores can be saturated for the backlog's whole
+  duration, not just briefly. Confirmed on net-flow (AVX2/FMA present):
+  a chat completion that took ~6s uncontended took 238s while a backfill
+  was running the same batch loop. Set `INDEXER_BATCH_SLEEP_SECONDS`
+  (default `0`, e.g. `1.0`) to add a pause between batches, giving
+  interactive requests a periodic CPU opening at the cost of a longer
+  backfill — independent of, and worth combining with, the
+  `proxy_read_timeout` (`web/nginx/syslog-ml-web.conf`) /
+  `SYSLOG_ML_OLLAMA_TIMEOUT_SECONDS` (`web/backend/app/core/config.py`)
+  timeouts, which only stop a slow request from being killed outright and
+  don't make it any faster.
+
 **Install OpenSearch** (single node, no Docker — same "native systemd
 service" approach as everything else here):
 

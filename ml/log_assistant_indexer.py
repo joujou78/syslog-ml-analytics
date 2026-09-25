@@ -94,6 +94,18 @@ CHECKPOINT_FILE = os.environ.get(
 # are anomaly-focused already, not general log browsing).
 INDEXER_ANOMALIES_ONLY = os.environ.get("INDEXER_ANOMALIES_ONLY", "false").lower() == "true"
 
+# Opt-in, default off: during a large backfill (e.g. after a checkpoint
+# reset), run_cycle's inner while-loop below fetches and embeds batch after
+# batch back-to-back with no pause between them -- POLL_SECONDS only applies
+# once it's caught up (the loop hits an empty batch). On a CPU-only host
+# that's also serving interactive "ask" chat completions (see
+# web/backend/app/services/log_assistant_service.py), that back-to-back
+# embedding traffic competes for the same cores and can starve a chat
+# request for minutes (confirmed on net-flow: see README's Log Assistant
+# section). Setting this gives interactive requests a periodic opening at
+# the cost of a longer backfill; leave at 0 on hardware with CPU to spare.
+INDEXER_BATCH_SLEEP_SECONDS = float(os.environ.get("INDEXER_BATCH_SLEEP_SECONDS", "0"))
+
 _EVENT_COLUMNS = [
     "event_time", "received_at", "source_ip", "hostname", "vendor", "severity", "program",
     "pid", "message", "template_id", "predicted_category", "is_anomaly", "anomaly_reasons",
@@ -288,6 +300,8 @@ def run_cycle(ch_client, os_client: OpenSearch, checkpoint: datetime | None) -> 
             break
         _save_checkpoint(checkpoint)
         total_indexed += len(rows)
+        if INDEXER_BATCH_SLEEP_SECONDS:
+            time.sleep(INDEXER_BATCH_SLEEP_SECONDS)
         # No "len(rows) < BATCH_SIZE means caught up" shortcut here on
         # purpose -- _trim_ambiguous_tail can legitimately return fewer
         # than BATCH_SIZE rows while more are still waiting (the trimmed
