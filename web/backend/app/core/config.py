@@ -36,6 +36,19 @@ class Settings(BaseSettings):
     # `/api/log-assistant/` proxy_read_timeout, which must be >= this or
     # nginx gives up first regardless of what this is set to.
     ollama_timeout_seconds: float = 300.0
+    # Bounds worst-case "ask" latency deterministically, which the timeout
+    # above alone doesn't: confirmed on net-flow that a genuinely
+    # content-rich question (many real matching log lines, e.g. "top up
+    # down ports" against a network that logs plenty of real interface
+    # flaps) can induce a long generated answer that -- at this CPU-only
+    # hardware's measured ~4.5-5 tokens/sec decode speed -- takes minutes on
+    # its own, regardless of indexer contention. A trivial question (e.g.
+    # "test") gets a short answer and finishes in seconds; a real one can
+    # hit the 300s timeout even with no other load on the box. 400 tokens is
+    # roughly 300-400 words -- plenty for a concise analysis answer, and
+    # ~80-90s worst case at this hardware's measured decode speed, leaving
+    # real margin under ollama_timeout_seconds even under some contention.
+    ollama_num_predict: int = 400
     # Empty means "use the built-in prompts/log_assistant_system.txt next to
     # the service code" (see log_assistant_service.py) -- override only to
     # point at a different file without touching the shipped default.

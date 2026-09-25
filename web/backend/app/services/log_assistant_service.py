@@ -168,6 +168,10 @@ async def ask(os_client: OpenSearch, query: LogAssistantQuery) -> AskResponse:
                     {"role": "user", "content": prompt},
                 ],
                 "stream": False,
+                # Bounds worst-case generation time -- see config.py's
+                # ollama_num_predict comment for why this matters on
+                # CPU-only hardware independent of any other contention.
+                "options": {"num_predict": settings.ollama_num_predict},
             },
         )
         response.raise_for_status()

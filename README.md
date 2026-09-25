@@ -1068,6 +1068,31 @@ both just work at the RAM budget above.
   combining with, the `proxy_read_timeout` /
   `SYSLOG_ML_OLLAMA_TIMEOUT_SECONDS` timeouts above, which only stop a slow
   request from being killed outright and don't make it any faster.
+- **The bigger discovery: contention wasn't the whole story.** All of the
+  above (timeouts, `INDEXER_BATCH_SLEEP_SECONDS`, `INDEXER_BATCH_SIZE`)
+  target the same theory -- that the indexer's backfill was starving a
+  concurrent chat request. That theory was real, but confirmed on net-flow
+  to be *incomplete*: even after `INDEXER_BATCH_SIZE=20` measurably fixed
+  the batch cadence (verified: `_bulk` POSTs every ~2s instead of ~13s), a
+  content-rich question ("top up down ports" -- interface up/down chatter
+  is common, genuinely well-matched log traffic) still hit the full 300s
+  timeout, every single time, while a content-free test question ("test")
+  succeeded every single time, regardless of what the indexer was doing.
+  The real second factor: the `/api/chat` call to Ollama had **no cap on
+  how many tokens it's allowed to generate**. A question that matches a lot
+  of real, relevant log content can induce a long, detailed generated
+  answer, and at this CPU-only hardware's measured ~4.5-5 tokens/sec decode
+  speed, an uncapped answer can genuinely take minutes on its own --
+  independent of any indexer contention at all. Fixed by
+  `ollama_num_predict` (`web/backend/app/core/config.py`, default `400`
+  tokens, passed as `options.num_predict` in
+  `log_assistant_service.py`'s `/api/chat` call) and a "keep it concise"
+  instruction added to `prompts/log_assistant_system.txt`, which bounds
+  worst-case generation time deterministically regardless of contention.
+  Lesson for anyone debugging this further: a fixed, trivial test question
+  succeeding proves the *pipeline* works, not that *every* question will
+  complete in time -- test with a real, content-rich question too before
+  concluding a latency fix is sufficient.
 
 **Install OpenSearch** (single node, no Docker — same "native systemd
 service" approach as everything else here):
