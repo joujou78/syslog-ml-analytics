@@ -17,6 +17,24 @@ Environment=OPENSEARCH_INDEX=syslog_ml_log_events
 Environment=OLLAMA_URL=http://localhost:11434
 Environment=OLLAMA_EMBED_MODEL=nomic-embed-text
 Environment=LOG_ASSISTANT_CHECKPOINT_FILE=/var/lib/syslog-ml/log_assistant_indexer.checkpoint
+# Deprioritize this service's CPU scheduling relative to everything else on
+# the box (ollama.service, syslog-ml-web-api, the classifier, etc. all stay
+# at the default Nice=0 / CPUWeight=100) -- confirmed on net-flow that this
+# indexer's own embedding batches can otherwise saturate every core for
+# ~13s at a stretch (see ml/log_assistant_indexer.py's
+# INDEXER_BATCH_SLEEP_SECONDS docstring) and starve an interactive chat
+# request for minutes. Nice=15 makes the kernel's CFS scheduler yield this
+# process's CPU time to any nice=0 process that wants to run; CPUWeight=20
+# does the same at the cgroup level (works on cgroup v2, degrades to a
+# proportional CPUShares translation on v1 -- harmless either way). Neither
+# throttles this service when it's the only thing that wants the CPU, so
+# the backfill still runs at full speed whenever nothing else needs it --
+# unlike INDEXER_BATCH_SLEEP_SECONDS, which pauses unconditionally. Keep
+# both: this is coarse (a whole embedding batch is one scheduling unit) and
+# doesn't help if the chat request lands mid-batch, which the sleep-based
+# gap still catches some of.
+Nice=15
+CPUWeight=20
 Restart=on-failure
 RestartSec=10
 

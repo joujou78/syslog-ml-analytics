@@ -930,6 +930,15 @@ both just work at the RAM budget above.
   `SYSLOG_ML_OLLAMA_TIMEOUT_SECONDS` (`web/backend/app/core/config.py`)
   timeouts, which only stop a slow request from being killed outright and
   don't make it any faster.
+- **Prefer OS-level scheduling priority over the sleep, where available.**
+  `systemd/syslog-ml-log-assistant-indexer.service` sets `Nice=15` and
+  `CPUWeight=20`, which asks the kernel to yield this service's CPU time to
+  everything else on the box (left at the default priority) only when
+  something else actually wants to run — unlike
+  `INDEXER_BATCH_SLEEP_SECONDS`, which pauses unconditionally, this doesn't
+  slow the backfill down at all when nothing else needs the CPU. It's
+  coarser, though (a whole ~13s embedding batch is one scheduling unit, so
+  a chat request that lands mid-batch still waits on it) — keep both.
 
 **Install OpenSearch** (single node, no Docker — same "native systemd
 service" approach as everything else here):
