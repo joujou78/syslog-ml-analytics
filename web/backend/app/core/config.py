@@ -28,7 +28,14 @@ class Settings(BaseSettings):
     # Pick one that actually fits the host's RAM (see README's Log
     # Assistant section for a memory budget) -- nothing here enforces that.
     ollama_chat_model: str = "llama3.1:8b-instruct-q4_K_M"
-    ollama_timeout_seconds: float = 60.0
+    # Confirmed on net-flow: an uncontended chat completion took ~6s, but
+    # the same request took 4+ minutes while something else (the Log
+    # Assistant indexer's own embedding backfill) was competing for the
+    # same CPU -- 60s was nowhere near enough headroom for that reality.
+    # Keep in sync with web/nginx/syslog-ml-web.conf's
+    # `/api/log-assistant/` proxy_read_timeout, which must be >= this or
+    # nginx gives up first regardless of what this is set to.
+    ollama_timeout_seconds: float = 300.0
     # Empty means "use the built-in prompts/log_assistant_system.txt next to
     # the service code" (see log_assistant_service.py) -- override only to
     # point at a different file without touching the shipped default.
