@@ -5,6 +5,7 @@ import { ProtectedRoute } from './components/ProtectedRoute'
 import { Alerts } from './pages/Alerts'
 import { AnomalySummary } from './pages/AnomalySummary'
 import { AnomalyWindows } from './pages/AnomalyWindows'
+import { AuditLog } from './pages/AuditLog'
 import { Credentials } from './pages/Credentials'
 import { Devices } from './pages/Devices'
 import { LogAssistant } from './pages/LogAssistant'
@@ -30,6 +31,7 @@ export default function App() {
               <Route path="/credentials" element={<Credentials />} />
               <Route path="/relays" element={<Relays />} />
               <Route path="/query-console" element={<QueryConsole />} />
+              <Route path="/audit-log" element={<AuditLog />} />
             </Route>
           </Route>
         </Route>

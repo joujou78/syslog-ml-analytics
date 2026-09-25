@@ -20,6 +20,7 @@ export function Layout() {
           {user?.role === 'admin' && <NavLink to="/credentials">SNMP Credentials</NavLink>}
           {user?.role === 'admin' && <NavLink to="/relays">Relay Source IPs</NavLink>}
           {user?.role === 'admin' && <NavLink to="/query-console">Query Console</NavLink>}
+          {user?.role === 'admin' && <NavLink to="/audit-log">Audit Log</NavLink>}
         </nav>
         <div className="app-user">
           <span>

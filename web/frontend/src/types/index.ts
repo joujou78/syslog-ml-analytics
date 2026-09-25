@@ -203,6 +203,16 @@ export interface AlertEvent {
   notify_error: string | null
 }
 
+export interface AuditLogEntry {
+  id: string
+  actor_id: string | null
+  actor_username: string | null
+  action: string
+  target: string
+  details: Record<string, unknown> | null
+  created_at: string
+}
+
 export interface DeviceAnomalySummaryRow {
   source_ip: string
   hostname: string
