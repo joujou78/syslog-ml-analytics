@@ -17,24 +17,35 @@ Environment=OPENSEARCH_INDEX=syslog_ml_log_events
 Environment=OLLAMA_URL=http://localhost:11434
 Environment=OLLAMA_EMBED_MODEL=nomic-embed-text
 Environment=LOG_ASSISTANT_CHECKPOINT_FILE=/var/lib/syslog-ml/log_assistant_indexer.checkpoint
-# Deprioritize this service's CPU scheduling relative to everything else on
-# the box (ollama.service, syslog-ml-web-api, the classifier, etc. all stay
-# at the default Nice=0 / CPUWeight=100) -- confirmed on net-flow that this
-# indexer's own embedding batches can otherwise saturate every core for
-# ~13s at a stretch (see ml/log_assistant_indexer.py's
-# INDEXER_BATCH_SLEEP_SECONDS docstring) and starve an interactive chat
-# request for minutes. Nice=15 makes the kernel's CFS scheduler yield this
-# process's CPU time to any nice=0 process that wants to run; CPUWeight=20
-# does the same at the cgroup level (works on cgroup v2, degrades to a
-# proportional CPUShares translation on v1 -- harmless either way). Neither
-# throttles this service when it's the only thing that wants the CPU, so
-# the backfill still runs at full speed whenever nothing else needs it --
-# unlike INDEXER_BATCH_SLEEP_SECONDS, which pauses unconditionally. Keep
-# both: this is coarse (a whole embedding batch is one scheduling unit) and
-# doesn't help if the chat request lands mid-batch, which the sleep-based
-# gap still catches some of.
+# CORRECTED after real-world evidence on net-flow (nginx error log showed
+# "upstream timed out ... /api/log-assistant/ask" recurring even AFTER this
+# was added): Nice/CPUWeight on THIS service does not fix the contention it
+# was meant to fix, and the original comment here was wrong about why. This
+# process (log_assistant_indexer.py) does not itself do the embedding
+# computation -- it makes an HTTP call to Ollama and blocks, using
+# negligible CPU while waiting. The actual CPU-heavy work happens inside
+# Ollama's own `llama-server` subprocess (a child of ollama.service, a
+# DIFFERENT systemd unit/cgroup entirely), which is what actually contends
+# with the chat model's own llama-server process for cores. Deprioritizing
+# this service's scheduling doesn't touch that contention at all. Left in
+# place because it's harmless (this process does have some real, if minor,
+# CPU cost of its own -- ClickHouse result parsing, hashing, JSON/bulk
+# formatting), but do not rely on it for the chat-latency problem -- see
+# INDEXER_BATCH_SIZE below (and ml/log_assistant_indexer.py's
+# INDEXER_BATCH_SLEEP_SECONDS docstring) for the setting that actually
+# bounds how long Ollama's embed subprocess can run uninterrupted.
 Nice=15
 CPUWeight=20
+# THE lever that actually works, if you see this contention in practice
+# (not set by default -- BATCH_SIZE=200 is fine on hosts without a
+# concurrently-used interactive chat model): shrinking INDEXER_BATCH_SIZE
+# via a `systemctl edit` override (e.g. to 20) means Ollama's embed
+# llama-server process only holds the CPU for a fraction of the default
+# ~13s per batch before INDEXER_BATCH_SLEEP_SECONDS's pause gives every
+# core a real, complete idle window -- during which a concurrent chat
+# request runs uncontended. Trades a proportionally slower backfill (more
+# batches means the per-batch sleep fires more often) for a much shorter
+# worst-case wait for an interactive request.
 Restart=on-failure
 RestartSec=10
 

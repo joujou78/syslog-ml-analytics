@@ -97,13 +97,24 @@ INDEXER_ANOMALIES_ONLY = os.environ.get("INDEXER_ANOMALIES_ONLY", "false").lower
 # Opt-in, default off: during a large backfill (e.g. after a checkpoint
 # reset), run_cycle's inner while-loop below fetches and embeds batch after
 # batch back-to-back with no pause between them -- POLL_SECONDS only applies
-# once it's caught up (the loop hits an empty batch). On a CPU-only host
-# that's also serving interactive "ask" chat completions (see
-# web/backend/app/services/log_assistant_service.py), that back-to-back
-# embedding traffic competes for the same cores and can starve a chat
-# request for minutes (confirmed on net-flow: see README's Log Assistant
-# section). Setting this gives interactive requests a periodic opening at
-# the cost of a longer backfill; leave at 0 on hardware with CPU to spare.
+# once it's caught up (the loop hits an empty batch). Note WHO actually
+# burns the CPU here: this process itself just blocks on an HTTP call
+# (_embed_batch) -- the real computation happens inside Ollama's own
+# embed-model llama-server subprocess (a child of ollama.service, not of
+# this indexer process), which is what actually contends with the chat
+# model's OWN llama-server subprocess for cores. This matters for anyone
+# tuning CPU scheduling around this: niceing/deprioritizing THIS process
+# does approximately nothing for that contention (confirmed the hard way on
+# net-flow: nginx still logged upstream timeouts on /api/log-assistant/ask
+# after doing exactly that) -- what actually helps is bounding how long
+# each batch keeps Ollama's embed subprocess continuously busy, which is
+# what this setting (paired with a smaller INDEXER_BATCH_SIZE) does. On a
+# CPU-only host also serving interactive "ask" chat completions (see
+# web/backend/app/services/log_assistant_service.py), continuous
+# back-to-back embedding batches can starve a chat request for minutes
+# (confirmed on net-flow: see README's Log Assistant section). Setting this
+# gives interactive requests a periodic opening at the cost of a longer
+# backfill; leave at 0 on hardware with CPU to spare.
 INDEXER_BATCH_SLEEP_SECONDS = float(os.environ.get("INDEXER_BATCH_SLEEP_SECONDS", "0"))
 
 _EVENT_COLUMNS = [

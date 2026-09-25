@@ -1039,15 +1039,35 @@ both just work at the RAM budget above.
   `SYSLOG_ML_OLLAMA_TIMEOUT_SECONDS` (`web/backend/app/core/config.py`)
   timeouts, which only stop a slow request from being killed outright and
   don't make it any faster.
-- **Prefer OS-level scheduling priority over the sleep, where available.**
-  `systemd/syslog-ml-log-assistant-indexer.service` sets `Nice=15` and
-  `CPUWeight=20`, which asks the kernel to yield this service's CPU time to
-  everything else on the box (left at the default priority) only when
-  something else actually wants to run — unlike
-  `INDEXER_BATCH_SLEEP_SECONDS`, which pauses unconditionally, this doesn't
-  slow the backfill down at all when nothing else needs the CPU. It's
-  coarser, though (a whole ~13s embedding batch is one scheduling unit, so
-  a chat request that lands mid-batch still waits on it) — keep both.
+- **`Nice=15`/`CPUWeight=20` on the indexer service does NOT fix this —
+  confirmed the hard way on net-flow, corrected here after initially
+  claiming otherwise.** `systemd/syslog-ml-log-assistant-indexer.service`
+  sets both, on the theory that deprioritizing the indexer's own scheduling
+  would let a concurrent chat request win the CPU. It doesn't, because this
+  indexer process doesn't itself do the embedding computation — it just
+  makes an HTTP call to Ollama and blocks. The actual CPU-heavy work
+  happens inside **Ollama's own embed-model `llama-server` subprocess**, a
+  child of `ollama.service` (a different systemd unit/cgroup entirely) that
+  contends directly with the chat model's own `llama-server` subprocess —
+  niceing the Python process waiting on the result does nothing to that.
+  Real evidence: nginx's error log kept showing `upstream timed out ...
+  /api/log-assistant/ask` (504, after nginx's own 300s
+  `proxy_read_timeout` elapsed) on net-flow *after* this was deployed. Left
+  in place since it's harmless (this process has some minor CPU cost of its
+  own), but don't rely on it for this problem.
+- **What actually works: shrink `INDEXER_BATCH_SIZE`.** Smaller batches
+  mean Ollama's embed subprocess only holds the CPU for a fraction of the
+  default ~13s (at `BATCH_SIZE=200`) before `INDEXER_BATCH_SLEEP_SECONDS`'s
+  pause gives every core a real, complete idle window — during which a
+  concurrent chat request runs uncontended, rather than merely
+  de-prioritized-but-still-competing. E.g. `INDEXER_BATCH_SIZE=20` cuts
+  each batch to roughly ~1.3s of embed work. Trades a proportionally slower
+  backfill (more batches means the per-batch sleep fires more often — very
+  roughly 2x slower backfill for a 10x smaller batch) for a much shorter
+  worst-case wait on an interactive request. Independent of, and worth
+  combining with, the `proxy_read_timeout` /
+  `SYSLOG_ML_OLLAMA_TIMEOUT_SECONDS` timeouts above, which only stop a slow
+  request from being killed outright and don't make it any faster.
 
 **Install OpenSearch** (single node, no Docker — same "native systemd
 service" approach as everything else here):
