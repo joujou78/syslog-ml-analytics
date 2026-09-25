@@ -838,6 +838,48 @@ Drop to a smaller chat model (e.g. `llama3.2:3b-instruct-q4_K_M`, ~2GB) if
 the target above — everything below is a config change (`ollama pull` a
 different model, update `SYSLOG_ML_OLLAMA_CHAT_MODEL`), not a code change.
 
+**CPU matters as much as RAM: check for AVX2/FMA before relying on
+throughput numbers.** `llama.cpp` (what Ollama runs under the hood) is
+heavily optimized around AVX2+FMA; without them it falls back to a much
+slower path. Check with:
+
+```bash
+grep -o -E "\bavx\b|\bavx2\b|\bfma\b" /proc/cpuinfo | sort -u
+```
+
+If only `avx` shows up (no `avx2`, no `fma`) — confirmed on a shared
+VMware host's `Intel Xeon E5-2620` (a 2012 "Sandy Bridge-EP" chip; AVX2/FMA
+arrived with the next generation, Haswell, in 2013) — two things follow,
+and neither is a bug to chase:
+
+- **Keep models resident.** Ollama's default 5-minute idle unload means
+  every request after a gap pays a full model-load cost again — measured
+  at ~55 seconds for `llama3.1:8b-instruct-q4_K_M` on that host, which
+  looks like "this hardware can't do this at all" but is really just a
+  reload tax. Set `OLLAMA_KEEP_ALIVE=-1` on the `ollama` systemd service
+  (`sudo systemctl edit ollama`) once there's RAM to spare for permanent
+  residency. Once warm, the same host measured ~4.5 tokens/sec chat
+  generation and ~1.2 messages/sec embedding — slow next to modern
+  hardware, but genuinely usable for an occasional-question tool.
+- **~1.2 msg/sec embedding throughput will not keep up with indexing
+  every event on a busy host.** Measure your own traffic
+  (`SELECT count() FROM syslog_ml.events WHERE received_at >= now() -
+  INTERVAL 1 HOUR`) before assuming it will. On the host this was measured
+  on, ordinary traffic ran ~2–4.6 msg/sec sustained — indexing everything
+  would mean the backlog only grows, never catches up. Set
+  `INDEXER_ANOMALIES_ONLY=true` (see `ml/log_assistant_indexer.py`) to
+  index only `is_anomaly=1` events instead of everything — on that same
+  host, anomalies ran ~0.33 msg/sec, comfortably inside the ~1.2 msg/sec
+  budget, and it matches how this feature is actually used (the "Explain
+  with AI" links are anomaly-focused, not general log browsing). A
+  7-day cold-start backfill of anomalies-only traffic at that host's
+  measured rate takes on the order of ~2 days to fully catch up, then
+  tracks new anomalies close to real-time indefinitely after that.
+
+None of this applies if your CPU has AVX2/FMA (most anything from 2014
+onward) — indexing every event and getting fast chat responses should
+both just work at the RAM budget above.
+
 **Install OpenSearch** (single node, no Docker — same "native systemd
 service" approach as everything else here):
 

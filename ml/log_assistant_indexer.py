@@ -81,6 +81,19 @@ CHECKPOINT_FILE = os.environ.get(
     "LOG_ASSISTANT_CHECKPOINT_FILE", "/var/lib/syslog-ml/log_assistant_indexer.checkpoint"
 )
 
+# Opt-in, not a universal default: on capable hardware, embedding every
+# event is the more valuable and originally-intended behavior. This exists
+# for hosts where the real numbers don't work out otherwise -- confirmed on
+# net-flow (no AVX2/FMA -- see README's Log Assistant section): once warm,
+# embedding throughput measured at ~1.2 msg/sec, while that host's own
+# ordinary traffic runs ~2-4.6 msg/sec. Indexing everything on such a host
+# means the backlog only ever grows, never catches up. Indexing only
+# is_anomaly=1 events cuts the required rate to net-flow's own measured
+# ~0.33 msg/sec -- comfortably within the ~1.2 msg/sec budget -- and lines
+# up with how this feature is actually used (the "Explain with AI" links
+# are anomaly-focused already, not general log browsing).
+INDEXER_ANOMALIES_ONLY = os.environ.get("INDEXER_ANOMALIES_ONLY", "false").lower() == "true"
+
 _EVENT_COLUMNS = [
     "event_time", "received_at", "source_ip", "hostname", "vendor", "severity", "program",
     "pid", "message", "template_id", "predicted_category", "is_anomaly", "anomaly_reasons",
@@ -141,6 +154,10 @@ def _embed_batch(texts: list[str]) -> list[list[float]]:
     return response.json()["embeddings"]
 
 
+def _anomaly_clause() -> str:
+    return " AND is_anomaly = 1" if INDEXER_ANOMALIES_ONLY else ""
+
+
 def _fetch_batch(client, checkpoint: datetime | None) -> list[dict]:
     # +1: a lookahead row, purely to detect whether the LIMIT below cut off
     # in the middle of a group of rows sharing the exact same received_at
@@ -155,6 +172,7 @@ def _fetch_batch(client, checkpoint: datetime | None) -> list[dict]:
         # The first batch's own max(received_at) becomes the checkpoint, so
         # every later cycle takes the `checkpoint is not None` branch above.
         condition = f"received_at >= now() - INTERVAL {BACKFILL_DAYS} DAY"
+    condition += _anomaly_clause()
 
     query = f"""
         SELECT {', '.join(_EVENT_COLUMNS)}
@@ -183,7 +201,7 @@ def _fetch_exact_timestamp(client, ts: datetime) -> list[dict]:
     query = f"""
         SELECT {', '.join(_EVENT_COLUMNS)}
         FROM syslog_ml.events
-        WHERE received_at = %(ts)s
+        WHERE received_at = %(ts)s{_anomaly_clause()}
         ORDER BY received_at ASC
     """
     result = client.query(query, parameters={"ts": ts})
