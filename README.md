@@ -786,11 +786,16 @@ thing runs on your own hardware.
 (its own systemd service, deliberately separate from `consumer.py` — see
 its module docstring for why), tails `syslog_ml.events` the same way
 `consumer.py` tails the raw log file, embeds each new event with Ollama,
-and writes the vector into an OpenSearch index. The web backend then does
-two things against that index: `/api/log-assistant/search` (semantic
-search alone) and `/api/log-assistant/ask` (search, then hand the results
-to an LLM as context and return its answer — the **Log Assistant** page in
-the web UI). Anomaly Windows and Anomaly Summary both link into it with an
+and writes the vector into an OpenSearch index. It polls every
+`INDEXER_POLL_SECONDS` (default `5`) — a new event typically becomes
+searchable within a few seconds of arriving, not instantly (true
+per-message push would mean embedding synchronously inside `consumer.py`'s
+own ingest path, which is exactly the coupling this being a separate
+process avoids — see its docstring). The web backend then does two things
+against that index: `/api/log-assistant/search` (semantic search alone)
+and `/api/log-assistant/ask` (search, then hand the results to an LLM as
+context and return its answer — the **Log Assistant** page in the web
+UI). Anomaly Windows and Anomaly Summary both link into it with an
 **"Explain with AI"** action that pre-fills a question and the relevant
 device/time range.
 

@@ -65,7 +65,14 @@ OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "60"))
 
 BATCH_SIZE = int(os.environ.get("INDEXER_BATCH_SIZE", "200"))
-POLL_SECONDS = float(os.environ.get("INDEXER_POLL_SECONDS", "30"))
+# Deliberately short, not "batch efficiently every so often" -- the point of
+# this being a separate process from consumer.py (see this module's own
+# docstring) is that embedding latency never touches the hot ingest path,
+# which frees this poll loop to run often without that tradeoff. A new
+# event should become searchable within a few seconds, not up to half a
+# minute later. Still a poll, not a true push/subscribe, since ClickHouse
+# has no native change-notification mechanism this could hook into instead.
+POLL_SECONDS = float(os.environ.get("INDEXER_POLL_SECONDS", "5"))
 # Only consulted on a cold start (no checkpoint file yet) -- how far back to
 # begin backfilling. Later restarts always resume from the saved checkpoint
 # regardless of this value.
