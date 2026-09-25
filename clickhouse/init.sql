@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS syslog_ml.events
     predicted_category  LowCardinality(String),
     predicted_confidence Float32,
     is_anomaly          UInt8 DEFAULT 0,
-    anomaly_reasons     Array(LowCardinality(String)) DEFAULT [], -- which signal(s) fired: rare_template | always_severe | severity_spike | security_content | volume_spike | unusual_template_mix -- see ml/anomaly_signals.py, consumer.py's DeviceBaselineCache, and ml/template_mix_anomaly.py
+    anomaly_reasons     Array(LowCardinality(String)) DEFAULT [], -- which signal(s) fired: rare_template | always_severe | severity_spike | security_content | volume_spike | unusual_template_mix | unusual_transition -- see ml/anomaly_signals.py, consumer.py's DeviceBaselineCache, ml/template_mix_anomaly.py, and ml/sequence_anomaly.py
     raw                 String,
 
     -- Secondary (skip) indexes: `events` is a *columnar* store ordered by
@@ -115,4 +115,31 @@ ORDER BY (source_ip, window_start)
 -- consistent so an old flagged window's score/model_scope context doesn't
 -- disappear while the event it tagged (unusual_template_mix) is retained
 -- forever.
+SETTINGS index_granularity = 8192;
+
+-- Per-(device, template transition) sequence-anomaly scores (see
+-- ml/sequence_anomaly.py) -- the order-sensitive counterpart to
+-- device_window_anomalies above. Distinct from that table the same way
+-- unusual_template_mix is distinct from rare_template: this asks "was
+-- THIS template likely to follow the PREVIOUS one for this device (or its
+-- vendor fleet)," not "does this window's overall mix look normal" or "is
+-- this template rare on its own." One row per scored transition per
+-- device, scored exactly once (mirrors device_window_anomalies' own
+-- checkpoint reasoning).
+CREATE TABLE IF NOT EXISTS syslog_ml.device_sequence_anomalies
+(
+    transition_time         DateTime64(3),          -- event_time of the "curr" half of the transition
+    source_ip               String,
+    vendor                  LowCardinality(String) DEFAULT 'unknown',
+    model_scope             LowCardinality(String), -- 'device' | 'vendor' -- which model actually scored this transition
+    prev_template_id        String,
+    curr_template_id        String,
+    transition_probability  Float32,                -- Laplace-smoothed P(curr | prev); lower = more anomalous
+    is_anomaly              UInt8,
+    scored_at                DateTime64(3) DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree(scored_at)
+PARTITION BY toYYYYMMDD(transition_time)
+ORDER BY (source_ip, transition_time)
+-- No TTL, same choice and same caveat as device_window_anomalies above.
 SETTINGS index_granularity = 8192;

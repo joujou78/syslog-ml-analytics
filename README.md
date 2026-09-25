@@ -292,10 +292,11 @@ sudo journalctl -u syslog-ml-silence-detector -f        # confirm it runs every 
 ### Anomaly flagging
 
 `events.is_anomaly` is populated by the classifier itself (`ml/consumer.py`),
-not a separate process. It's actually six independent signals
+not a separate process. It's actually seven independent signals
 (`ml/anomaly_signals.py` for the stateless two, `DeviceBaselineCache` in
 `consumer.py` for two that need per-device history, `ml/template_mix_anomaly.py`
-for the sixth — see below) — any one firing sets `is_anomaly = 1`, and
+for the sixth, `ml/sequence_anomaly.py` for the seventh — see below) — any
+one firing sets `is_anomaly = 1`, and
 `events.anomaly_reasons` (an array column) records *which* one(s) did, the
 same "always label the reason, not just a verdict" principle already used
 for `resolution_method` and `vendor_source`:
@@ -323,6 +324,11 @@ for `resolution_method` and `vendor_source`:
   the other five, this one is retrospective: it can only be judged once a
   window has closed, so it's applied to already-inserted rows via a
   targeted mutation, not inline as each message arrives.
+- **`unusual_transition`**: this device (or its vendor fleet) essentially
+  never followed the *previous* Drain3 template with *this* one before —
+  see "Sequence anomaly detection" below. Also retrospective/mutation-based
+  like `unusual_template_mix`, for the same reason: it can't be judged
+  until the previous event in the device's sequence is already known.
 
 The middle two (severity_spike, volume_spike) are per-device, not global
 thresholds, since "unusual" only
@@ -429,6 +435,109 @@ briefly delays tailing new lines, the same tradeoff `DeviceBaselineCache`
 already makes at its own (shorter) interval. Widen
 `TEMPLATE_MIX_REFRESH_SECONDS` or shorten `TEMPLATE_MIX_LOOKBACK_DAYS` if
 this becomes a real cost on your traffic volume.
+
+### Sequence anomaly detection (order, not mix)
+
+Every signal above, including the windowed one, looks at *what* a device is
+logging — a rare template, a worse-than-usual severity, an unusual
+proportion of message types over a few minutes. None of them look at
+*order*. A device that logs template B right after template A a thousand
+times, then one day logs template C right after A instead, can sail past
+all six of the above: C might not be individually rare, and one window's
+overall mix might not shift enough to register as an outlier. That's the
+gap `ml/sequence_anomaly.py` closes.
+
+**Why not [DeepLog](https://github.com/Thijsvanede/DeepLog)** (Du et al.,
+CCS'17), the well-known approach to exactly this problem: DeepLog trains an
+LSTM to predict the next event ID from a window of prior event IDs, and
+flags a mismatch against its top-k predictions. It was evaluated for this
+project and deliberately not adopted, for two reasons specific to this
+pipeline rather than a knock on DeepLog itself:
+
+1. **Open-ended vocabulary.** DeepLog's embedding layer needs a fixed event
+   vocabulary size decided up front. Drain3 (this pipeline's template
+   miner, see `ml/consumer.py`) keeps minting new template IDs
+   indefinitely as new log formats show up — there's no fixed vocabulary
+   to size an embedding table against short of periodically retraining and
+   redeploying a whole neural net every time Drain3's cluster set changes.
+2. **Dependency and interpretability cost.** DeepLog means adding PyTorch —
+   a large dependency this otherwise scikit-learn/numpy pipeline doesn't
+   have — for a result that's fundamentally a probability estimate anyway.
+   A first-order Markov chain over template transitions answers the same
+   "how likely was this, given what usually follows the previous event"
+   question, at a fraction of the code, zero new dependencies, and every
+   flagged transition's reason is a plain conditional probability
+   (`P(curr | prev) = 0.38%`) rather than an opaque network's output —
+   consistent with `anomaly_reasons`' "always label the reason, never just
+   a bare verdict" principle used everywhere else in this pipeline.
+
+**How it works**, once per `SEQUENCE_ANOMALY_REFRESH_SECONDS` (default
+900s):
+
+1. For each device, walk its ordered `(event_time, template_id)` history
+   over the last `SEQUENCE_ANOMALY_LOOKBACK_DAYS` (default 7) and count
+   every `prev_template -> curr_template` pair.
+2. **Hybrid model scope**, the same shape as the template-mix detector: a
+   device with at least `SEQUENCE_ANOMALY_MIN_TRANSITIONS_FOR_DEVICE`
+   (default 200) transitions of its own history gets its own transition
+   table; a lower-traffic device falls back to its *vendor's* pooled
+   transitions instead (needs
+   `SEQUENCE_ANOMALY_MIN_TRANSITIONS_FOR_VENDOR`, default 200, pooled)
+   so it's still compared against something meaningful.
+3. Score a transition's probability as `(count + 1) / (total_from_prev + vocab_size)`
+   (Laplace/add-one smoothing) — a transition that's genuinely never been
+   observed for that `prev` scores low but not exactly zero, so
+   `SEQUENCE_ANOMALY_PROBABILITY_THRESHOLD` (default `0.005`, i.e. "rarer
+   than 1 in 200") stays meaningful for it too.
+4. **Train on history strictly before the current cycle's new transitions,
+   never on the transitions being scored.** This matters more than it
+   might look: since Laplace smoothing treats "seen once, right now" very
+   differently from "seen zero times ever," training on the same batch
+   being scored would fold a genuinely novel transition into its own
+   count and dilute exactly the signal this detector exists to catch —
+   confirmed in testing (see below). The one exception is a brand-new
+   device's very first backfill cycle, which has no prior history to
+   separate from new — same accepted cold-start tradeoff
+   `TemplateMixAnomalyDetector` already makes for the identical reason.
+
+**Where it surfaces**: every scored transition (flagged or not) is written
+to `syslog_ml.device_sequence_anomalies` — there's no dedicated browsing
+page for it yet (unlike `device_window_anomalies`'s Anomaly Windows page),
+so inspecting raw scores means querying ClickHouse directly; a *newly*
+flagged transition's event is tagged with `unusual_transition` via the same
+targeted-mutation pattern `template_mix_anomaly.py` uses, so it shows up
+immediately in Log Search's/Alerts' existing anomaly filtering without any
+frontend changes.
+
+**Real validation** (this sandbox's local ClickHouse, not net-flow):
+trained on 780 events of a clean repeating `A -> B -> C` cycle for one
+device, then fed one genuinely novel transition (`C -> Z`, a template never
+seen before at all) followed by 60 more events resuming the normal cycle.
+Scored in a second cycle against a model trained only on the
+before-the-anomaly history: the injected transition was flagged at
+`P = 0.38%` (below the 0.5% threshold); all 839 legitimate transitions
+across both cycles scored `~99%` and were correctly left unflagged. The
+following `Z -> A` transition was deliberately *not* flagged — `Z` itself
+being a brand-new template is `rare_template`'s job, not this detector's,
+and Laplace smoothing correctly treats "no data about what follows Z" as
+uninformative rather than anomalous. A second, low-traffic device (well
+under `MIN_TRANSITIONS_FOR_DEVICE`) was also confirmed to correctly fall
+back to and score cleanly against its vendor's pooled model.
+
+**Honest caveats**:
+- Order-1 (bigram) only, not DeepLog's longer look-back window — this
+  pipeline interleaves many devices' events in arrival order already (see
+  `AcsMultipartReassembler` upstream in `consumer.py` for one source of
+  that complexity), so committing to a single `prev -> curr` pair per
+  device avoids having to reason about how far back a longer window would
+  legitimately look per-device. Nothing rules out extending this later if
+  order-1 proves too coarse in practice.
+- Same per-cycle cost shape as the template-mix detector: it queries and
+  holds one device's whole lookback history in memory to walk it in order,
+  which is more expensive than the plain `GROUP BY source_ip` baseline
+  query. Widen `SEQUENCE_ANOMALY_REFRESH_SECONDS` or shorten
+  `SEQUENCE_ANOMALY_LOOKBACK_DAYS` if this becomes a real cost on your
+  traffic volume.
 
 ### Alerting
 
@@ -1048,6 +1157,7 @@ syslog-ml-log-assistant-indexer`) if anything doesn't work as expected.
 - `ml/consumer.py` — tails the file, resolves identity, classifies, flags anomalies, writes to ClickHouse.
 - `ml/anomaly_signals.py` — stateless anomaly signals (always_severe, security_content); the per-device ones (severity_spike, volume_spike) live in `consumer.py`'s `DeviceBaselineCache`.
 - `ml/template_mix_anomaly.py` — the sixth anomaly signal: periodic, windowed, per-device/per-vendor template-mix outlier detection (`unusual_template_mix`).
+- `ml/sequence_anomaly.py` — the seventh anomaly signal: periodic, per-device/per-vendor Markov-chain template-transition anomaly detection (`unusual_transition`) — a lightweight, dependency-free alternative to DeepLog (see README's "Sequence anomaly detection").
 - `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver, including credential-pool discovery/auto-save (reads credentials from Postgres, see `web/`).
 - `ml/reverify_devices.py` — twice-daily re-check of already-resolved devices; self-heals an auto-discovered credential if its community rotates.
 - `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.

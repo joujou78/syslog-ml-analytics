@@ -34,6 +34,7 @@ from drain3.template_miner_config import TemplateMinerConfig
 import state_db
 from anomaly_signals import is_always_severe, is_security_content
 from labeling_rules import weak_label, severity_rank
+from sequence_anomaly import SequenceAnomalyDetector
 from template_mix_anomaly import TemplateMixAnomalyDetector
 from vendor_signatures import detect_vendor
 
@@ -696,6 +697,7 @@ def main():
     baselines = DeviceBaselineCache(ch_client)
     relay_ips = RelaySourceIpCache(DATABASE_URL)
     template_mix = TemplateMixAnomalyDetector(ch_client)
+    sequence_anomaly = SequenceAnomalyDetector(ch_client)
     acs_reassembler = AcsMultipartReassembler()
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)
@@ -710,6 +712,7 @@ def main():
         baselines.refresh_if_stale()
         relay_ips.refresh_if_stale()
         template_mix.refresh_if_stale()
+        sequence_anomaly.refresh_if_stale()
         lines = tailer.readlines()
 
         for line in lines:
