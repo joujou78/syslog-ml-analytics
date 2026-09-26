@@ -72,17 +72,23 @@ BASELINE_REFRESH_SECONDS = float(os.environ.get("ANOMALY_BASELINE_REFRESH_SECOND
 # refresh is at least this many times its historical average rate.
 VOLUME_SPIKE_MULTIPLIER = float(os.environ.get("ANOMALY_VOLUME_SPIKE_MULTIPLIER", "5"))
 
-# Confirmed on net-flow: messages naming a Docker/Podman veth pair (e.g.
-# "veth88671e0: link becomes ready") come from a monitored device that
-# itself runs containers -- this is container network-namespace churn on
-# THAT device, not a real interface flapping, and it isn't net-flow's own
-# noise either (rsyslog/60-syslog-ml.conf already keeps this VM's own
-# local traffic out of the feed). Left in, it floods Log Search/Ask and
-# would swamp a flapping detector with false positives. Dropped here, at
-# parse time, so it never reaches Drain3, the classifier, or per-device
-# baselines -- not just hidden downstream. Empty string disables the
-# filter entirely (e.g. if a device genuinely uses "veth" in a hardware
-# interface name, unlikely as that is).
+# Confirmed on net-flow via a live "Ask" query result: messages naming a
+# Docker/Podman veth pair (e.g. "veth88671e0: Link DOWN", program
+# systemd-networkd) show hostname=net-flow -- this is net-flow's OWN local
+# container network-namespace churn, not a real interface flapping on a
+# monitored device. (An earlier version of this comment guessed it was a
+# monitored device's own containers; the hostname field rules that out.)
+# That it reaches raw.jsonl at all is notable: rsyslog/60-syslog-ml.conf's
+# ruleset is scoped to network-received (UDP/TCP 514) traffic specifically
+# to keep net-flow's own local noise out (see that file's comment on the
+# gunicorn/sudo/systemd leak it was built to fix) -- if systemd-networkd is
+# getting through too, net-flow's actual deployed rsyslog config likely
+# has a local-forwarding path this repo's committed copy doesn't show.
+# Filtering here is a content-based backstop regardless of the leak path:
+# floods Log Search/Ask and would swamp a flapping detector with false
+# positives if left in. Dropped at parse time so it never reaches Drain3,
+# the classifier, or per-device baselines -- not just hidden downstream.
+# Empty string disables the filter entirely.
 IGNORE_MESSAGE_PATTERN = os.environ.get("IGNORE_MESSAGE_PATTERN", r"\bveth[0-9a-f]{6,}\b")
 _ignore_message_re = re.compile(IGNORE_MESSAGE_PATTERN, re.IGNORECASE) if IGNORE_MESSAGE_PATTERN else None
 
