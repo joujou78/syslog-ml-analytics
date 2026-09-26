@@ -5,6 +5,27 @@ import type { LogAssistantQuery, LogHit } from '../types'
 import { extractErrorMessage } from '../utils/errors'
 import { formatBeirutDateTime } from '../utils/time'
 
+// extractErrorMessage's fallback only ever fires when the backend's own
+// response has no JSON `detail` (see errors.ts) -- for OpenSearch/Ollama
+// actually being unreachable, that's genuinely accurate, since
+// log_assistant.py's routes DO attach a `detail` for that case (see
+// _upstream_error, a 502). But a 504 comes from nginx itself, timing out
+// before the backend ever responds -- nginx's own error page is plain
+// HTML, not JSON, so it ALWAYS falls through to whatever generic fallback
+// is passed in. Confirmed on net-flow: this generic wording repeatedly
+// looked like "OpenSearch/Ollama isn't running" when the real cause was
+// "the LLM is still generating and took longer than the timeout" --
+// several rounds of debugging before landing on the actual fix
+// (ollama_num_predict, see config.py) could have been shortened
+// considerably by the error message itself saying so.
+function logAssistantErrorFallback(err: unknown): string {
+  const status = (err as { response?: { status?: number } })?.response?.status
+  if (status === 504) {
+    return 'The Log Assistant timed out before finishing — likely still processing under load (e.g. "Ask" generating a long answer), not OpenSearch/Ollama being down. Try a shorter/simpler question, or wait and retry.'
+  }
+  return 'Could not reach the Log Assistant — is OpenSearch/Ollama running?'
+}
+
 // Same idea as Logs.tsx's filtersFromSearchParams -- lets Anomaly Windows/
 // Anomaly Summary's "Explain with AI" links land on a pre-filled question
 // instead of an empty box. Read once on mount, not kept in sync afterward.
@@ -109,9 +130,7 @@ export function LogAssistant() {
         setModel(res.model)
         setSources(res.sources)
       })
-      .catch((err) =>
-        setError(extractErrorMessage(err, 'Could not reach the Log Assistant — is OpenSearch/Ollama running?')),
-      )
+      .catch((err) => setError(extractErrorMessage(err, logAssistantErrorFallback(err))))
       .finally(() => setLoading(null))
   }
 
@@ -123,9 +142,7 @@ export function LogAssistant() {
     logAssistantApi
       .search(currentQuery())
       .then((res) => setSources(res.items))
-      .catch((err) =>
-        setError(extractErrorMessage(err, 'Could not reach the Log Assistant — is OpenSearch/Ollama running?')),
-      )
+      .catch((err) => setError(extractErrorMessage(err, logAssistantErrorFallback(err))))
       .finally(() => setLoading(null))
   }
 
