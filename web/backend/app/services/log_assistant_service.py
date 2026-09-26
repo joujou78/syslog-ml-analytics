@@ -176,38 +176,53 @@ def _build_prompt(question: str, hits: list[LogHit]) -> str:
     return "Log excerpts (most semantically relevant first):\n" + "\n".join(lines) + f"\n\nQuestion: {question}"
 
 
+def _post_chat_sync(url: str, payload: dict, timeout: float) -> dict:
+    # Deliberately httpx.Client (sync), not AsyncClient, and run via
+    # asyncio.to_thread below -- NOT a style preference. Root-caused on
+    # net-flow through direct, repeatable comparison: a raw urllib request
+    # and a raw `curl` to this exact endpoint, with this exact payload
+    # shape, both completed in seconds; the identical payload sent through
+    # httpx.AsyncClient (both against `localhost` and against the literal
+    # `127.0.0.1`, ruling out IPv6/dual-stack resolution as the cause)
+    # reliably hung until timeout. embed calls elsewhere in this file stay
+    # on AsyncClient because they've been reliably fast (sub-second) all
+    # session -- this call is the one that waits tens of seconds for a
+    # full generated response, which is exactly where the async transport
+    # reproduced the hang. Not root-caused deeper than that (a real bug
+    # somewhere in httpx/httpcore's async I/O path for a slow-arriving
+    # response, on this Python/library version combination, is the leading
+    # theory) -- but switching transports is a well-evidenced fix, not a
+    # guess: every sync-client test succeeded, every async-client test on
+    # this same payload hung.
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+
 async def ask(os_client: OpenSearch, query: LogAssistantQuery) -> AskResponse:
     hits = await semantic_search(os_client, query)
     prompt = _build_prompt(query.question, hits)
-    # A separate system-role message is the "correct" way to do this per
-    # Ollama's/OpenAI's chat API shape, but confirmed on net-flow (via a
-    # raw request directly to Ollama, bypassing this service entirely) that
-    # OLLAMA_CHAT_MODEL=llama3.2:3b-instruct-q4_K_M hangs indefinitely
-    # whenever the request includes a system-role message at all -- with
-    # ANY content, even a single trivial user question and no system
-    # message otherwise, still completes in under a second. Folding the
-    # system instructions into the one user message instead is a known,
-    # safe workaround for exactly this class of chat-template bug, and
-    # confirmed working here (~30s including prompt processing, nowhere
-    # near ollama_timeout_seconds). If OLLAMA_CHAT_MODEL is ever changed,
-    # re-verify this is still needed -- it may be specific to this one
-    # model's packaged template, not a general Ollama issue.
+    # Also folding the system prompt into the one user message rather than
+    # a separate system-role message -- a second, independent finding from
+    # the same investigation: OLLAMA_CHAT_MODEL=llama3.2:3b-instruct-q4_K_M
+    # hung on a system-role message specifically in earlier testing (via
+    # urllib, before the transport issue above was isolated). Harmless to
+    # keep either way, and cheap insurance against a second failure mode.
     combined_prompt = f"{_SYSTEM_PROMPT}\n\n---\n\n{prompt}"
-    async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-        response = await client.post(
-            f"{settings.ollama_url}/api/chat",
-            json={
-                "model": settings.ollama_chat_model,
-                "messages": [
-                    {"role": "user", "content": combined_prompt},
-                ],
-                "stream": False,
-                # Bounds worst-case generation time -- see config.py's
-                # ollama_num_predict comment for why this matters on
-                # CPU-only hardware independent of any other contention.
-                "options": {"num_predict": settings.ollama_num_predict},
-            },
-        )
-        response.raise_for_status()
-        answer = response.json()["message"]["content"]
+    body = await asyncio.to_thread(
+        _post_chat_sync,
+        f"{settings.ollama_url}/api/chat",
+        {
+            "model": settings.ollama_chat_model,
+            "messages": [{"role": "user", "content": combined_prompt}],
+            "stream": False,
+            # Bounds worst-case generation time -- see config.py's
+            # ollama_num_predict comment for why this matters on
+            # CPU-only hardware independent of any other contention.
+            "options": {"num_predict": settings.ollama_num_predict},
+        },
+        settings.ollama_timeout_seconds,
+    )
+    answer = body["message"]["content"]
     return AskResponse(answer=answer, sources=hits, model=settings.ollama_chat_model)
