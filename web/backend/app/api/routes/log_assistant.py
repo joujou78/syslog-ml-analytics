@@ -1,3 +1,5 @@
+import logging
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from opensearchpy import OpenSearch
@@ -6,6 +8,8 @@ from opensearchpy.exceptions import OpenSearchException
 from app.api.deps import get_current_user, get_os_client
 from app.schemas.log_assistant import AskResponse, LogAssistantQuery, SemanticSearchResponse
 from app.services import log_assistant_service
+
+log = logging.getLogger("log_assistant_routes")
 
 router = APIRouter(prefix="/log-assistant", tags=["log-assistant"])
 
@@ -18,6 +22,16 @@ _authenticated = Depends(get_current_user)
 def _upstream_error(exc: Exception) -> HTTPException:
     # OpenSearch/Ollama being unreachable or misconfigured isn't the
     # caller's fault -- 502, with the real error, rather than an opaque 500.
+    # Logged here (not left to propagate) precisely BECAUSE it's caught and
+    # turned into a clean HTTPException -- FastAPI never sees this as an
+    # unhandled exception, so without an explicit log call here, nothing
+    # about it would ever appear anywhere server-side. Confirmed on
+    # net-flow this matters in practice: some httpx exceptions (timeouts in
+    # particular) construct with no message at all, so str(exc) can be an
+    # empty string -- "Log Assistant backend error: " with nothing useful
+    # after it. log.exception() captures the exception's actual TYPE and
+    # full traceback regardless of whether its string form says anything.
+    log.exception("Log Assistant upstream error (returning 502 to caller)")
     return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Log Assistant backend error: {exc}")
 
 
