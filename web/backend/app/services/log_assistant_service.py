@@ -144,11 +144,32 @@ async def semantic_search(os_client: OpenSearch, query: LogAssistantQuery) -> li
     return [_hit_to_log_hit(hit) for hit in result["hits"]["hits"]]
 
 
+# A syslog `message` field has no length guarantee -- most are short, but a
+# device is free to log something huge (a stack trace, a base64/hex dump, a
+# verbose multi-line payload) in one line, and nothing upstream of this
+# truncates it. Feeding that straight into the prompt, times up to
+# query.limit (default 10) hits, can make the prompt far bigger than a
+# typical one without any warning -- suspected on net-flow as a real
+# contributor to "ask" taking far longer than a raw Ollama call with a
+# trivial prompt, though not confirmed (correlated with intermittent
+# slowness, not reproduced in isolation). Capping defensively either way:
+# an LLM summarizing log lines needs enough of each message to identify it,
+# not its entire payload verbatim.
+_MAX_MESSAGE_CHARS_IN_PROMPT = 500
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...[truncated, {len(text)} chars total]"
+
+
 def _build_prompt(question: str, hits: list[LogHit]) -> str:
     if not hits:
         return f"Question: {question}\n\nNo related log lines were found in the index."
     lines = [
-        f"- [{h.event_time.isoformat()}] {h.hostname} ({h.vendor}) {h.severity}/{h.program}: {h.message}"
+        f"- [{h.event_time.isoformat()}] {h.hostname} ({h.vendor}) {h.severity}/{h.program}: "
+        f"{_truncate(h.message, _MAX_MESSAGE_CHARS_IN_PROMPT)}"
         + (f" [flagged: {', '.join(h.anomaly_reasons)}]" if h.is_anomaly else "")
         for h in hits
     ]
