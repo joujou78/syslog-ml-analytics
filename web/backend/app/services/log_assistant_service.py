@@ -179,14 +179,27 @@ def _build_prompt(question: str, hits: list[LogHit]) -> str:
 async def ask(os_client: OpenSearch, query: LogAssistantQuery) -> AskResponse:
     hits = await semantic_search(os_client, query)
     prompt = _build_prompt(query.question, hits)
+    # A separate system-role message is the "correct" way to do this per
+    # Ollama's/OpenAI's chat API shape, but confirmed on net-flow (via a
+    # raw request directly to Ollama, bypassing this service entirely) that
+    # OLLAMA_CHAT_MODEL=llama3.2:3b-instruct-q4_K_M hangs indefinitely
+    # whenever the request includes a system-role message at all -- with
+    # ANY content, even a single trivial user question and no system
+    # message otherwise, still completes in under a second. Folding the
+    # system instructions into the one user message instead is a known,
+    # safe workaround for exactly this class of chat-template bug, and
+    # confirmed working here (~30s including prompt processing, nowhere
+    # near ollama_timeout_seconds). If OLLAMA_CHAT_MODEL is ever changed,
+    # re-verify this is still needed -- it may be specific to this one
+    # model's packaged template, not a general Ollama issue.
+    combined_prompt = f"{_SYSTEM_PROMPT}\n\n---\n\n{prompt}"
     async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
         response = await client.post(
             f"{settings.ollama_url}/api/chat",
             json={
                 "model": settings.ollama_chat_model,
                 "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": combined_prompt},
                 ],
                 "stream": False,
                 # Bounds worst-case generation time -- see config.py's
