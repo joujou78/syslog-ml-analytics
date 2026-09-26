@@ -32,10 +32,16 @@ class Settings(BaseSettings):
     # the same request took 4+ minutes while something else (the Log
     # Assistant indexer's own embedding backfill) was competing for the
     # same CPU -- 60s was nowhere near enough headroom for that reality.
-    # Keep in sync with web/nginx/syslog-ml-web.conf's
-    # `/api/log-assistant/` proxy_read_timeout, which must be >= this or
-    # nginx gives up first regardless of what this is set to.
-    ollama_timeout_seconds: float = 300.0
+    # Deliberately a few seconds SHORTER than web/nginx/syslog-ml-web.conf's
+    # `/api/log-assistant/` proxy_read_timeout (300s): when a request truly
+    # can't finish in time, this should always fire first, so the caller
+    # gets our own clean 502 (a real `detail` message, see
+    # log_assistant.py's _upstream_error) instead of nginx's blunt 504
+    # (plain HTML, no detail -- confirmed on net-flow this reliably got
+    # misread as "OpenSearch/Ollama is down" instead of "this was just
+    # slow"). If nginx's timeout is ever lowered, lower this to stay under
+    # it; this must never be >= nginx's value or the race is undefined.
+    ollama_timeout_seconds: float = 290.0
     # Bounds worst-case "ask" latency deterministically, which the timeout
     # above alone doesn't: confirmed on net-flow that a genuinely
     # content-rich question (many real matching log lines, e.g. "top up
