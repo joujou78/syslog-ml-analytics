@@ -63,6 +63,17 @@ OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 # that cold-load cost. See README's Log Assistant section for the
 # recommended pre-warm step that avoids paying this cost inside a request.
 OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "60"))
+# Root-caused on net-flow (8 cores): with no cap, this embed model's
+# llama-server process defaults to using up to all 8 cores per call. Since
+# this indexer polls continuously, that means it can be actively computing
+# at the same moment an interactive chat completion is too (a separate
+# llama-server process, one per model) -- observed directly via `top`
+# during a multi-minute "ask" stall: both processes at 300%+ CPU
+# simultaneously, load average over 13 on 8 cores. Capping this to 2
+# leaves the chat model (see web/backend/app/core/config.py's
+# ollama_chat_num_thread, default 6) real room to actually make progress
+# instead of the two fighting over all 8 cores.
+OLLAMA_EMBED_NUM_THREAD = int(os.environ.get("OLLAMA_EMBED_NUM_THREAD", "2"))
 
 BATCH_SIZE = int(os.environ.get("INDEXER_BATCH_SIZE", "200"))
 # Deliberately short, not "batch efficiently every so often" -- the point of
@@ -170,7 +181,11 @@ def _embed_batch(texts: list[str]) -> list[list[float]]:
     exercise it live (see README's Log Assistant section)."""
     response = requests.post(
         f"{OLLAMA_URL}/api/embed",
-        json={"model": OLLAMA_EMBED_MODEL, "input": texts},
+        json={
+            "model": OLLAMA_EMBED_MODEL,
+            "input": texts,
+            "options": {"num_thread": OLLAMA_EMBED_NUM_THREAD},
+        },
         timeout=OLLAMA_TIMEOUT_SECONDS,
     )
     response.raise_for_status()

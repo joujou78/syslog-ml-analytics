@@ -70,7 +70,15 @@ async def _embed(question: str) -> list[float]:
     async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
         response = await client.post(
             f"{settings.ollama_url}/api/embed",
-            json={"model": settings.ollama_embed_model, "input": question},
+            json={
+                "model": settings.ollama_embed_model,
+                "input": question,
+                # Same reasoning as ollama_chat_num_thread -- a one-off
+                # embed call doesn't need many threads, and capping it
+                # leaves headroom for whatever else (the indexer's own
+                # embed calls, an in-flight chat completion) is running.
+                "options": {"num_thread": 2},
+            },
         )
         response.raise_for_status()
         return response.json()["embeddings"][0]
@@ -220,7 +228,10 @@ async def ask(os_client: OpenSearch, query: LogAssistantQuery) -> AskResponse:
             # Bounds worst-case generation time -- see config.py's
             # ollama_num_predict comment for why this matters on
             # CPU-only hardware independent of any other contention.
-            "options": {"num_predict": settings.ollama_num_predict},
+            "options": {
+                "num_predict": settings.ollama_num_predict,
+                "num_thread": settings.ollama_chat_num_thread,
+            },
         },
         settings.ollama_timeout_seconds,
     )

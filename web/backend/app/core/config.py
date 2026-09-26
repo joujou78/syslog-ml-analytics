@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # ~80-90s worst case at this hardware's measured decode speed, leaving
     # real margin under ollama_timeout_seconds even under some contention.
     ollama_num_predict: int = 400
+    # Caps how many CPU threads THIS call is allowed to use. Root-caused on
+    # net-flow (8 cores): with no cap, each llama-server process (one per
+    # loaded model -- the embed model AND the chat model are separate
+    # processes) defaults to using up to all 8 cores for its own inference.
+    # The indexer's embed calls and an interactive chat completion can
+    # genuinely run at the same time, and observed directly via `top`
+    # during a hang: both llama-server processes actively computing at
+    # once, 300%+ CPU each, total load average over 13 on an 8-core box --
+    # severe thread oversubscription, not a code bug, not Ollama itself
+    # hanging. 6 threads leaves headroom so the embed model (capped
+    # separately, see ml/log_assistant_indexer.py's OLLAMA_EMBED_NUM_THREAD)
+    # can still get real CPU time without the two fighting for all 8 cores.
+    ollama_chat_num_thread: int = 6
     # Empty means "use the built-in prompts/log_assistant_system.txt next to
     # the service code" (see log_assistant_service.py) -- override only to
     # point at a different file without touching the shipped default.
