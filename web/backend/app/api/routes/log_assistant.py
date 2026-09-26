@@ -21,6 +21,19 @@ def _upstream_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Log Assistant backend error: {exc}")
 
 
+# httpx.HTTPError/OpenSearchException cover a request failing outright, but
+# not a request that "succeeds" with an unexpected shape -- e.g. Ollama's
+# response missing the ["message"]["content"] path log_assistant_service.py
+# expects (KeyError) or a non-JSON body (json.JSONDecodeError, a ValueError
+# subclass). Uncaught, either would surface as a bare 500 with no `detail`
+# field -- which the frontend's error handling can't distinguish from a
+# genuine network failure any better than it could a 504 (see
+# LogAssistant.tsx's logAssistantErrorFallback for the same lesson learned
+# about a 504). Treating these as upstream errors too keeps every failure
+# mode in this pipeline informative rather than a mystery.
+_UPSTREAM_ERRORS = (httpx.HTTPError, OpenSearchException, KeyError, ValueError)
+
+
 @router.post("/search", response_model=SemanticSearchResponse)
 async def search(
     payload: LogAssistantQuery,
@@ -29,7 +42,7 @@ async def search(
 ):
     try:
         items = await log_assistant_service.semantic_search(os_client, payload)
-    except (httpx.HTTPError, OpenSearchException) as exc:
+    except _UPSTREAM_ERRORS as exc:
         raise _upstream_error(exc)
     return SemanticSearchResponse(items=items)
 
@@ -42,5 +55,5 @@ async def ask(
 ):
     try:
         return await log_assistant_service.ask(os_client, payload)
-    except (httpx.HTTPError, OpenSearchException) as exc:
+    except _UPSTREAM_ERRORS as exc:
         raise _upstream_error(exc)
