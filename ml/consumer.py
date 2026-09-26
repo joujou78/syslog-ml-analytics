@@ -72,6 +72,20 @@ BASELINE_REFRESH_SECONDS = float(os.environ.get("ANOMALY_BASELINE_REFRESH_SECOND
 # refresh is at least this many times its historical average rate.
 VOLUME_SPIKE_MULTIPLIER = float(os.environ.get("ANOMALY_VOLUME_SPIKE_MULTIPLIER", "5"))
 
+# Confirmed on net-flow: messages naming a Docker/Podman veth pair (e.g.
+# "veth88671e0: link becomes ready") come from a monitored device that
+# itself runs containers -- this is container network-namespace churn on
+# THAT device, not a real interface flapping, and it isn't net-flow's own
+# noise either (rsyslog/60-syslog-ml.conf already keeps this VM's own
+# local traffic out of the feed). Left in, it floods Log Search/Ask and
+# would swamp a flapping detector with false positives. Dropped here, at
+# parse time, so it never reaches Drain3, the classifier, or per-device
+# baselines -- not just hidden downstream. Empty string disables the
+# filter entirely (e.g. if a device genuinely uses "veth" in a hardware
+# interface name, unlikely as that is).
+IGNORE_MESSAGE_PATTERN = os.environ.get("IGNORE_MESSAGE_PATTERN", r"\bveth[0-9a-f]{6,}\b")
+_ignore_message_re = re.compile(IGNORE_MESSAGE_PATTERN, re.IGNORECASE) if IGNORE_MESSAGE_PATTERN else None
+
 # Postgres connection for the admin-managed relay_source_ips table (same
 # database/table the web app's "Relay Source IPs" admin page reads and
 # writes -- see RelaySourceIpCache below). Empty by default: if unset, the
@@ -702,6 +716,8 @@ def parse_record(line):
         log.warning("Skipping malformed JSON line: %.200s", line)
         return None
     if "message" not in record:
+        return None
+    if _ignore_message_re and _ignore_message_re.search(record["message"]):
         return None
     return record
 
