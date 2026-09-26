@@ -255,6 +255,10 @@ class FileTailer:
         self.offset_path = offset_path
         self.file = None
         self.inode = None
+        # Tracks how far we've READ, kept separate from what's actually
+        # persisted to offset_path -- see readlines()/commit_offset()'s
+        # docstrings for why the two must not be the same thing.
+        self._pending_offset = None
         self._open()
 
     def _load_offset(self):
@@ -291,17 +295,35 @@ class FileTailer:
         return current_inode != self.inode
 
     def readlines(self):
+        """Returns new lines and advances the in-memory read position, but
+        does NOT persist it -- call commit_offset() once the caller has
+        actually done something durable with these lines (inserted them
+        into ClickHouse), not before. Persisting here unconditionally was a
+        real, confirmed bug: a batch that failed to insert (ClickHouse
+        restart, timeout, disk full) was still "past" the saved offset, so
+        a crash or restart before the next successful insert would never
+        see those lines again -- silent, permanent event loss with no way
+        to recover them, for every batch touched by a transient failure."""
         if self._rotated():
             log.info("Detected log rotation on %s, reopening", self.path)
             self.file.close()
             self._save_offset(0)
             self.file = open(self.path, "r")
             self.inode = os.fstat(self.file.fileno()).st_ino
+            self._pending_offset = None
 
         lines = self.file.readlines()
         if lines:
-            self._save_offset(self.file.tell())
+            self._pending_offset = self.file.tell()
         return lines
+
+    def commit_offset(self):
+        """Call only after the lines returned by the readlines() call(s)
+        since the last commit are durably stored (e.g. the ClickHouse
+        insert succeeded) -- see readlines()'s docstring for why this is
+        deliberately not automatic."""
+        if self._pending_offset is not None:
+            self._save_offset(self._pending_offset)
 
 
 def load_classifier():
@@ -730,8 +752,16 @@ def main():
             try:
                 ch_client.insert("syslog_ml.events", batch, column_names=INSERT_COLUMNS)
             except Exception:
-                log.exception("Failed to insert batch of %d rows", len(batch))
-            batch = []
+                # Deliberately NOT clearing batch or committing the
+                # tailer's offset here -- see FileTailer.readlines()'s
+                # docstring. Keeping the batch means the next cycle's
+                # newly-read lines are appended on top of it and the whole
+                # (larger) batch is retried together; nothing is silently
+                # dropped by a transient ClickHouse failure.
+                log.exception("Failed to insert batch of %d rows, will retry next cycle", len(batch))
+            else:
+                batch = []
+                tailer.commit_offset()
             last_flush = time.monotonic()
 
         if not lines:
