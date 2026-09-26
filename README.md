@@ -292,10 +292,11 @@ sudo journalctl -u syslog-ml-silence-detector -f        # confirm it runs every 
 ### Anomaly flagging
 
 `events.is_anomaly` is populated by the classifier itself (`ml/consumer.py`),
-not a separate process. It's actually seven independent signals
+not a separate process. It's actually eight independent signals
 (`ml/anomaly_signals.py` for the stateless two, `DeviceBaselineCache` in
 `consumer.py` for two that need per-device history, `ml/template_mix_anomaly.py`
-for the sixth, `ml/sequence_anomaly.py` for the seventh — see below) — any
+for the sixth, `ml/sequence_anomaly.py` for the seventh,
+`ml/interface_flap_anomaly.py` for the eighth — see below) — any
 one firing sets `is_anomaly = 1`, and
 `events.anomaly_reasons` (an array column) records *which* one(s) did, the
 same "always label the reason, not just a verdict" principle already used
@@ -329,6 +330,20 @@ for `resolution_method` and `vendor_source`:
   see "Sequence anomaly detection" below. Also retrospective/mutation-based
   like `unusual_template_mix`, for the same reason: it can't be judged
   until the previous event in the device's sequence is already known.
+- **`interface_flapping`**: this device's interface has logged
+  `INTERFACE_FLAP_MIN_DOWN_TRANSITIONS` (default 3) or more "link down"
+  events within `INTERFACE_FLAP_WINDOW_SECONDS` (default 15 minutes) — see
+  `ml/interface_flap_anomaly.py`. Built from a real example: a live "Ask"
+  query surfaced `ether1` on a Mikrotik device going down twice 18 seconds
+  apart, which none of the other seven signals called out (`volume_spike`
+  only catches flapping incidentally, and only if it's frequent enough to
+  push the device 5x above its own baseline rate). Inline like
+  `rare_template`/`always_severe`/`security_content`, not
+  retrospective/mutation-based — interface/state extraction is narrow and
+  evidence-based (currently just RouterOS's confirmed `ether<N> link
+  up|down` format, the same one `vendor_signatures.py` already matches for
+  mikrotik detection); more vendors' formats can be added as they're
+  confirmed against this deployment's real traffic.
 
 The middle two (severity_spike, volume_spike) are per-device, not global
 thresholds, since "unusual" only
@@ -558,7 +573,8 @@ point it at a service that turns webhooks into email/SMS if you need that.
 
 Every anomaly signal above (`rare_template`, `always_severe`,
 `security_content`, `severity_spike`, `volume_spike`,
-`unusual_template_mix`) detects a device logging too much or unusually.
+`unusual_template_mix`, `unusual_transition`, `interface_flapping`) detects
+a device logging too much or unusually.
 None of them detect a device that stops logging entirely — for a security
 appliance or network switch, that can mean it crashed, lost connectivity,
 or was tampered with, and without this it's invisible.
@@ -1203,6 +1219,7 @@ syslog-ml-log-assistant-indexer`) if anything doesn't work as expected.
 - `ml/anomaly_signals.py` — stateless anomaly signals (always_severe, security_content); the per-device ones (severity_spike, volume_spike) live in `consumer.py`'s `DeviceBaselineCache`.
 - `ml/template_mix_anomaly.py` — the sixth anomaly signal: periodic, windowed, per-device/per-vendor template-mix outlier detection (`unusual_template_mix`).
 - `ml/sequence_anomaly.py` — the seventh anomaly signal: periodic, per-device/per-vendor Markov-chain template-transition anomaly detection (`unusual_transition`) — a lightweight, dependency-free alternative to DeepLog (see README's "Sequence anomaly detection").
+- `ml/interface_flap_anomaly.py` — the eighth anomaly signal: inline, in-memory sliding-window detection of a real hardware interface repeatedly cycling down/up (`interface_flapping`).
 - `ml/device_resolver.py` / `ml/resolve_pending.py` — the opt-in SNMP identity resolver, including credential-pool discovery/auto-save (reads credentials from Postgres, see `web/`).
 - `ml/reverify_devices.py` — twice-daily re-check of already-resolved devices; self-heals an auto-discovered credential if its community rotates.
 - `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.

@@ -35,6 +35,7 @@ const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 
 // without a code change.
 const ANOMALY_REASON_OPTIONS = [
   'rare_template', 'always_severe', 'security_content', 'severity_spike', 'volume_spike', 'unusual_template_mix',
+  'unusual_transition', 'interface_flapping',
 ]
 
 // If the current filter value (e.g. from a deep link -- see Anomaly

@@ -186,7 +186,8 @@ class AnomalyAcknowledgment(Base):
 
     anomaly_reason is one of events.anomaly_reasons' values (rare_template
     | always_severe | security_content | severity_spike | volume_spike |
-    unusual_template_mix) but not a DB-level foreign key, since that
+    unusual_template_mix | unusual_transition | interface_flapping) but not
+    a DB-level foreign key, since that
     array lives in ClickHouse, not Postgres -- logical reference only,
     same as ClassificationFeedback.event_id.
     """

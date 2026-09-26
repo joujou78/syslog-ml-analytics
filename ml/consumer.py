@@ -33,6 +33,7 @@ from drain3.template_miner_config import TemplateMinerConfig
 
 import state_db
 from anomaly_signals import is_always_severe, is_security_content
+from interface_flap_anomaly import InterfaceFlapDetector
 from labeling_rules import weak_label, severity_rank
 from sequence_anomaly import SequenceAnomalyDetector
 from template_mix_anomaly import TemplateMixAnomalyDetector
@@ -659,7 +660,7 @@ def resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved):
     return source_ip, hostname, reported_hostname, relayed_via, detected_vendor, "", resolution_method, vendor_source
 
 
-def to_row(record, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved):
+def to_row(record, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved):
     message = record.get("message", "")
     cluster = miner.add_log_message(message)
     timestamp = record.get("timestamp")
@@ -699,6 +700,8 @@ def to_row(record, miner, model, inventory, relay_ips, baselines, state_conn, se
         reasons.append("severity_spike")
     if baselines.is_volume_spiking(source_ip):
         reasons.append("volume_spike")
+    if interface_flap.is_flapping(source_ip, message, event_time):
+        reasons.append("interface_flapping")
     baselines.record_event(source_ip)
 
     is_anomaly = 1 if reasons else 0
@@ -742,6 +745,7 @@ def main():
     relay_ips = RelaySourceIpCache(DATABASE_URL)
     template_mix = TemplateMixAnomalyDetector(ch_client)
     sequence_anomaly = SequenceAnomalyDetector(ch_client)
+    interface_flap = InterfaceFlapDetector()
     acs_reassembler = AcsMultipartReassembler()
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)
@@ -764,10 +768,10 @@ def main():
             if record is None:
                 continue
             for ready in acs_reassembler.feed(record):
-                batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved))
+                batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved))
 
         for ready in acs_reassembler.flush_stale():
-            batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, state_conn, seen_unresolved))
+            batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved))
 
         should_flush = len(batch) >= BATCH_SIZE or (time.monotonic() - last_flush) >= BATCH_FLUSH_SECONDS
         if should_flush and batch:
