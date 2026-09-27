@@ -1,5 +1,5 @@
 [Unit]
-Description=Syslog ML alert rule evaluator (one-shot, triggered by syslog-ml-alert-evaluator.timer)
+Description=Syslog ML events backup+purge (one-shot, triggered by syslog-ml-backup-events.timer)
 After=network.target clickhouse-server.service
 
 [Service]
@@ -7,9 +7,9 @@ Type=oneshot
 User=syslog-ml
 Group=syslog-ml
 WorkingDirectory=/opt/syslog-ml/ml
-ExecStart=/opt/syslog-ml/venv/bin/python evaluate_alerts.py
-EnvironmentFile=/etc/syslog-ml/resolver.env
+ExecStart=/opt/syslog-ml/venv/bin/python backup_and_purge_events.py
 EnvironmentFile=-/etc/syslog-ml/clickhouse.env
-EnvironmentFile=-/etc/syslog-ml/email.env
 Environment=CLICKHOUSE_HOST=localhost
 Environment=CLICKHOUSE_PORT=8123
+Environment=EVENTS_RETENTION_DAYS=90
+Environment=EVENTS_BACKUP_DIR=/var/backups/syslog-ml/events

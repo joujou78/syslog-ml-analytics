@@ -24,6 +24,8 @@ import psycopg2
 import psycopg2.extras
 import requests
 
+from emailer import parse_recipients, send_email
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("evaluate_alerts")
 
@@ -37,6 +39,13 @@ CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "")
 WEBHOOK_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_TIMEOUT_SECONDS", "5"))
 SAMPLE_MESSAGE_MAX_LEN = 2000
+# One global recipient list for every rule that fires, not a per-rule
+# column alongside webhook_url -- deliberately simpler than fully
+# per-rule email config, which would need a schema change, a new API
+# field, and a new frontend field for comparatively little benefit on a
+# single-operator deployment. Add per-rule recipients later if that
+# stops being true.
+ALERT_EMAIL_RECIPIENTS = parse_recipients(os.environ.get("ALERT_EMAIL_RECIPIENTS", ""))
 
 _EQUALITY_FILTERS = ("hostname", "source_ip", "program", "severity", "predicted_category")
 
@@ -113,6 +122,19 @@ def notify_webhook(rule, matched_count, window_start, window_end, sample_message
         return False, str(exc)[:1000]
 
 
+def notify_email(rule, matched_count, window_start, window_end, sample_message):
+    """Returns (sent, error) -- same convention as notify_webhook above.
+    Uses the global ALERT_EMAIL_RECIPIENTS list, not a per-rule field."""
+    subject = f"[syslog-ml] Alert: {rule['name']} ({matched_count} matched)"
+    body = (
+        f"Rule: {rule['name']}\n"
+        f"Matched: {matched_count} (threshold {rule['threshold']})\n"
+        f"Window: {window_start.isoformat()} to {window_end.isoformat()}\n"
+        f"Sample message: {sample_message}\n"
+    )
+    return send_email(ALERT_EMAIL_RECIPIENTS, subject, body)
+
+
 def evaluate_rule(ch_client, pg_conn, rule, now):
     if in_cooldown(rule, now):
         return
@@ -129,22 +151,38 @@ def evaluate_rule(ch_client, pg_conn, rule, now):
 
     sample_message = (sample_message or "")[:SAMPLE_MESSAGE_MAX_LEN]
     notified, notify_error = notify_webhook(rule, matched_count, window_start, now, sample_message)
+    email_notified, email_notify_error = notify_email(rule, matched_count, window_start, now, sample_message)
 
     with pg_conn, pg_conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO alert_events
-                (id, rule_id, window_start, window_end, matched_count, sample_message, notified, notify_error)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (id, rule_id, window_start, window_end, matched_count, sample_message,
+                 notified, notify_error, email_notified, email_notify_error)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (str(uuid.uuid4()), rule["id"], window_start, now, matched_count, sample_message, notified, notify_error),
+            (
+                str(uuid.uuid4()), rule["id"], window_start, now, matched_count, sample_message,
+                notified, notify_error, email_notified, email_notify_error,
+            ),
         )
-        cur.execute("UPDATE alert_rules SET last_triggered_at = %s WHERE id = %s", (now, rule["id"]))
+        # Only start the cooldown clock if at least one channel actually
+        # delivered (or had nothing configured to deliver to -- notified/
+        # email_notified is True in both cases, see notify_webhook's own
+        # docstring). Previously this ran unconditionally: a transient
+        # webhook failure still consumed the full cooldown_minutes window,
+        # so the next real notification for a persisting condition could
+        # be silently delayed by the whole cooldown period even though
+        # nothing was ever delivered for this firing.
+        if notified or email_notified:
+            cur.execute("UPDATE alert_rules SET last_triggered_at = %s WHERE id = %s", (now, rule["id"]))
 
     log.info(
-        "Rule %r fired: %d matched (threshold %d), notified=%s%s",
+        "Rule %r fired: %d matched (threshold %d), notified=%s%s, email_notified=%s%s",
         rule["name"], matched_count, rule["threshold"], notified,
         f", error={notify_error}" if notify_error else "",
+        email_notified,
+        f", error={email_notify_error}" if email_notify_error else "",
     )
 
 

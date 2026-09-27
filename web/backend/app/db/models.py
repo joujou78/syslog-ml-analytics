@@ -166,6 +166,11 @@ class AlertEvent(Base):
     sample_message: Mapped[str] = mapped_column(String, nullable=False, default="")
     notified: Mapped[bool] = mapped_column(default=False, nullable=False)
     notify_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Independent from notified/notify_error above (webhook-specific) --
+    # ml/evaluate_alerts.py fires both channels and a rule can succeed on
+    # one while failing on the other. See "Alerting" in README.md.
+    email_notified: Mapped[bool] = mapped_column(default=False, nullable=False)
+    email_notify_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     rule: Mapped["AlertRule"] = relationship()
 

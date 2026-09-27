@@ -52,3 +52,5 @@ class AlertEventRead(BaseModel):
     sample_message: str
     notified: bool
     notify_error: str | None
+    email_notified: bool
+    email_notify_error: str | None

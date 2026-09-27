@@ -327,7 +327,8 @@ export function Alerts() {
             <th>Triggered</th>
             <th>Matched</th>
             <th>Sample message</th>
-            <th>Notified</th>
+            <th>Webhook</th>
+            <th>Email</th>
           </tr>
         </thead>
         <tbody>
@@ -338,11 +339,12 @@ export function Alerts() {
               <td>{h.matched_count}</td>
               <td className="mono log-message">{h.sample_message}</td>
               <td>{h.notified ? 'Yes' : `No${h.notify_error ? ` (${h.notify_error})` : ''}`}</td>
+              <td>{h.email_notified ? 'Yes' : `No${h.email_notify_error ? ` (${h.email_notify_error})` : ''}`}</td>
             </tr>
           ))}
           {history?.length === 0 && (
             <tr>
-              <td colSpan={5}>No alerts have fired yet.</td>
+              <td colSpan={6}>No alerts have fired yet.</td>
             </tr>
           )}
         </tbody>

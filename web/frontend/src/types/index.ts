@@ -201,6 +201,8 @@ export interface AlertEvent {
   sample_message: string
   notified: boolean
   notify_error: string | null
+  email_notified: boolean
+  email_notify_error: string | null
 }
 
 export interface DeviceSilence {

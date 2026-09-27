@@ -565,9 +565,53 @@ and won't fire again until *cooldown* has elapsed since it last fired. A
 firing writes a row to Postgres (`alert_events`, visible in the same page)
 and, if the rule has a `webhook_url`, POSTs a JSON payload to it (works
 with a Slack incoming webhook, PagerDuty, or any endpoint that accepts a
-POST). There's no email delivery in this version — a webhook was the
-simplest channel to build and test without requiring SMTP credentials;
-point it at a service that turns webhooks into email/SMS if you need that.
+POST). It also emails `ALERT_EMAIL_RECIPIENTS` (comma-separated, see
+`systemd/syslog-ml-email.env.example`) via `ml/emailer.py` — plain
+`smtplib` against an SMTP server/relay you already have, not a
+transactional email API, so no new account is needed. Webhook and email
+are independent: `alert_events.notified`/`notify_error` track the
+webhook, `email_notified`/`email_notify_error` track email, and a rule's
+cooldown only starts once at least one of the two actually delivered (or
+had nothing configured to deliver to) — a transient failure on one
+channel no longer silently costs a full `cooldown_minutes` window of
+lost notifications the way it used to when the cooldown timer advanced
+unconditionally.
+
+### Daily digest
+
+`ml/daily_digest.py` (run once a day by `syslog-ml-daily-digest.timer`,
+07:00 by default) emails `DIGEST_EMAIL_RECIPIENTS` (falls back to
+`ALERT_EMAIL_RECIPIENTS` if unset) a plain-text summary of the last
+`DIGEST_WINDOW_HOURS` (default 24): total/anomalous event counts, a
+breakdown of which of the 8 anomaly signals fired and how often, the
+`DIGEST_TOP_DEVICES` noisiest devices, every alert rule that fired, and
+every device currently flagged silent — one message answering "what
+happened" instead of checking Log Search/Anomaly Summary/Alerts/Devices
+separately. Only the daily cadence is wired up for now; `build_digest()`
+takes an arbitrary window, so an hourly or weekly variant is a second
+timer + a different `DIGEST_WINDOW_HOURS`, not new logic.
+
+### Event retention: backup, then purge
+
+`clickhouse/init.sql` documents `syslog_ml.events` as unbounded by
+explicit choice — disk usage grows forever otherwise.
+`ml/backup_and_purge_events.py` (run once a day by
+`syslog-ml-backup-events.timer`, 03:15 by default) bounds it: for every
+daily partition older than `EVENTS_RETENTION_DAYS` (default 90), it
+exports the partition to a gzip CSV file under `EVENTS_BACKUP_DIR`
+(default `/var/backups/syslog-ml/events`), confirms the file was written
+and is non-empty, and only then runs `ALTER TABLE ... DROP PARTITION` —
+a near-instant metadata operation since `events` is already
+`PARTITION BY toYYYYMMDD(event_time)`, unlike a row-by-row `DELETE`,
+which in ClickHouse is a heavy mutation. A partition is never dropped
+before its backup is confirmed; a failed export just leaves that
+partition alone to retry next run. Export itself is paginated
+(`EVENTS_EXPORT_PAGE_SIZE`, default 50,000 rows/page) so memory use
+stays bounded regardless of how large a day's partition is. Only
+`events` is covered — `device_window_anomalies`/`device_sequence_anomalies`
+are also unbounded per the same file, but far smaller (only scored
+windows/transitions, not every raw event); the same approach extends to
+them later if their own growth ever becomes a real concern.
 
 ### Device-silence detection
 
@@ -1225,9 +1269,12 @@ syslog-ml-log-assistant-indexer`) if anything doesn't work as expected.
 - `ml/vendor_signatures.py` — passive, no-credential vendor detection from syslog message format.
 - `ml/labeling_rules.py` — weak-supervision category rules (tune for your vendors).
 - `ml/train_classifier.py` — trains the TF-IDF + linear SVM classifier.
-- `ml/evaluate_alerts.py` — evaluates alert rules against ClickHouse, fires webhooks.
+- `ml/evaluate_alerts.py` — evaluates alert rules against ClickHouse, fires webhooks and email.
+- `ml/emailer.py` — shared SMTP email helper used by `evaluate_alerts.py` and `daily_digest.py`.
+- `ml/daily_digest.py` — emails a daily summary of events/anomalies/alerts/silent devices (see "Daily digest" above).
+- `ml/backup_and_purge_events.py` — backs up then drops `events` partitions older than `EVENTS_RETENTION_DAYS` (see "Event retention" above).
 - `ml/log_assistant_indexer.py` — embeds new events into OpenSearch for the Log Assistant's semantic search/ask features (see "Log Assistant" above).
 - `opensearch/` — the log-embedding index's mapping (`log_events_index.json`) and its one-time setup script.
-- `systemd/` — unit files for the classifier, resolver timer, alert evaluator timer, re-verify timer, and the Log Assistant indexer.
+- `systemd/` — unit files for the classifier, resolver timer, alert evaluator timer, re-verify timer, daily digest timer, events backup+purge timer, and the Log Assistant indexer.
 - `grafana/` — provisioned datasource + starter dashboard.
 - `web/` — FastAPI + React admin app, including Log Search, the anomaly pages, Query Console, and Log Assistant (see `web/README.md`).

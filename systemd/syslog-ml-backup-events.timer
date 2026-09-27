@@ -1,0 +1,9 @@
+[Unit]
+Description=Run syslog-ml-backup-events daily at 03:15
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
