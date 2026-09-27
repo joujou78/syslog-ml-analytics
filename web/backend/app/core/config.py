@@ -1,3 +1,6 @@
+import json
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -81,7 +84,32 @@ class Settings(BaseSettings):
     #   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     credential_encryption_key: str = "l_4kEGewM6ILrPN6XDKa9tW2gW7FxcG4pisE1GkoL8M="
 
-    cors_origins: list[str] = ["http://localhost:5173"]
+    # Deliberately a plain str field (not list[str]) with an explicit
+    # validation_alias pinning it to the exact env var name this project
+    # has always used -- pydantic-settings JSON-decodes a list[str] field
+    # at the SOURCE level, before any field_validator ever runs, and that
+    # decode fails outright the moment this value is supplied any way
+    # other than systemd's own EnvironmentFile= parsing (e.g. sourcing the
+    # same file through bash for a one-off manual command like alembic --
+    # confirmed the hard way deploying this exact project: bash's quote
+    # removal turns `["a","b"]` into the invalid `[a,b]`). A plain string
+    # never enters that decode path at all, so it's simply immune to this
+    # failure mode regardless of how it's supplied. See cors_origins below
+    # for the parsed form actually used by the app.
+    cors_origins_raw: str = Field(default="http://localhost:5173", validation_alias="SYSLOG_ML_CORS_ORIGINS")
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Comma-separated (e.g. SYSLOG_ML_CORS_ORIGINS=https://a,https://b).
+        Also tolerates a legacy JSON-array-formatted value, for anyone who
+        had it set that way already."""
+        value = self.cors_origins_raw.strip()
+        if value.startswith("["):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                value = value.strip("[]")
+        return [origin.strip() for origin in value.split(",") if origin.strip()]
 
 
 settings = Settings()

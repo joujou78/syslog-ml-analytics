@@ -1253,8 +1253,34 @@ AI" deep links were verified in a real browser. Check both services' own
 logs (`journalctl -u opensearch`, `journalctl -u ollama`, `journalctl -u
 syslog-ml-log-assistant-indexer`) if anything doesn't work as expected.
 
+## Step 8 — deploying updates
+
+`deploy.sh` (repo root) is the standard way to deploy any future change:
+
+```bash
+sudo /opt/syslog-ml/deploy.sh
+```
+
+It pulls the latest code, runs pending Alembic migrations, syncs systemd
+unit files, reloads systemd, and restarts the two persistent services
+(`syslog-ml-classifier`, `syslog-ml-web-api`) — everything else is a
+oneshot triggered by its own timer, so it picks up new code and unit
+files on its next scheduled firing without needing a restart. It always
+does the git pull and migration as the `syslog-ml` user regardless of
+which login invokes it (via `sudo`), which matters: a real deploy of this
+project once had `git pull` silently fail for days because an
+administrator login didn't have write access to files `syslog-ml` owned
+in `.git` — no error was visible until someone checked which commit
+range a "successful" pull actually updated through. Running consistently
+as one owner avoids that whole class of drift. A brand-new `*.timer`
+still needs a one-time, deliberate
+`sudo systemctl enable --now <name>.timer` — the script never does that
+on its own, since enabling a new periodic job is a decision, not a side
+effect of a code pull.
+
 ## Files
 
+- `deploy.sh` — the standard way to deploy any future change (see "Step 8 — deploying updates" above).
 - `clickhouse/init.sql` — `device_inventory`, `events`, the per-minute rollup, and `device_window_anomalies`.
 - `rsyslog/10-network-listener.conf` — enables rsyslog to receive syslog over the network (UDP/TCP 514), routed into the `syslogMlNetwork` ruleset so this VM's own local/journald traffic isn't mixed in.
 - `rsyslog/60-syslog-ml.conf` — mirrors that network-only ruleset's feed to a local JSON file (plus an explicit `snmptrapd` allow-list, since it logs traps via that same local path -- see "Windowed template-mix anomaly detection" and the SNMP trap section below).
