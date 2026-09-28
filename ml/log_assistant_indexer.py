@@ -34,7 +34,7 @@ import hashlib
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import clickhouse_connect
 import requests
@@ -235,14 +235,31 @@ def _fetch_exact_timestamp(client, ts: datetime) -> list[dict]:
     (up to BATCH_SIZE there, default 500) can land with the identical
     millisecond timestamp. A tie's size is bounded by that pipeline's own
     batch size, not by traffic volume in general, so an unbounded query
-    here is fine."""
+    here is fine.
+
+    A half-open [ts, ts+1ms) range, deliberately NOT `received_at = ts`
+    -- confirmed the hard way on net-flow that clickhouse_connect's
+    parameter binding for an exact equality comparison against this
+    DateTime64(3) column never matches anything, even for a freshly
+    constructed, correct Python datetime (direct A/B testing showed
+    `>`/`>=`/`<` comparisons with the identical parameter value and
+    column work fine; only `=` silently returns zero rows). That silently
+    broke every backfill that ever hit a tie wider than BATCH_SIZE+1
+    rows: _trim_ambiguous_tail's fallback returned nothing, so
+    run_cycle's `if not rows: break` fired immediately, the checkpoint
+    never advanced, and the process looked healthy from its logs (still
+    embedding/posting other work) while making zero progress past that
+    exact point -- confirmed stuck for 2+ days before this was found.
+    received_at has millisecond precision, so this range can only ever
+    contain rows exactly at `ts`, same as the equality check it
+    replaces."""
     query = f"""
         SELECT {', '.join(_EVENT_COLUMNS)}
         FROM syslog_ml.events
-        WHERE received_at = %(ts)s{_anomaly_clause()}
+        WHERE received_at >= %(ts)s AND received_at < %(ts_next)s{_anomaly_clause()}
         ORDER BY received_at ASC
     """
-    result = client.query(query, parameters={"ts": ts})
+    result = client.query(query, parameters={"ts": ts, "ts_next": ts + timedelta(milliseconds=1)})
     return [dict(zip(_EVENT_COLUMNS, row)) for row in result.result_rows]
 
 
