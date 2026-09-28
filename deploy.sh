@@ -42,16 +42,24 @@ cp "$REPO_DIR"/systemd/*.service "$REPO_DIR"/systemd/*.timer /etc/systemd/system
 cp "$REPO_DIR"/web/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 
-echo "==> Restarting persistent services (classifier, web API)..."
-# Only these two run continuously and need an explicit restart to load
+echo "==> Restarting persistent services (classifier, web API, Log Assistant indexer)..."
+# Only these three run continuously and need an explicit restart to load
 # new code. Every other syslog-ml-* unit (evaluate_alerts, daily_digest,
 # backup_and_purge_events, detect_silent_devices, resolve_pending,
 # reverify_devices) is a oneshot triggered by its own timer -- it
 # re-reads both its code and its (just daemon-reloaded) unit file fresh
 # on its next scheduled firing, so restarting it here would just be
 # no-op busywork.
+#
+# log-assistant-indexer's omission here was a real bug, not a style
+# choice: it's Type=simple + WantedBy=multi-user.target in its own unit
+# file, a persistent daemon exactly like the other two -- confirmed the
+# hard way on net-flow, where it ran for 2+ days silently stuck (its
+# on-disk checkpoint frozen, 641k+ events backlogged) because nothing
+# ever restarted it, including multiple deploy.sh runs in between.
 systemctl restart syslog-ml-classifier
 systemctl restart syslog-ml-web-api
+systemctl restart syslog-ml-log-assistant-indexer
 
 echo "==> Done."
 echo "    A brand-new *.timer (one that didn't exist before this deploy)"

@@ -1295,17 +1295,33 @@ sudo /opt/syslog-ml/deploy.sh
 ```
 
 It pulls the latest code, runs pending Alembic migrations, syncs systemd
-unit files, reloads systemd, and restarts the two persistent services
-(`syslog-ml-classifier`, `syslog-ml-web-api`) — everything else is a
-oneshot triggered by its own timer, so it picks up new code and unit
-files on its next scheduled firing without needing a restart. It always
-does the git pull and migration as the `syslog-ml` user regardless of
-which login invokes it (via `sudo`), which matters: a real deploy of this
-project once had `git pull` silently fail for days because an
-administrator login didn't have write access to files `syslog-ml` owned
-in `.git` — no error was visible until someone checked which commit
-range a "successful" pull actually updated through. Running consistently
-as one owner avoids that whole class of drift. A brand-new `*.timer`
+unit files, reloads systemd, and restarts the three persistent services
+(`syslog-ml-classifier`, `syslog-ml-web-api`,
+`syslog-ml-log-assistant-indexer`) — everything else is a oneshot
+triggered by its own timer, so it picks up new code and unit files on its
+next scheduled firing without needing a restart. It always does the git
+pull and migration as the `syslog-ml` user regardless of which login
+invokes it (via `sudo`), which matters: a real deploy of this project
+once had `git pull` silently fail for days because an administrator
+login didn't have write access to files `syslog-ml` owned in `.git` — no
+error was visible until someone checked which commit range a
+"successful" pull actually updated through. Running consistently as one
+owner avoids that whole class of drift.
+
+**Getting the persistent-service list right matters, concretely, not just
+stylistically**: an earlier version of this script omitted
+`syslog-ml-log-assistant-indexer` (wrongly assumed to be a oneshot like
+the timer-triggered jobs) — confirmed on net-flow that this let it run
+stuck for 2+ days with its checkpoint frozen and 641k+ events backlogged,
+silently re-posting the same small already-indexed window every second
+(a harmless no-op given `_doc_id`'s deterministic hashing, which is
+exactly why it looked healthy from the outside) while nothing ever
+restarted it to clear whatever state it had fallen into. If Log Assistant
+searches stop returning recent results again, check this service's own
+checkpoint/logs (see "No related log lines were found" above) before
+assuming it's simple indexing lag.
+
+A brand-new `*.timer`
 still needs a one-time, deliberate
 `sudo systemctl enable --now <name>.timer` — the script never does that
 on its own, since enabling a new periodic job is a decision, not a side
