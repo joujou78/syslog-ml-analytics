@@ -45,6 +45,8 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
+from ch_time import ch_literal
+
 log = logging.getLogger("template_mix_anomaly")
 
 WINDOW_MINUTES = int(os.environ.get("TEMPLATE_MIX_WINDOW_MINUTES", "5"))
@@ -143,13 +145,18 @@ class TemplateMixAnomalyDetector:
         now = datetime.now(timezone.utc)
         current_window_start = _window_floor(now)  # still filling -- excluded, not yet complete
 
+        # current_window_start is embedded as a literal, not bound as a
+        # query parameter -- see ch_time.py (clickhouse_connect's datetime
+        # parameter binding was root-caused as unreliable against
+        # DateTime64(3) columns; this project no longer relies on it for
+        # any event_time/received_at comparison).
         result = self.client.query(f"""
             SELECT source_ip, toStartOfInterval(event_time, INTERVAL {WINDOW_MINUTES} MINUTE) AS window_start,
                    template_id, any(vendor) AS vendor, count() AS cnt
             FROM syslog_ml.events
-            WHERE event_time >= now() - INTERVAL {LOOKBACK_DAYS} DAY AND event_time < %(current_window_start)s
+            WHERE event_time >= now() - INTERVAL {LOOKBACK_DAYS} DAY AND event_time < '{ch_literal(current_window_start)}'
             GROUP BY source_ip, window_start, template_id
-        """, parameters={"current_window_start": current_window_start})
+        """)
 
         # source_ip -> window_start -> template_id -> count
         by_device: dict[str, dict[datetime, dict[str, int]]] = defaultdict(lambda: defaultdict(dict))
@@ -234,14 +241,16 @@ class TemplateMixAnomalyDetector:
 
     def _tag_events(self, source_ip: str, window_start: datetime):
         window_end = window_start + timedelta(minutes=WINDOW_MINUTES)
+        # window_start/window_end embedded as literals, not bound as query
+        # parameters -- see ch_time.py.
         try:
-            self.client.command("""
+            self.client.command(f"""
                 ALTER TABLE syslog_ml.events UPDATE
                     anomaly_reasons = arrayConcat(anomaly_reasons, ['unusual_template_mix']),
                     is_anomaly = 1
                 WHERE source_ip = %(source_ip)s
-                  AND event_time >= %(window_start)s AND event_time < %(window_end)s
+                  AND event_time >= '{ch_literal(window_start)}' AND event_time < '{ch_literal(window_end)}'
                   AND NOT has(anomaly_reasons, 'unusual_template_mix')
-            """, parameters={"source_ip": source_ip, "window_start": window_start, "window_end": window_end})
+            """, parameters={"source_ip": source_ip})
         except Exception:
             log.exception("Failed to tag events for flagged window %s @ %s", source_ip, window_start)

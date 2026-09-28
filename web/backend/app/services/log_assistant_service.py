@@ -25,6 +25,7 @@ import pathlib
 import httpx
 from opensearchpy import OpenSearch
 
+from app.core.ch_time import ch_literal
 from app.core.config import settings
 from app.schemas.log_assistant import AskResponse, LogAssistantQuery, LogHit
 
@@ -181,12 +182,12 @@ def _raw_data_exists(ch_client, query: LogAssistantQuery) -> int:
     if query.vendor:
         conditions.append("vendor = %(vendor)s")
         params["vendor"] = query.vendor
+    # start/end embedded as literals, not bound as query parameters -- see
+    # app/core/ch_time.py.
     if query.start:
-        conditions.append("event_time >= %(start)s")
-        params["start"] = query.start
+        conditions.append(f"event_time >= '{ch_literal(query.start)}'")
     if query.end:
-        conditions.append("event_time <= %(end)s")
-        params["end"] = query.end
+        conditions.append(f"event_time <= '{ch_literal(query.end)}'")
 
     result = ch_client.query(f"SELECT count() FROM syslog_ml.events WHERE {' AND '.join(conditions)}", parameters=params)
     return result.result_rows[0][0]

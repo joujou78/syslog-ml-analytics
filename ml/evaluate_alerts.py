@@ -24,6 +24,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 
+from ch_time import ch_literal
 from emailer import parse_recipients, send_email
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -72,15 +73,20 @@ def in_cooldown(rule, now):
     return (now - last).total_seconds() < rule["cooldown_minutes"] * 60
 
 
-def build_count_query(rule):
+def build_count_query(rule, start: datetime, end: datetime):
     """
     Same equality-filter shape as web/backend's log_search_service, just
     aggregated to a count + one sample message instead of full rows -- kept
     as its own small copy rather than a shared import since this script and
     the web backend are separate deployable units with separate Python
     environments (ml/requirements.txt vs web/backend/requirements.txt).
+
+    start/end are embedded as literals, not bound as query parameters --
+    see ch_time.py. This is the query that decides whether an alert rule
+    fires, so a silently wrong window boundary here isn't a cosmetic bug:
+    it's a missed or falsely-fired alert.
     """
-    conditions = ["event_time >= %(start)s", "event_time <= %(end)s"]
+    conditions = [f"event_time >= '{ch_literal(start)}'", f"event_time <= '{ch_literal(end)}'"]
     params = {}
     for field in _EQUALITY_FILTERS:
         value = rule.get(field)
@@ -140,9 +146,7 @@ def evaluate_rule(ch_client, pg_conn, rule, now):
         return
 
     window_start = now - timedelta(minutes=rule["window_minutes"])
-    query, params = build_count_query(rule)
-    params["start"] = window_start
-    params["end"] = now
+    query, params = build_count_query(rule, window_start, now)
 
     result = ch_client.query(query, parameters=params)
     matched_count, sample_message = result.result_rows[0]

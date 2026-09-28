@@ -5,6 +5,7 @@ from xml.sax.saxutils import escape
 
 from clickhouse_connect.driver.client import Client
 
+from app.core.ch_time import ch_literal
 from app.schemas.log_search import LogEntry, LogFilterOptions, LogSearchResponse
 
 DEFAULT_LOOKBACK = timedelta(hours=24)
@@ -62,8 +63,10 @@ def _build_conditions(
         "predicted_category": predicted_category,
     }
 
-    conditions = ["event_time >= %(start)s", "event_time <= %(end)s"]
-    params: dict = {"start": start, "end": end}
+    # start/end embedded as literals, not bound as query parameters -- see
+    # app/core/ch_time.py.
+    conditions = [f"event_time >= '{ch_literal(start)}'", f"event_time <= '{ch_literal(end)}'"]
+    params: dict = {}
 
     for field in _EQUALITY_FILTERS:
         value = filter_values[field]

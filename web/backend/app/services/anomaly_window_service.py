@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from clickhouse_connect.driver.client import Client
 
+from app.core.ch_time import ch_literal
 from app.schemas.anomaly_window import AnomalyWindowListResponse, AnomalyWindowRead
 
 DEFAULT_LOOKBACK = timedelta(hours=24)
@@ -39,8 +40,10 @@ def list_anomaly_windows(
     end = end or datetime.now(timezone.utc)
     start = start or (end - DEFAULT_LOOKBACK)
 
-    conditions = ["w.window_start >= %(start)s", "w.window_start <= %(end)s"]
-    params: dict = {"start": start, "end": end, "fetch_limit": limit + 1, "offset": offset}
+    # start/end embedded as literals, not bound as query parameters -- see
+    # app/core/ch_time.py.
+    conditions = [f"w.window_start >= '{ch_literal(start)}'", f"w.window_start <= '{ch_literal(end)}'"]
+    params: dict = {"fetch_limit": limit + 1, "offset": offset}
 
     if only_anomalies:
         conditions.append("w.is_anomaly = 1")

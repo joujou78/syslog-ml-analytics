@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from clickhouse_connect.driver.client import Client
 
+from app.core.ch_time import ch_literal
 from app.schemas.device import DeviceListResponse, DeviceRead, ResolutionSummary
 
 DEFAULT_WINDOW = "INTERVAL 1 DAY"
@@ -41,8 +42,10 @@ def list_devices(
     end = end or datetime.now(timezone.utc)
     start = start or (end - DEFAULT_LOOKBACK)
 
-    conditions = ["event_time >= %(start)s", "event_time <= %(end)s"]
-    params: dict = {"start": start, "end": end, "fetch_limit": limit + 1, "offset": offset}
+    # start/end embedded as literals, not bound as query parameters -- see
+    # app/core/ch_time.py.
+    conditions = [f"event_time >= '{ch_literal(start)}'", f"event_time <= '{ch_literal(end)}'"]
+    params: dict = {"fetch_limit": limit + 1, "offset": offset}
 
     if ip:
         conditions.append("positionCaseInsensitive(source_ip, %(ip)s) > 0")

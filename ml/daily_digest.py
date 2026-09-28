@@ -18,6 +18,7 @@ import clickhouse_connect
 import psycopg2
 import psycopg2.extras
 
+from ch_time import ch_literal
 from emailer import parse_recipients, send_email
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,25 +43,32 @@ DIGEST_EMAIL_RECIPIENTS = parse_recipients(
 
 
 def fetch_event_summary(ch_client, window_start: datetime, now: datetime) -> dict:
+    # window_start/now embedded as literals, not bound as query parameters
+    # -- see ch_time.py. Left as bound parameters, these three queries
+    # would silently under/over-count events right at the window's edges
+    # (root-caused via net-flow production data: clickhouse_connect's
+    # datetime parameter binding is unreliable against DateTime64(3)
+    # columns), which is exactly the kind of quietly-wrong number this
+    # digest exists to report accurately.
+    start_literal, end_literal = ch_literal(window_start), ch_literal(now)
+
     total = ch_client.query(
         f"SELECT count(), countIf(is_anomaly = 1) FROM {CLICKHOUSE_EVENTS_TABLE} "
-        f"WHERE event_time >= %(start)s AND event_time <= %(end)s",
-        parameters={"start": window_start, "end": now},
+        f"WHERE event_time >= '{start_literal}' AND event_time <= '{end_literal}'"
     ).result_rows[0]
 
     reasons = ch_client.query(
         f"SELECT reason, count() FROM ("
         f"  SELECT arrayJoin(anomaly_reasons) AS reason FROM {CLICKHOUSE_EVENTS_TABLE} "
-        f"  WHERE event_time >= %(start)s AND event_time <= %(end)s"
-        f") GROUP BY reason ORDER BY count() DESC",
-        parameters={"start": window_start, "end": now},
+        f"  WHERE event_time >= '{start_literal}' AND event_time <= '{end_literal}'"
+        f") GROUP BY reason ORDER BY count() DESC"
     ).result_rows
 
     top_devices = ch_client.query(
         f"SELECT source_ip, any(hostname) AS hostname, count() AS event_count "
-        f"FROM {CLICKHOUSE_EVENTS_TABLE} WHERE event_time >= %(start)s AND event_time <= %(end)s "
+        f"FROM {CLICKHOUSE_EVENTS_TABLE} WHERE event_time >= '{start_literal}' AND event_time <= '{end_literal}' "
         f"GROUP BY source_ip ORDER BY event_count DESC LIMIT %(n)s",
-        parameters={"start": window_start, "end": now, "n": DIGEST_TOP_DEVICES},
+        parameters={"n": DIGEST_TOP_DEVICES},
     ).result_rows
 
     return {

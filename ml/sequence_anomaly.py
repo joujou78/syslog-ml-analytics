@@ -69,7 +69,9 @@ import logging
 import os
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+
+from ch_time import ch_literal
 
 log = logging.getLogger("sequence_anomaly")
 
@@ -299,32 +301,27 @@ class SequenceAnomalyDetector:
         # need the same anomalous transition to have produced the same
         # curr_template in the first place).
         #
-        # A half-open [event_time, event_time+1ms) range, deliberately NOT
-        # `event_time = %(event_time)s` -- confirmed on net-flow (see
-        # log_assistant_indexer.py's _fetch_exact_timestamp for the full
-        # story) that clickhouse_connect's parameter binding for an exact
-        # equality comparison against a DateTime64(3) column never
-        # matches anything, even for a correct value. Silently meant this
+        # event_time is embedded as a literal, not bound as a query
+        # parameter -- see ch_time.py. An earlier version of this query
+        # used a bound parameter (`event_time = %(event_time)s`, then a
+        # half-open range after that alone was found broken) and both
+        # were still wrong: clickhouse_connect's datetime parameter
+        # binding was root-caused as unreliable against this column for
+        # multiple operators, not just `=`. That silently meant this
         # UPDATE never matched any row, ever -- unusual_transition was
         # computed and logged as "flagged" in this detector's own cycle
         # summary, but never actually written to events.anomaly_reasons.
-        # event_time has millisecond precision, so this range can only
-        # ever contain rows exactly at event_time, same as the equality
-        # check it replaces.
         try:
-            self.client.command("""
+            self.client.command(f"""
                 ALTER TABLE syslog_ml.events UPDATE
                     anomaly_reasons = arrayConcat(anomaly_reasons, ['unusual_transition']),
                     is_anomaly = 1
                 WHERE source_ip = %(source_ip)s
-                  AND event_time >= %(event_time)s
-                  AND event_time < %(event_time_next)s
+                  AND event_time = '{ch_literal(event_time)}'
                   AND template_id = %(curr_template)s
                   AND NOT has(anomaly_reasons, 'unusual_transition')
             """, parameters={
                 "source_ip": source_ip,
-                "event_time": event_time,
-                "event_time_next": event_time + timedelta(milliseconds=1),
                 "curr_template": curr_template,
             })
         except Exception:

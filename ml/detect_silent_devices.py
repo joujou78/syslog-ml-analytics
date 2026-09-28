@@ -41,6 +41,8 @@ import psycopg2
 import psycopg2.extras
 import requests
 
+from ch_time import ch_literal
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("detect_silent_devices")
 
@@ -82,6 +84,9 @@ def fetch_device_activity(ch_client, now: datetime):
     seen. Devices with too little history (SILENCE_MIN_BASELINE_EVENTS)
     are excluded here, not filtered in Python, so the threshold is one
     number instead of two things that could drift apart."""
+    # window_start embedded as a literal, not bound as a query parameter --
+    # see ch_time.py.
+    window_start = ch_literal(now - timedelta(days=SILENCE_BASELINE_WINDOW_DAYS))
     query = f"""
         SELECT
             source_ip,
@@ -90,17 +95,11 @@ def fetch_device_activity(ch_client, now: datetime):
             min(event_time) AS first_seen,
             max(event_time) AS last_seen
         FROM {CLICKHOUSE_EVENTS_TABLE}
-        WHERE event_time >= %(window_start)s
+        WHERE event_time >= '{window_start}'
         GROUP BY source_ip
         HAVING event_count >= %(min_events)s
     """
-    result = ch_client.query(
-        query,
-        parameters={
-            "window_start": now - timedelta(days=SILENCE_BASELINE_WINDOW_DAYS),
-            "min_events": SILENCE_MIN_BASELINE_EVENTS,
-        },
-    )
+    result = ch_client.query(query, parameters={"min_events": SILENCE_MIN_BASELINE_EVENTS})
     return [
         dict(zip(["source_ip", "hostname", "event_count", "first_seen", "last_seen"], row))
         for row in result.result_rows
