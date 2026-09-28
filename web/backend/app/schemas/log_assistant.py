@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LogAssistantQuery(BaseModel):
@@ -14,6 +14,21 @@ class LogAssistantQuery(BaseModel):
     start: datetime | None = None
     end: datetime | None = None
     limit: int = Field(default=10, ge=1, le=50)
+
+    @model_validator(mode="after")
+    def _validate_time_range(self):
+        # Confirmed in real use: a mis-set end-before-start range (e.g. a
+        # date picker's month rolling over between filling in the two
+        # fields) doesn't error -- it silently becomes a ClickHouse/
+        # OpenSearch range filter that can never match anything
+        # (event_time >= later-timestamp AND event_time <= earlier-
+        # timestamp), producing the exact same "No related log lines were
+        # found" as a genuine empty result, with nothing to tell them
+        # apart. Rejecting it outright at the API boundary is cheap and
+        # removes that entire failure mode.
+        if self.start and self.end and self.end < self.start:
+            raise ValueError("end must not be before start")
+        return self
 
 
 class LogHit(BaseModel):
@@ -40,6 +55,13 @@ class LogHit(BaseModel):
 
 class SemanticSearchResponse(BaseModel):
     items: list[LogHit]
+    # Set only when `items` is empty AND matching raw rows exist in
+    # ClickHouse for the same source_ip/vendor/time filters -- see
+    # log_assistant_service.py's build_coverage_note. Distinguishes
+    # "genuinely nothing happened" from "it happened but the Log
+    # Assistant indexer hasn't embedded it yet", which look identical
+    # from an empty `items` list alone.
+    coverage_note: str | None = None
 
 
 class AskResponse(BaseModel):

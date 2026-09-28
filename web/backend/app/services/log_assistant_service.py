@@ -152,6 +152,66 @@ async def semantic_search(os_client: OpenSearch, query: LogAssistantQuery) -> li
     return [_hit_to_log_hit(hit) for hit in result["hits"]["hits"]]
 
 
+def _raw_data_exists(ch_client, query: LogAssistantQuery) -> int:
+    """Cheap existence check against syslog_ml.events using the same
+    structural filters as the OpenSearch query (source_ip/vendor/time
+    range), ignoring the free-text question entirely -- ClickHouse does
+    exact matching, not semantic search, so this only answers "does
+    anything matching these filters exist at all", not "is it relevant".
+    That's exactly what's needed to disambiguate an empty OpenSearch
+    result: if this comes back > 0, the raw data exists but the Log
+    Assistant indexer hasn't embedded it yet (see README's "Log
+    Assistant" section on its checkpoint) -- confirmed multiple times in
+    real use, where "No related log lines were found" looked identical
+    for that case and for a genuinely quiet window.
+
+    Only runs when at least one narrow filter is present (source_ip, or a
+    bounded start+end range) -- an unfiltered question with zero
+    OpenSearch hits never triggers a full, unbounded table scan just to
+    explain the empty result.
+    """
+    if not query.source_ip and not (query.start and query.end):
+        return 0
+
+    conditions = []
+    params: dict = {}
+    if query.source_ip:
+        conditions.append("source_ip = %(source_ip)s")
+        params["source_ip"] = query.source_ip
+    if query.vendor:
+        conditions.append("vendor = %(vendor)s")
+        params["vendor"] = query.vendor
+    if query.start:
+        conditions.append("event_time >= %(start)s")
+        params["start"] = query.start
+    if query.end:
+        conditions.append("event_time <= %(end)s")
+        params["end"] = query.end
+
+    result = ch_client.query(f"SELECT count() FROM syslog_ml.events WHERE {' AND '.join(conditions)}", parameters=params)
+    return result.result_rows[0][0]
+
+
+async def build_coverage_note(ch_client, query: LogAssistantQuery, hits: list[LogHit]) -> str | None:
+    if hits:
+        return None
+    try:
+        raw_count = await asyncio.to_thread(_raw_data_exists, ch_client, query)
+    except Exception:
+        # Best-effort diagnostic only -- a ClickHouse hiccup here must
+        # never break the actual search/ask response over a nice-to-have
+        # explanation for why it came back empty.
+        log.exception("Coverage-note ClickHouse check failed, omitting the note")
+        return None
+    if raw_count == 0:
+        return None
+    return (
+        f"{raw_count} matching log line(s) exist in ClickHouse for this filter, but haven't been "
+        "indexed for semantic search yet -- check Log Search for the raw data, or see README's "
+        "\"Log Assistant\" section on the indexer's checkpoint."
+    )
+
+
 # A syslog `message` field has no length guarantee -- most are short, but a
 # device is free to log something huge (a stack trace, a base64/hex dump, a
 # verbose multi-line payload) in one line, and nothing upstream of this
@@ -173,8 +233,13 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _build_prompt(question: str, hits: list[LogHit]) -> str:
-    if not hits:
-        return f"Question: {question}\n\nNo related log lines were found in the index."
+    # hits is guaranteed non-empty here -- ask() returns early, without
+    # calling this at all, the moment semantic_search() comes back empty
+    # (see _NO_HITS_ANSWER below). Asking the LLM to "explain" a genuinely
+    # empty context produced nothing but generic, contentless filler in
+    # every real case observed ("I couldn't find any information..."),
+    # for the cost of a full CPU-bound generation call -- worth skipping
+    # outright rather than prompting around it.
     lines = [
         f"- [{h.event_time.isoformat()}] {h.hostname} ({h.vendor}) {h.severity}/{h.program}: "
         f"{_truncate(h.message, _MAX_MESSAGE_CHARS_IN_PROMPT)}"
@@ -208,8 +273,18 @@ def _post_chat_sync(url: str, payload: dict, timeout: float) -> dict:
         return response.json()
 
 
-async def ask(os_client: OpenSearch, query: LogAssistantQuery) -> AskResponse:
+_NO_HITS_ANSWER = (
+    "No related log lines were found in the index for this question/filter -- nothing to "
+    "synthesize an answer from, so the local LLM wasn't invoked (it would only produce a "
+    "generic non-answer with no real log content to ground it)."
+)
+
+
+async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> AskResponse:
     hits = await semantic_search(os_client, query)
+    if not hits:
+        note = await build_coverage_note(ch_client, query, hits)
+        return AskResponse(answer=note or _NO_HITS_ANSWER, sources=[], model="(no data -- LLM not invoked)")
     prompt = _build_prompt(query.question, hits)
     # Also folding the system prompt into the one user message rather than
     # a separate system-role message -- a second, independent finding from

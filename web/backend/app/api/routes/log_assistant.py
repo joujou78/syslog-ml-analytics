@@ -1,11 +1,12 @@
 import logging
 
 import httpx
+from clickhouse_connect.driver.client import Client
 from fastapi import APIRouter, Depends, HTTPException, status
 from opensearchpy import OpenSearch
 from opensearchpy.exceptions import OpenSearchException
 
-from app.api.deps import get_current_user, get_os_client
+from app.api.deps import get_ch_client, get_current_user, get_os_client
 from app.schemas.log_assistant import AskResponse, LogAssistantQuery, SemanticSearchResponse
 from app.services import log_assistant_service
 
@@ -53,12 +54,14 @@ async def search(
     payload: LogAssistantQuery,
     _user=_authenticated,
     os_client: OpenSearch = Depends(get_os_client),
+    ch_client: Client = Depends(get_ch_client),
 ):
     try:
         items = await log_assistant_service.semantic_search(os_client, payload)
+        coverage_note = await log_assistant_service.build_coverage_note(ch_client, payload, items)
     except _UPSTREAM_ERRORS as exc:
         raise _upstream_error(exc)
-    return SemanticSearchResponse(items=items)
+    return SemanticSearchResponse(items=items, coverage_note=coverage_note)
 
 
 @router.post("/ask", response_model=AskResponse)
@@ -66,8 +69,9 @@ async def ask(
     payload: LogAssistantQuery,
     _user=_authenticated,
     os_client: OpenSearch = Depends(get_os_client),
+    ch_client: Client = Depends(get_ch_client),
 ):
     try:
-        return await log_assistant_service.ask(os_client, payload)
+        return await log_assistant_service.ask(os_client, ch_client, payload)
     except _UPSTREAM_ERRORS as exc:
         raise _upstream_error(exc)

@@ -52,9 +52,14 @@ function logSearchLink(hit: LogHit) {
   return `/logs?${params.toString()}`
 }
 
-function SourcesTable({ sources }: { sources: LogHit[] }) {
+function SourcesTable({ sources, coverageNote }: { sources: LogHit[]; coverageNote: string | null }) {
   if (sources.length === 0) {
-    return <p className="page-hint">No related log lines were found.</p>
+    // coverageNote (see log_assistant_service.py's build_coverage_note)
+    // distinguishes "genuinely nothing happened" from "it happened but
+    // the indexer hasn't embedded it yet" -- both looked identical as a
+    // bare "No related log lines were found" before this existed,
+    // confirmed as a recurring point of confusion in real use.
+    return <p className="page-hint">{coverageNote ?? 'No related log lines were found.'}</p>
   }
   return (
     <table className="data-table">
@@ -105,6 +110,7 @@ export function LogAssistant() {
   const [answer, setAnswer] = useState<string | null>(null)
   const [model, setModel] = useState<string | null>(null)
   const [sources, setSources] = useState<LogHit[] | null>(null)
+  const [coverageNote, setCoverageNote] = useState<string | null>(null)
   const [loading, setLoading] = useState<'ask' | 'search' | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -117,12 +123,31 @@ export function LogAssistant() {
     return query
   }
 
+  // Catches an inverted range (end before start) immediately, client-side,
+  // rather than waiting on a round trip -- the backend also rejects this
+  // (see LogAssistantQuery's _validate_time_range), since a client-only
+  // check can't be trusted as the sole guard, but a round trip for
+  // something this checkable is pure friction. Confirmed in real use: an
+  // inverted range doesn't error the old way, it silently becomes a query
+  // that can never match anything, indistinguishable from a genuinely
+  // empty result.
+  function invalidRange(): string | null {
+    if (start && end && end < start) return 'End must not be before start.'
+    return null
+  }
+
   function runAsk(e?: React.FormEvent) {
     e?.preventDefault()
     if (!question.trim()) return
+    const rangeError = invalidRange()
+    if (rangeError) {
+      setError(rangeError)
+      return
+    }
     setLoading('ask')
     setError(null)
     setAnswer(null)
+    setCoverageNote(null)
     logAssistantApi
       .ask(currentQuery())
       .then((res) => {
@@ -136,12 +161,20 @@ export function LogAssistant() {
 
   function runSearchOnly() {
     if (!question.trim()) return
+    const rangeError = invalidRange()
+    if (rangeError) {
+      setError(rangeError)
+      return
+    }
     setLoading('search')
     setError(null)
     setAnswer(null)
     logAssistantApi
       .search(currentQuery())
-      .then((res) => setSources(res.items))
+      .then((res) => {
+        setSources(res.items)
+        setCoverageNote(res.coverage_note)
+      })
       .catch((err) => setError(extractErrorMessage(err, logAssistantErrorFallback(err))))
       .finally(() => setLoading(null))
   }
@@ -216,7 +249,7 @@ export function LogAssistant() {
       {sources && (
         <>
           <h3>{answer ? 'Cited log lines' : 'Matching log lines'}</h3>
-          <SourcesTable sources={sources} />
+          <SourcesTable sources={sources} coverageNote={coverageNote} />
         </>
       )}
     </div>

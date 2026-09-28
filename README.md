@@ -1253,6 +1253,39 @@ AI" deep links were verified in a real browser. Check both services' own
 logs (`journalctl -u opensearch`, `journalctl -u ollama`, `journalctl -u
 syslog-ml-log-assistant-indexer`) if anything doesn't work as expected.
 
+**"No related log lines were found" doesn't always mean nothing happened.**
+Confirmed repeatedly in real use as a source of confusion: this exact
+message showed for three different reasons that all look identical from
+an empty result alone -- an unfiltered question matching across every
+device instead of the one asked about, `ml/log_assistant_indexer.py`
+simply not having caught up to a recent or historical time window yet
+(see its checkpoint file), and an inverted date range (end before start)
+silently becoming a filter that can never match anything. Two of these
+are now handled directly:
+
+- **An inverted range is rejected outright** (`LogAssistantQuery`'s
+  `_validate_time_range`) rather than silently searching nothing.
+- **`coverage_note`** (in `/log-assistant/search`'s response, shown in
+  place of the generic message): when OpenSearch returns zero hits but a
+  cheap ClickHouse existence check on the same source_ip/vendor/time
+  filters finds matching raw rows, it says so explicitly instead of
+  leaving "was there really nothing, or is it just not indexed yet?"
+  unanswered. Only runs when a narrow filter (source_ip, or a bounded
+  start+end range) is present, so an unfiltered question never triggers
+  an unbounded table scan just to explain its own empty result.
+- **`ask()` skips the LLM call entirely when there are no hits** --
+  confirmed in real use that asking the model to explain an empty
+  context produces nothing but generic filler ("I couldn't find any
+  information...") for the cost of a full CPU-bound generation call. It
+  returns the `coverage_note` (or a plain no-data message) directly as
+  the answer instead.
+
+The empty-source_ip-causes-cross-device-mixing case isn't code-fixable in
+the same way -- it's a real design tradeoff (an unfiltered question
+searches everything on purpose, for "what's going on across the whole
+network" questions), so the fix there is just remembering to set Source
+IP when asking about one specific device.
+
 ## Step 8 — deploying updates
 
 `deploy.sh` (repo root) is the standard way to deploy any future change:

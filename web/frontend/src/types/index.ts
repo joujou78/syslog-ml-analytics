@@ -291,6 +291,7 @@ export interface LogHit {
 
 export interface SemanticSearchResponse {
   items: LogHit[]
+  coverage_note: string | null
 }
 
 export interface AskResponse {
