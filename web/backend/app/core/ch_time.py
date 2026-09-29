@@ -30,13 +30,31 @@ from datetime import datetime, timezone
 
 
 def ch_literal(dt: datetime) -> str:
-    """'YYYY-MM-DD HH:MM:SS.mmm' -- millisecond precision (matching
-    DateTime64(3)'s own on-disk precision, see clickhouse/init.sql) and no
-    timezone suffix (this project treats every timestamp as UTC
-    throughout -- confirmed via `SELECT timezone()` on net-flow: Etc/UTC).
-    A tz-aware `dt` is converted to UTC first so an accidental non-UTC
-    value still lands in the column correctly rather than silently
-    shifting."""
+    """'YYYY-MM-DD HH:MM:SS.mmm' -- millisecond precision, for a
+    DateTime64(3) column (matching its own on-disk precision, see
+    clickhouse/init.sql's `events` table) and no timezone suffix (this
+    project treats every timestamp as UTC throughout -- confirmed via
+    `SELECT timezone()` on net-flow: Etc/UTC). A tz-aware `dt` is
+    converted to UTC first so an accidental non-UTC value still lands in
+    the column correctly rather than silently shifting.
+
+    Do NOT use this for a plain DateTime column (second precision, no
+    fractional part -- e.g. device_window_anomalies.window_start):
+    confirmed on net-flow that ClickHouse's DateTime type rejects a
+    literal string with a '.mmm' suffix outright (`Cannot convert string
+    '...' to type DateTime`, TYPE_MISMATCH) rather than truncating it --
+    use `ch_literal_seconds()` for those instead."""
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def ch_literal_seconds(dt: datetime) -> str:
+    """'YYYY-MM-DD HH:MM:SS' -- second precision, no fractional part, for
+    a plain DateTime column. See ch_literal()'s docstring for why this is
+    a separate function rather than one that always includes fractional
+    seconds: a plain DateTime column errors on the '.mmm' form instead of
+    tolerating/truncating it."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")

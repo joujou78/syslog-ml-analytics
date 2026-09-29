@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from clickhouse_connect.driver.client import Client
 
-from app.core.ch_time import ch_literal
+from app.core.ch_time import ch_literal_seconds
 from app.schemas.anomaly_window import AnomalyWindowListResponse, AnomalyWindowRead
 
 DEFAULT_LOOKBACK = timedelta(hours=24)
@@ -41,8 +41,17 @@ def list_anomaly_windows(
     start = start or (end - DEFAULT_LOOKBACK)
 
     # start/end embedded as literals, not bound as query parameters -- see
-    # app/core/ch_time.py.
-    conditions = [f"w.window_start >= '{ch_literal(start)}'", f"w.window_start <= '{ch_literal(end)}'"]
+    # app/core/ch_time.py. window_start is a plain DateTime (second
+    # precision, see clickhouse/init.sql's device_window_anomalies table),
+    # NOT DateTime64(3) like events.event_time -- ch_literal_seconds(),
+    # not ch_literal(), or ClickHouse rejects the literal outright
+    # (confirmed on net-flow: `Cannot convert string '...' to type
+    # DateTime`, TYPE_MISMATCH -- a plain DateTime doesn't tolerate a
+    # '.mmm' fractional suffix at all).
+    conditions = [
+        f"w.window_start >= '{ch_literal_seconds(start)}'",
+        f"w.window_start <= '{ch_literal_seconds(end)}'",
+    ]
     params: dict = {"fetch_limit": limit + 1, "offset": offset}
 
     if only_anomalies:
