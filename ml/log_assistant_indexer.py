@@ -78,6 +78,23 @@ OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "60"))
 OLLAMA_EMBED_NUM_THREAD = int(os.environ.get("OLLAMA_EMBED_NUM_THREAD", "2"))
 
 BATCH_SIZE = int(os.environ.get("INDEXER_BATCH_SIZE", "200"))
+# Bounds how many rows go into a single Ollama /api/embed call, separate
+# from BATCH_SIZE (which bounds how many rows are FETCHED per cycle).
+# Needed because _fetch_exact_timestamp's fallback (see its own
+# docstring) is deliberately unbounded by row count -- correctness there
+# requires capturing every row sharing a tied received_at value before
+# the checkpoint can advance past it, but nothing requires embedding
+# them all in one HTTP call. Confirmed on net-flow: a single tie 291
+# rows wide reliably exceeded OLLAMA_TIMEOUT_SECONDS (300s at this
+# host's real throughput) even after lowering INDEXER_BATCH_SIZE to
+# 50 -- BATCH_SIZE has NO effect on a tie's size once it's wider than
+# BATCH_SIZE+1, since _fetch_exact_timestamp always returns the full
+# tie regardless of BATCH_SIZE. _index_batch below chunks the embed
+# calls at this size instead, so an arbitrarily wide tie is handled
+# correctly (each chunk finishes well within the timeout) rather than
+# needing OLLAMA_TIMEOUT_SECONDS raised to cover a worst case that could
+# always, in principle, get wider still.
+EMBED_CHUNK_SIZE = int(os.environ.get("INDEXER_EMBED_CHUNK_SIZE", "50"))
 # Deliberately short, not "batch efficiently every so often" -- the point of
 # this being a separate process from consumer.py (see this module's own
 # docstring) is that embedding latency never touches the hot ingest path,
@@ -240,7 +257,10 @@ def _fetch_exact_timestamp(client, ts: datetime) -> list[dict]:
     (up to BATCH_SIZE there, default 500) can land with the identical
     millisecond timestamp. A tie's size is bounded by that pipeline's own
     batch size, not by traffic volume in general, so an unbounded query
-    here is fine.
+    here is fine -- confirmed a real tie of 291 rows on net-flow, well
+    within that ~500 bound. Fetching it all in one query is fine
+    regardless; see EMBED_CHUNK_SIZE for why _index_batch no longer
+    embeds it all in one Ollama call.
 
     Plain `received_at = '<literal>'`, not a bound parameter -- an earlier
     version of this function used a bound parameter for the comparison
@@ -288,7 +308,13 @@ def _trim_ambiguous_tail(client, rows: list[dict]) -> list[dict]:
 
 def _index_batch(os_client: OpenSearch, rows: list[dict]) -> datetime:
     texts = [_embedding_text(row) for row in rows]
-    embeddings = _embed_batch(texts)
+    # Chunked, not one call for the whole (possibly tie-widened, see
+    # EMBED_CHUNK_SIZE above) `rows` -- keeps each individual Ollama
+    # request's duration bounded regardless of how many rows this cycle
+    # fetched.
+    embeddings: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_CHUNK_SIZE):
+        embeddings.extend(_embed_batch(texts[i:i + EMBED_CHUNK_SIZE]))
 
     actions = []
     for row, text, embedding in zip(rows, texts, embeddings):
