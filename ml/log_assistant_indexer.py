@@ -124,6 +124,30 @@ CHECKPOINT_FILE = os.environ.get(
 # are anomaly-focused already, not general log browsing).
 INDEXER_ANOMALIES_ONLY = os.environ.get("INDEXER_ANOMALIES_ONLY", "false").lower() == "true"
 
+# How far behind `now()` this indexer stays on purpose, so retroactive
+# anomaly tagging has time to land before a row's checkpoint window
+# closes for good. unusual_template_mix and unusual_transition (see
+# template_mix_anomaly.py / sequence_anomaly.py) don't know a row is
+# anomalous at insert time -- they can only score it after a full
+# window/transition is complete, then retroactively `ALTER TABLE UPDATE`
+# is_anomaly on rows that already exist. This indexer's checkpoint only
+# ever moves forward and never re-reads a row once it's passed -- so
+# under INDEXER_ANOMALIES_ONLY, a row this indexer's fetch saw (and
+# excluded, correctly, per its is_anomaly value AT THAT MOMENT) before
+# the retroactive tag landed is gone from semantic search forever, not
+# just delayed. Confirmed on net-flow once the indexer caught up to
+# near-real-time (~10s behind `now()`): a device's flagged
+# unusual_template_mix window was, by the time anyone asked about it,
+# already is_anomaly=1 in ClickHouse for every one of its rows -- yet
+# never made it into the index, because the indexer's own near-zero lag
+# meant it always fetched (and excluded) those rows before either
+# detector's own cycle (REFRESH_SECONDS=900 by default) got a chance to
+# tag them. 20 minutes covers each detector's worst case: a REFRESH_SECONDS
+# cycle just missing a just-closed window/transition, plus (for
+# template-mix specifically) up to WINDOW_MINUTES more before that window
+# even counts as closed.
+INDEXER_LAG_MINUTES = int(os.environ.get("INDEXER_LAG_MINUTES", "20"))
+
 # Opt-in, default off: during a large backfill (e.g. after a checkpoint
 # reset), run_cycle's inner while-loop below fetches and embeds batch after
 # batch back-to-back with no pause between them -- POLL_SECONDS only applies
@@ -232,6 +256,11 @@ def _fetch_batch(client, checkpoint: datetime | None) -> list[dict]:
         # The first batch's own max(received_at) becomes the checkpoint, so
         # every later cycle takes the `checkpoint is not None` branch above.
         condition = f"received_at >= now() - INTERVAL {BACKFILL_DAYS} DAY"
+    # Upper bound too, not just the lower one -- see INDEXER_LAG_MINUTES.
+    # Deliberately keeps this indexer from ever fetching (and, under
+    # INDEXER_ANOMALIES_ONLY, permanently excluding) a row before
+    # retroactive anomaly tagging has had time to land on it.
+    condition += f" AND received_at <= now() - INTERVAL {INDEXER_LAG_MINUTES} MINUTE"
     condition += _anomaly_clause()
 
     query = f"""
