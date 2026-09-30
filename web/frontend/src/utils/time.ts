@@ -41,14 +41,23 @@ function toDatetimeLocalUtc(date: Date): string {
   return date.toISOString().slice(0, 16)
 }
 
-// Pads a single instant (e.g. an anomaly window's start) into a
-// {start, end} range around it, for "Explain with AI" links that need more
-// surrounding context than the flagged instant alone -- an LLM asked about
-// one bare timestamp has nothing to reason over.
+// Pads a single instant (e.g. an anomaly window's start, or a reason's
+// last_seen) into a {start, end} range around it, for "Explain with AI"
+// links that need more surrounding context than the flagged instant alone
+// -- an LLM asked about one bare timestamp has nothing to reason over.
+//
+// `end` is clamped to now: for a still-recent/ongoing anomaly (last_seen or
+// window_start within `afterMinutes` of the current time -- the exact case
+// an analyst most wants "Explain" to work for), the un-clamped end would
+// land in the future. Confirmed in practice: a device last seen logging an
+// anomaly 5 minutes ago, padded +15 minutes, produced a query window ending
+// 10 minutes from now -- guaranteed to find nothing (there's no data yet
+// for a time that hasn't happened), independent of anything the indexer
+// does or doesn't have caught up on.
 export function padWindow(iso: string, beforeMinutes: number, afterMinutes: number): { start: string; end: string } {
   const center = toUtcDate(iso)
   const start = new Date(center.getTime() - beforeMinutes * 60_000)
-  const end = new Date(center.getTime() + afterMinutes * 60_000)
+  const end = new Date(Math.min(center.getTime() + afterMinutes * 60_000, Date.now()))
   return { start: toDatetimeLocalUtc(start), end: toDatetimeLocalUtc(end) }
 }
 
