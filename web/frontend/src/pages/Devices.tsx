@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { devicesApi } from '../api/devices'
 import type { Device, DeviceSearchFilters, ResolutionSummary } from '../types'
-import { formatBeirutDateTime, formatBeirutTime } from '../utils/time'
+import { formatBeirutDateTime, formatBeirutTime, fromDatetimeLocalBeirut, toDatetimeLocalBeirut } from '../utils/time'
 
 const RESOLUTION_LABEL: Record<string, string> = {
   snmp: 'Verified (SNMP)',
@@ -115,12 +115,20 @@ export function Devices() {
             <input type="text" value={pendingFilters.vendor ?? ''} onChange={(e) => updateField('vendor', e.target.value)} />
           </label>
           <label>
-            Start
-            <input type="datetime-local" value={pendingFilters.start ?? ''} onChange={(e) => updateField('start', e.target.value)} />
+            Start (Beirut time)
+            <input
+              type="datetime-local"
+              value={pendingFilters.start ? toDatetimeLocalBeirut(pendingFilters.start) : ''}
+              onChange={(e) => updateField('start', e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
           <label>
-            End
-            <input type="datetime-local" value={pendingFilters.end ?? ''} onChange={(e) => updateField('end', e.target.value)} />
+            End (Beirut time)
+            <input
+              type="datetime-local"
+              value={pendingFilters.end ? toDatetimeLocalBeirut(pendingFilters.end) : ''}
+              onChange={(e) => updateField('end', e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
         </div>
         <div className="form-actions">

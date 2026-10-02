@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { logsApi } from '../api/logs'
 import type { LogEntry, LogFilterOptions, LogSearchFilters } from '../types'
-import { formatBeirutDateTime, formatBeirutTime } from '../utils/time'
+import { formatBeirutDateTime, formatBeirutTime, fromDatetimeLocalBeirut, toDatetimeLocalBeirut } from '../utils/time'
 
 type StringFilterKey =
   | 'start' | 'end' | 'hostname' | 'source_ip' | 'vendor' | 'program' | 'severity' | 'predicted_category'
@@ -261,12 +261,20 @@ export function Logs() {
             />
           </label>
           <label>
-            Start
-            <input type="datetime-local" value={pendingFilters.start ?? ''} onChange={(e) => updateField('start', e.target.value)} />
+            Start (Beirut time)
+            <input
+              type="datetime-local"
+              value={pendingFilters.start ? toDatetimeLocalBeirut(pendingFilters.start) : ''}
+              onChange={(e) => updateField('start', e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
           <label>
-            End
-            <input type="datetime-local" value={pendingFilters.end ?? ''} onChange={(e) => updateField('end', e.target.value)} />
+            End (Beirut time)
+            <input
+              type="datetime-local"
+              value={pendingFilters.end ? toDatetimeLocalBeirut(pendingFilters.end) : ''}
+              onChange={(e) => updateField('end', e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
           <label>
             Anomalies only

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { anomalyWindowsApi } from '../api/anomalyWindows'
 import type { AnomalyWindow, AnomalyWindowFilters } from '../types'
-import { formatBeirutDateTime, padWindow } from '../utils/time'
+import { formatBeirutDateTime, fromDatetimeLocalBeirut, padWindow, toDatetimeLocalBeirut } from '../utils/time'
 
 // +/- padding around the flagged 5-minute window itself -- an LLM asked
 // about one bare window has nothing to reason over; the surrounding
@@ -104,12 +104,20 @@ export function AnomalyWindows() {
             <input type="text" value={pendingFilters.vendor ?? ''} onChange={(e) => updateField('vendor', e.target.value)} />
           </label>
           <label>
-            Start
-            <input type="datetime-local" value={pendingFilters.start ?? ''} onChange={(e) => updateField('start', e.target.value)} />
+            Start (Beirut time)
+            <input
+              type="datetime-local"
+              value={pendingFilters.start ? toDatetimeLocalBeirut(pendingFilters.start) : ''}
+              onChange={(e) => updateField('start', e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
           <label>
-            End
-            <input type="datetime-local" value={pendingFilters.end ?? ''} onChange={(e) => updateField('end', e.target.value)} />
+            End (Beirut time)
+            <input
+              type="datetime-local"
+              value={pendingFilters.end ? toDatetimeLocalBeirut(pendingFilters.end) : ''}
+              onChange={(e) => updateField('end', e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
           <label>
             Show

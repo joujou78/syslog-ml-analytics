@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { logAssistantApi } from '../api/logAssistant'
 import type { LogAssistantQuery, LogHit } from '../types'
 import { extractErrorMessage } from '../utils/errors'
-import { formatBeirutDateTime } from '../utils/time'
+import { formatBeirutDateTime, fromDatetimeLocalBeirut, toDatetimeLocalBeirut } from '../utils/time'
 
 // extractErrorMessage's fallback only ever fires when the backend's own
 // response has no JSON `detail` (see errors.ts) -- for OpenSearch/Ollama
@@ -219,12 +219,20 @@ export function LogAssistant() {
             <input type="text" value={vendor} onChange={(e) => setVendor(e.target.value)} />
           </label>
           <label>
-            Start
-            <input type="datetime-local" value={start} onChange={(e) => setStart(e.target.value)} />
+            Start (Beirut time)
+            <input
+              type="datetime-local"
+              value={start ? toDatetimeLocalBeirut(start) : ''}
+              onChange={(e) => setStart(e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
           <label>
-            End
-            <input type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} />
+            End (Beirut time)
+            <input
+              type="datetime-local"
+              value={end ? toDatetimeLocalBeirut(end) : ''}
+              onChange={(e) => setEnd(e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+            />
           </label>
         </div>
         <div className="form-actions">

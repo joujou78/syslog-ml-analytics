@@ -41,6 +41,50 @@ function toDatetimeLocalUtc(date: Date): string {
   return date.toISOString().slice(0, 16)
 }
 
+// The Asia/Beirut UTC offset (in minutes, Beirut minus UTC) that applies
+// at the given instant -- not a fixed constant, since Lebanon observes
+// DST, so the offset shifts across the year.
+function beirutOffsetMinutes(instant: Date): number {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: BEIRUT_TZ, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  })
+  const parts: Record<string, string> = {}
+  for (const part of dtf.formatToParts(instant)) parts[part.type] = part.value
+  // Some runtimes render midnight as hour '24' under hour12: false --
+  // normalize so Date.UTC doesn't silently roll into the next day.
+  const hour = parts.hour === '24' ? '00' : parts.hour
+  const asIfUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +hour, +parts.minute, +parts.second)
+  return Math.round((asIfUtc - instant.getTime()) / 60_000)
+}
+
+// Converts a UTC instant (from the API/URL) into the "YYYY-MM-DDTHH:MM"
+// string a <input type="datetime-local"> needs to display it as Beirut
+// local time -- the filter-bar counterpart to formatBeirutDateTime's
+// read-only display. Added after a real mix-up: Log Assistant's Start/End
+// inputs showed raw UTC with no label while its own "Cited log lines"
+// table showed Beirut local time, making a correct query look 3 hours
+// off at a glance. Log Search, Devices, and Anomaly Windows' filter bars
+// had the identical gap -- fixed the same way, not just on that one page.
+export function toDatetimeLocalBeirut(iso: string): string {
+  const instant = toUtcDate(iso)
+  const shifted = new Date(instant.getTime() + beirutOffsetMinutes(instant) * 60_000)
+  return shifted.toISOString().slice(0, 16)
+}
+
+// The inverse: a <input type="datetime-local">'s value (entered as Beirut
+// local wall-clock time) back to the UTC "YYYY-MM-DDTHH:MM" string the
+// API/URL actually expects. The offset is looked up using the typed value
+// itself as the reference instant -- the only way this could be off is a
+// value that falls exactly within a DST transition's lost/repeated hour,
+// which this UI has no way to disambiguate either.
+export function fromDatetimeLocalBeirut(value: string): string {
+  const naive = new Date(`${value}:00Z`)
+  const actual = new Date(naive.getTime() - beirutOffsetMinutes(naive) * 60_000)
+  return actual.toISOString().slice(0, 16)
+}
+
 // Pads a single instant (e.g. an anomaly window's start, or a reason's
 // last_seen) into a {start, end} range around it, for "Explain with AI"
 // links that need more surrounding context than the flagged instant alone
