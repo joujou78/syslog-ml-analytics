@@ -469,7 +469,18 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     # re-verified for a tool-calling request specifically (no live Ollama
     # in this sandbox) -- if agent responses hang where plain "ask" didn't
     # used to, a system-role message is the first thing to rule back in.
-    opening = f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\n---\n\nQuestion: {query.question}"
+    # The model has no system clock -- confirmed on net-flow: asked "this
+    # week", it called list_devices with start=2024-10-01 (not even the
+    # right year), an arbitrary guess rather than an actual last-7-days
+    # window. Happened to still name the right device only because that
+    # device has dominated event counts across the whole guessed range --
+    # a time-relative question is not safe to trust without this anchor.
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    opening = (
+        f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\nThe current date/time is {now_utc} UTC -- "
+        f"use this, not your training data, to resolve 'today'/'this week'/'yesterday'/etc. into "
+        f"actual start/end tool arguments.\n\n---\n\nQuestion: {query.question}"
+    )
     if query.source_ip or query.vendor or query.start or query.end:
         opening += (
             f"\n\n(The user also set these filters as a starting hint -- a tool call that honors "
