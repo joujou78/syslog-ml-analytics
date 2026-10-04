@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 import pathlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from clickhouse_connect.driver.client import Client
@@ -301,13 +301,12 @@ _AGENT_INSTRUCTIONS = (
     "with/related to <topic>' questions where you don't have an exact keyword to filter on. Once a "
     "tool's result answers the question, give a plain, direct final answer in your own words -- do "
     "not call another tool after that, and do not call the same tool twice with the same arguments.\n\n"
-    "Time ranges: a tool's start/end must always span a real range, NEVER the same value for both -- "
-    "a start equal to end searches zero seconds of time and will always come back empty, which is "
-    "wrong, not 'no data'. Using the current date/time given below: 'today' = start at 00:00:00 on "
-    "the current date, end = the current date/time. 'yesterday' = start at 00:00:00 the day before, "
-    "end at 23:59:59 that same day. 'this week'/'past week' = start 7 days before the current date/"
-    "time, end = the current date/time. If a question has no time period at all, omit start/end "
-    "entirely rather than guessing a narrow one."
+    "Time ranges: below is a list of exact start/end values already computed for you, one per common "
+    "phrase -- COPY the pair matching the question's time period character-for-character into a "
+    "tool's start/end arguments. Do NOT compute a date yourself by adding/subtracting days -- "
+    "confirmed unreliable in testing (e.g. 'this week' was miscomputed as next week, a future date, "
+    "because the arithmetic came out backwards). If the question has no time period at all, omit "
+    "start/end entirely rather than guessing one."
 )
 
 TOOL_DEFINITIONS = [
@@ -380,6 +379,25 @@ TOOL_DEFINITIONS = [
         },
     },
 ]
+
+
+def _relative_time_ranges_hint(now: datetime) -> str:
+    """Precomputed start/end literals for common relative-time phrases, for
+    the model to copy verbatim instead of computing itself -- confirmed on
+    net-flow that giving it only the current date/time and a rule to apply
+    ('subtract 7 days') isn't enough: it still got the arithmetic backwards
+    (added 7 days, landing on a future date) and separately produced a
+    zero-width start==end window for 'today'. Real arithmetic, done once
+    here in Python, removes that failure mode entirely."""
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = now - timedelta(days=7)
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    return (
+        f"today: start={today_start.strftime(fmt)}, end={now.strftime(fmt)}\n"
+        f"yesterday: start={yesterday_start.strftime(fmt)}, end={today_start.strftime(fmt)}\n"
+        f"this week / past week: start={week_start.strftime(fmt)}, end={now.strftime(fmt)}"
+    )
 
 
 def _parse_tool_datetime(value) -> datetime | None:
@@ -482,11 +500,12 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     # window. Happened to still name the right device only because that
     # device has dominated event counts across the whole guessed range --
     # a time-relative question is not safe to trust without this anchor.
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    now = datetime.now(timezone.utc)
     opening = (
-        f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\nThe current date/time is {now_utc} UTC -- "
-        f"use this, not your training data, to resolve 'today'/'this week'/'yesterday'/etc. into "
-        f"actual start/end tool arguments.\n\n---\n\nQuestion: {query.question}"
+        f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\nThe current date/time is "
+        f"{now.strftime('%Y-%m-%dT%H:%M:%S')} UTC. Precomputed start/end values for common time "
+        f"periods (copy the matching pair exactly, do not recompute):\n{_relative_time_ranges_hint(now)}"
+        f"\n\n---\n\nQuestion: {query.question}"
     )
     if query.source_ip or query.vendor or query.start or query.end:
         opening += (
