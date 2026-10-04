@@ -171,6 +171,43 @@ def search_logs(
     return LogSearchResponse(items=items, limit=limit, offset=offset, has_more=has_more)
 
 
+def count_events(
+    client: Client,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    hostname: str | None = None,
+    source_ip: str | None = None,
+    vendor: str | None = None,
+    program: str | None = None,
+    severity: str | None = None,
+    predicted_category: str | None = None,
+    anomaly_reason: str | None = None,
+    keyword: str | None = None,
+    only_anomalies: bool = False,
+) -> int:
+    """
+    A real COUNT(*) over the same filters as search_logs/export_logs, for
+    callers that need an exact total rather than a page of rows -- added
+    for the Log Assistant agent after confirming on net-flow that without
+    this, asked to compare one device's event count across two days, the
+    model had no tool that could answer "how many", and fabricated both
+    numbers in its final answer rather than admitting it couldn't get one.
+    search_logs's own has_more/len(items) can't substitute for this: its
+    page size is capped (MAX_LIMIT), so a device with more events than that
+    in the window would silently undercount.
+    """
+    conditions, params, _, _ = _build_conditions(
+        start=start, end=end, hostname=hostname, source_ip=source_ip, vendor=vendor, program=program,
+        severity=severity, predicted_category=predicted_category, anomaly_reason=anomaly_reason,
+        keyword=keyword, only_anomalies=only_anomalies,
+    )
+    result = client.query(
+        f"SELECT count() FROM syslog_ml.events WHERE {' AND '.join(conditions)}", parameters=params,
+    )
+    return result.result_rows[0][0]
+
+
 def get_filter_options(client: Client) -> LogFilterOptions:
     """Real, currently-relevant values for the Vendor/Program filter
     dropdowns -- unlike Severity or anomaly_reason (fixed, small enums

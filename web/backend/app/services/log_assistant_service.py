@@ -296,11 +296,19 @@ _AGENT_INSTRUCTIONS = (
     "'busiest', 'most'), or specific log content -- never guess or estimate from memory, and never "
     "answer from a tool's result until you've actually called it. Use list_devices for 'which "
     "device is noisiest/busiest/most active' questions (it returns devices sorted by event count "
-    "already -- the first one is the answer). Use search_logs for 'how many', 'show me', 'did X "
-    "happen', or exact keyword/filter questions. Use semantic_search only for 'what's going on "
-    "with/related to <topic>' questions where you don't have an exact keyword to filter on. Once a "
-    "tool's result answers the question, give a plain, direct final answer in your own words -- do "
-    "not call another tool after that, and do not call the same tool twice with the same arguments.\n\n"
+    "already -- the first one is the answer) -- it does NOT accept a hostname/IP filter, so never use "
+    "it to ask about ONE already-named device. For 'how many events/logs' for a specific device, "
+    "severity, or filter -- including comparing two time periods -- use count_events once PER time "
+    "period being asked about (e.g. once for today, once for yesterday); it returns an exact total, "
+    "never estimate or reuse a number from a different tool call. Use search_logs only when the "
+    "actual log lines themselves are needed (not just a count), for 'show me', 'did X happen', or "
+    "exact keyword questions. Use semantic_search only for 'what's going on with/related to <topic>' "
+    "questions where you don't have an exact keyword to filter on. A number in your final answer must "
+    "come from a tool result for that SAME device/filter/time period -- never attribute one tool "
+    "call's result to a different device or period than what it was actually called with. Once every "
+    "number the question needs has been retrieved, give a plain, direct final answer in your own "
+    "words -- do not call another tool after that, and do not call the same tool twice with the same "
+    "arguments.\n\n"
     "Time ranges: below is a list of exact start/end values already computed for you, one per common "
     "phrase -- COPY the pair matching the question's time period character-for-character into a "
     "tool's start/end arguments. Do NOT compute a date yourself by adding/subtracting days -- "
@@ -332,12 +340,38 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "count_events",
+            "description": (
+                "Returns the EXACT total count of log events matching the given filters -- use this, "
+                "not search_logs, for any 'how many' question or when comparing counts across devices "
+                "or time periods. Call it once per time period being compared (e.g. once with today's "
+                "start/end, once with yesterday's) -- never reuse one call's count for a different "
+                "period."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hostname": {"type": "string"},
+                    "source_ip": {"type": "string"},
+                    "severity": {"type": "string", "description": "e.g. emerg, alert, crit, err, warning, notice, info, debug"},
+                    "program": {"type": "string"},
+                    "keyword": {"type": "string", "description": "Substring to match in the log message"},
+                    "only_anomalies": {"type": "boolean"},
+                    "start": {"type": "string", "description": "ISO 8601 UTC start"},
+                    "end": {"type": "string", "description": "ISO 8601 UTC end"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_logs",
             "description": (
                 "Searches the raw log events with exact filters (hostname, source IP, severity, "
-                "program, a message keyword, whether flagged anomalous) and returns matching rows. "
-                "Use for 'how many', 'show me', 'did X happen', or any question with an exact field "
-                "or keyword to filter on."
+                "program, a message keyword, whether flagged anomalous) and returns the matching rows "
+                "themselves. Use only when the actual log content is needed (e.g. 'show me', 'did X "
+                "happen') -- for a count, use count_events instead."
             ),
             "parameters": {
                 "type": "object",
@@ -434,6 +468,21 @@ async def _execute_tool(
                 for d in result.items
             ],
         }, []
+
+    if name == "count_events":
+        count = await asyncio.to_thread(
+            log_search_service.count_events,
+            ch_client,
+            hostname=arguments.get("hostname"),
+            source_ip=arguments.get("source_ip"),
+            severity=arguments.get("severity"),
+            program=arguments.get("program"),
+            keyword=arguments.get("keyword"),
+            only_anomalies=bool(arguments.get("only_anomalies", False)),
+            start=_parse_tool_datetime(arguments.get("start")),
+            end=_parse_tool_datetime(arguments.get("end")),
+        )
+        return {"count": count}, []
 
     if name == "search_logs":
         result = await asyncio.to_thread(
