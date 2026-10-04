@@ -506,7 +506,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
         messages.append(message)
         for call in tool_calls:
             fn = call["function"]
-            result, hits = await _execute_tool(fn["name"], fn.get("arguments") or {}, os_client, ch_client)
+            arguments = fn.get("arguments") or {}
+            result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client)
+            # Temporary diagnostic: the only way to see what the model actually
+            # asked for and what came back, since the old plain access-log line
+            # (POST /api/log-assistant/ask 200) hides both -- a 200 here says
+            # nothing about whether the tool call itself found real data.
+            log.info("Log Assistant tool call: %s(%s) -> %s", fn["name"], arguments, _truncate(json.dumps(result), 1000))
             sources.extend(hits)
             messages.append({"role": "tool", "content": json.dumps(result)})
 
