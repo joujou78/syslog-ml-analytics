@@ -300,7 +300,14 @@ _AGENT_INSTRUCTIONS = (
     "happen', or exact keyword/filter questions. Use semantic_search only for 'what's going on "
     "with/related to <topic>' questions where you don't have an exact keyword to filter on. Once a "
     "tool's result answers the question, give a plain, direct final answer in your own words -- do "
-    "not call another tool after that, and do not call the same tool twice with the same arguments."
+    "not call another tool after that, and do not call the same tool twice with the same arguments.\n\n"
+    "Time ranges: a tool's start/end must always span a real range, NEVER the same value for both -- "
+    "a start equal to end searches zero seconds of time and will always come back empty, which is "
+    "wrong, not 'no data'. Using the current date/time given below: 'today' = start at 00:00:00 on "
+    "the current date, end = the current date/time. 'yesterday' = start at 00:00:00 the day before, "
+    "end at 23:59:59 that same day. 'this week'/'past week' = start 7 days before the current date/"
+    "time, end = the current date/time. If a question has no time period at all, omit start/end "
+    "entirely rather than guessing a narrow one."
 )
 
 TOOL_DEFINITIONS = [
