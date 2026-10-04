@@ -19,15 +19,19 @@ constraint that applies to net-flow itself). Smoke-test both endpoints
 after installing OpenSearch/Ollama for real.
 """
 import asyncio
+import json
 import logging
 import pathlib
+from datetime import datetime, timezone
 
 import httpx
+from clickhouse_connect.driver.client import Client
 from opensearchpy import OpenSearch
 
 from app.core.ch_time import ch_literal
 from app.core.config import settings
 from app.schemas.log_assistant import AskResponse, LogAssistantQuery, LogHit
+from app.services import device_service, log_search_service
 
 log = logging.getLogger("log_assistant_service")
 
@@ -233,23 +237,6 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"...[truncated, {len(text)} chars total]"
 
 
-def _build_prompt(question: str, hits: list[LogHit]) -> str:
-    # hits is guaranteed non-empty here -- ask() returns early, without
-    # calling this at all, the moment semantic_search() comes back empty
-    # (see _NO_HITS_ANSWER below). Asking the LLM to "explain" a genuinely
-    # empty context produced nothing but generic, contentless filler in
-    # every real case observed ("I couldn't find any information..."),
-    # for the cost of a full CPU-bound generation call -- worth skipping
-    # outright rather than prompting around it.
-    lines = [
-        f"- [{h.event_time.isoformat()}] {h.hostname} ({h.vendor}) {h.severity}/{h.program}: "
-        f"{_truncate(h.message, _MAX_MESSAGE_CHARS_IN_PROMPT)}"
-        + (f" [flagged: {', '.join(h.anomaly_reasons)}]" if h.is_anomaly else "")
-        for h in hits
-    ]
-    return "Log excerpts (most semantically relevant first):\n" + "\n".join(lines) + f"\n\nQuestion: {question}"
-
-
 def _post_chat_sync(url: str, payload: dict, timeout: float) -> dict:
     # Deliberately httpx.Client (sync), not AsyncClient, and run via
     # asyncio.to_thread below -- NOT a style preference. Root-caused on
@@ -280,36 +267,257 @@ _NO_HITS_ANSWER = (
     "generic non-answer with no real log content to ground it)."
 )
 
+# "Ask" used to be pure RAG: embed the question, pull the top-K
+# semantically-similar log LINES, stuff them into one prompt, one chat
+# call. That architecture structurally cannot answer anything that needs
+# counting or comparing across rows -- confirmed in real use on net-flow:
+# asked "which device is noisiest this week", it picked three devices out
+# of ten retrieved lines whose relevance scores were ~0.015 (indistinguishable
+# from noise) and confabulated a plausible-sounding answer with no actual
+# count behind it. Replaced with a tool-calling agent: the model gets
+# function-calling access to the real aggregate queries this app already
+# has (list_devices, search_logs) plus the original semantic_search as one
+# tool among others, so "which device is noisiest" now means an actual
+# event_count comparison, not a guess from a handful of unrelated lines.
+#
+# UNTESTED LIVE (same caveat as this file's other Ollama-facing code, see
+# the module docstring): tool-calling support for
+# OLLAMA_CHAT_MODEL=llama3.2:3b-instruct-q4_K_M via Ollama's /api/chat
+# `tools` parameter is written against Ollama's documented API, but this
+# sandbox can't reach a live Ollama to exercise it. Smoke-test a real
+# question after deploying -- if tool calls never fire (model just answers
+# in plain text, ignoring the tools), check Ollama's version supports
+# tool-calling for this model.
+MAX_TOOL_ITERATIONS = 4
 
-async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> AskResponse:
-    hits = await semantic_search(os_client, query)
-    if not hits:
-        note = await build_coverage_note(ch_client, query, hits)
-        return AskResponse(answer=note or _NO_HITS_ANSWER, sources=[], model="(no data -- LLM not invoked)")
-    prompt = _build_prompt(query.question, hits)
-    # Also folding the system prompt into the one user message rather than
-    # a separate system-role message -- a second, independent finding from
-    # the same investigation: OLLAMA_CHAT_MODEL=llama3.2:3b-instruct-q4_K_M
-    # hung on a system-role message specifically in earlier testing (via
-    # urllib, before the transport issue above was isolated). Harmless to
-    # keep either way, and cheap insurance against a second failure mode.
-    combined_prompt = f"{_SYSTEM_PROMPT}\n\n---\n\n{prompt}"
-    body = await asyncio.to_thread(
-        _post_chat_sync,
-        f"{settings.ollama_url}/api/chat",
-        {
-            "model": settings.ollama_chat_model,
-            "messages": [{"role": "user", "content": combined_prompt}],
-            "stream": False,
-            # Bounds worst-case generation time -- see config.py's
-            # ollama_num_predict comment for why this matters on
-            # CPU-only hardware independent of any other contention.
-            "options": {
-                "num_predict": settings.ollama_num_predict,
-                "num_thread": settings.ollama_chat_num_thread,
+_AGENT_INSTRUCTIONS = (
+    "You have tools that query this network's real, current log data. ALWAYS call a tool to get "
+    "real data before answering any question involving a count, a comparison ('noisiest', "
+    "'busiest', 'most'), or specific log content -- never guess or estimate from memory, and never "
+    "answer from a tool's result until you've actually called it. Use list_devices for 'which "
+    "device is noisiest/busiest/most active' questions (it returns devices sorted by event count "
+    "already -- the first one is the answer). Use search_logs for 'how many', 'show me', 'did X "
+    "happen', or exact keyword/filter questions. Use semantic_search only for 'what's going on "
+    "with/related to <topic>' questions where you don't have an exact keyword to filter on. Once a "
+    "tool's result answers the question, give a plain, direct final answer in your own words -- do "
+    "not call another tool after that, and do not call the same tool twice with the same arguments."
+)
+
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_devices",
+            "description": (
+                "Lists devices seen in a time window with their total event count, busiest first. "
+                "The answer to 'which device is noisiest/busiest/most active' is simply the first "
+                "item this returns -- no further comparison needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "ISO 8601 UTC start, e.g. 2026-10-01T00:00:00. Omit for 'last 24 hours'."},
+                    "end": {"type": "string", "description": "ISO 8601 UTC end. Omit to mean 'now'."},
+                    "limit": {"type": "integer", "description": "Max devices to return. Default 10."},
+                },
             },
         },
-        settings.ollama_timeout_seconds,
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_logs",
+            "description": (
+                "Searches the raw log events with exact filters (hostname, source IP, severity, "
+                "program, a message keyword, whether flagged anomalous) and returns matching rows. "
+                "Use for 'how many', 'show me', 'did X happen', or any question with an exact field "
+                "or keyword to filter on."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hostname": {"type": "string"},
+                    "source_ip": {"type": "string"},
+                    "severity": {"type": "string", "description": "e.g. emerg, alert, crit, err, warning, notice, info, debug"},
+                    "program": {"type": "string"},
+                    "keyword": {"type": "string", "description": "Substring to match in the log message"},
+                    "only_anomalies": {"type": "boolean"},
+                    "start": {"type": "string", "description": "ISO 8601 UTC start"},
+                    "end": {"type": "string", "description": "ISO 8601 UTC end"},
+                    "limit": {"type": "integer", "description": "Max rows to return. Default 20."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": (
+                "Finds log lines similar in MEANING to a short phrase, even without shared words -- "
+                "e.g. 'authentication failures' can match a line that says 'login rejected'. Use "
+                "only when there's no exact keyword/field to filter on with search_logs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phrase": {"type": "string", "description": "What to search for, in plain language"},
+                    "source_ip": {"type": "string"},
+                    "vendor": {"type": "string"},
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Default 10"},
+                },
+                "required": ["phrase"],
+            },
+        },
+    },
+]
+
+
+def _parse_tool_datetime(value) -> datetime | None:
+    # Tool call arguments arrive as whatever JSON-ish types the model
+    # produces -- str is the documented/expected case, but defending
+    # against None/missing/malformed here means one bad argument degrades
+    # to "treat as unset" instead of a 500 that kills the whole answer.
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+async def _execute_tool(
+    name: str, arguments: dict, os_client: OpenSearch, ch_client: Client,
+) -> tuple[dict, list[LogHit]]:
+    """Returns (JSON-able result for the model, LogHits to surface as this
+    response's cited sources -- only semantic_search produces any)."""
+    if name == "list_devices":
+        result = await asyncio.to_thread(
+            device_service.list_devices,
+            ch_client,
+            start=_parse_tool_datetime(arguments.get("start")),
+            end=_parse_tool_datetime(arguments.get("end")),
+            limit=min(int(arguments.get("limit") or 10), 50),
+        )
+        return {
+            "devices_sorted_busiest_first": [
+                {"ip": d.ip, "hostname": d.hostname, "vendor": d.vendor, "event_count": d.event_count,
+                 "resolution_method": d.resolution_method, "last_seen": d.last_seen.isoformat()}
+                for d in result.items
+            ],
+        }, []
+
+    if name == "search_logs":
+        result = await asyncio.to_thread(
+            log_search_service.search_logs,
+            ch_client,
+            hostname=arguments.get("hostname"),
+            source_ip=arguments.get("source_ip"),
+            severity=arguments.get("severity"),
+            program=arguments.get("program"),
+            keyword=arguments.get("keyword"),
+            only_anomalies=bool(arguments.get("only_anomalies", False)),
+            start=_parse_tool_datetime(arguments.get("start")),
+            end=_parse_tool_datetime(arguments.get("end")),
+            limit=min(int(arguments.get("limit") or 20), 50),
+        )
+        return {
+            "has_more_beyond_this_page": result.has_more,
+            "matching_rows": [
+                {"event_time": i.event_time.isoformat(), "hostname": i.hostname, "source_ip": i.source_ip,
+                 "severity": i.severity, "program": i.program,
+                 "message": _truncate(i.message, _MAX_MESSAGE_CHARS_IN_PROMPT),
+                 "is_anomaly": i.is_anomaly, "anomaly_reasons": i.anomaly_reasons}
+                for i in result.items
+            ],
+        }, []
+
+    if name == "semantic_search":
+        phrase = arguments.get("phrase") or ""
+        sub_query = LogAssistantQuery(
+            question=phrase[:1000] or "related logs",
+            source_ip=arguments.get("source_ip"),
+            vendor=arguments.get("vendor"),
+            start=_parse_tool_datetime(arguments.get("start")),
+            end=_parse_tool_datetime(arguments.get("end")),
+            limit=min(int(arguments.get("limit") or 10), 50),
+        )
+        hits = await semantic_search(os_client, sub_query)
+        if not hits:
+            note = await build_coverage_note(ch_client, sub_query, hits)
+            return {"hits": [], "note": note or "No related log lines were found."}, []
+        return {
+            "hits": [
+                {"event_time": h.event_time.isoformat(), "hostname": h.hostname, "source_ip": h.source_ip,
+                 "severity": h.severity, "program": h.program,
+                 "message": _truncate(h.message, _MAX_MESSAGE_CHARS_IN_PROMPT),
+                 "is_anomaly": h.is_anomaly, "anomaly_reasons": h.anomaly_reasons}
+                for h in hits
+            ],
+        }, hits
+
+    return {"error": f"unknown tool '{name}'"}, []
+
+
+async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> AskResponse:
+    # Folded into the one user message, not a separate system-role message
+    # -- see _post_chat_sync's docstring: a system-role message hung this
+    # exact model/Ollama combination for the old single-shot prompt. Not
+    # re-verified for a tool-calling request specifically (no live Ollama
+    # in this sandbox) -- if agent responses hang where plain "ask" didn't
+    # used to, a system-role message is the first thing to rule back in.
+    opening = f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\n---\n\nQuestion: {query.question}"
+    if query.source_ip or query.vendor or query.start or query.end:
+        opening += (
+            f"\n\n(The user also set these filters as a starting hint -- a tool call that honors "
+            f"them, where relevant to the question, is appropriate: source_ip={query.source_ip}, "
+            f"vendor={query.vendor}, start={query.start}, end={query.end})"
+        )
+    messages: list[dict] = [{"role": "user", "content": opening}]
+    sources: list[LogHit] = []
+
+    for _ in range(MAX_TOOL_ITERATIONS):
+        body = await asyncio.to_thread(
+            _post_chat_sync,
+            f"{settings.ollama_url}/api/chat",
+            {
+                "model": settings.ollama_chat_model,
+                "messages": messages,
+                "tools": TOOL_DEFINITIONS,
+                "stream": False,
+                # Bounds worst-case generation time -- see config.py's
+                # ollama_num_predict comment for why this matters on
+                # CPU-only hardware independent of any other contention.
+                "options": {
+                    "num_predict": settings.ollama_num_predict,
+                    "num_thread": settings.ollama_chat_num_thread,
+                },
+            },
+            settings.ollama_timeout_seconds,
+        )
+        message = body["message"]
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            return AskResponse(answer=message["content"], sources=sources, model=settings.ollama_chat_model)
+
+        messages.append(message)
+        for call in tool_calls:
+            fn = call["function"]
+            result, hits = await _execute_tool(fn["name"], fn.get("arguments") or {}, os_client, ch_client)
+            sources.extend(hits)
+            messages.append({"role": "tool", "content": json.dumps(result)})
+
+    # Exhausted MAX_TOOL_ITERATIONS without a plain-text final answer --
+    # say so rather than silently dropping the question or looping forever
+    # (a real risk with a small model: see _AGENT_INSTRUCTIONS' explicit
+    # "do not call the same tool twice" for the failure mode this guards).
+    return AskResponse(
+        answer=(
+            "The assistant made several tool calls but didn't settle on a final answer in time -- "
+            "try a narrower or more specific question."
+        ),
+        sources=sources, model=settings.ollama_chat_model,
     )
-    answer = body["message"]["content"]
-    return AskResponse(answer=answer, sources=hits, model=settings.ollama_chat_model)
