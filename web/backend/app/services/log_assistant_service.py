@@ -500,6 +500,23 @@ TOOL_DEFINITIONS = [
 ]
 
 
+def _relative_time_bounds(now: datetime) -> dict[str, tuple[datetime, datetime]]:
+    """Real Python arithmetic for the relative-time phrases this app's
+    questions actually use, computed once and shared by both the prompt
+    hint below (for the model to copy) and _detect_comparison_periods
+    (which bypasses the model entirely for a detected today/yesterday/this
+    week comparison) -- see both call sites for why neither trusts the
+    model to derive these itself."""
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = now - timedelta(days=7)
+    return {
+        "today": (today_start, now),
+        "yesterday": (yesterday_start, today_start),
+        "this week": (week_start, now),
+    }
+
+
 def _relative_time_ranges_hint(now: datetime) -> str:
     """Precomputed start/end literals for common relative-time phrases, for
     the model to copy verbatim instead of computing itself -- confirmed on
@@ -508,15 +525,57 @@ def _relative_time_ranges_hint(now: datetime) -> str:
     (added 7 days, landing on a future date) and separately produced a
     zero-width start==end window for 'today'. Real arithmetic, done once
     here in Python, removes that failure mode entirely."""
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today_start - timedelta(days=1)
-    week_start = now - timedelta(days=7)
+    bounds = _relative_time_bounds(now)
     fmt = "%Y-%m-%dT%H:%M:%S"
+    today_start, today_end = bounds["today"]
+    yesterday_start, yesterday_end = bounds["yesterday"]
+    week_start, week_end = bounds["this week"]
     return (
-        f"today: start={today_start.strftime(fmt)}, end={now.strftime(fmt)}\n"
-        f"yesterday: start={yesterday_start.strftime(fmt)}, end={today_start.strftime(fmt)}\n"
-        f"this week / past week: start={week_start.strftime(fmt)}, end={now.strftime(fmt)}"
+        f"today: start={today_start.strftime(fmt)}, end={today_end.strftime(fmt)}\n"
+        f"yesterday: start={yesterday_start.strftime(fmt)}, end={yesterday_end.strftime(fmt)}\n"
+        f"this week / past week: start={week_start.strftime(fmt)}, end={week_end.strftime(fmt)}"
     )
+
+
+# Phrase aliases that map onto the same _relative_time_bounds() key -- "this
+# week" and "past week" are used interchangeably in real questions (see the
+# original noisiest-device incident, which used "this week").
+_PERIOD_PHRASE_ALIASES: list[tuple[str, tuple[str, ...]]] = [
+    ("today", ("today",)),
+    ("yesterday", ("yesterday",)),
+    ("this week", ("this week", "past week", "last week")),
+]
+
+
+def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, datetime, datetime]] | None:
+    """If the question names (at least) two of today/yesterday/this week,
+    returns their exact boundaries so ask() can fetch both deterministically
+    instead of trusting the model's own tool-call arguments and its own
+    labeling of which number belongs to which period.
+
+    Confirmed on net-flow this was necessary, not just defensive: asked to
+    compare one device's count today vs. yesterday, the model's own first
+    tool call used the right start (yesterday's midnight) but the wrong end
+    (now, instead of today's midnight) -- silently turning "yesterday" into
+    "yesterday+today combined" -- and then its final answer swapped which
+    raw number it called "today" vs. "yesterday" on top of that. Both
+    numbers were individually real (each came from an actual tool call), so
+    the grounding check in ask() didn't catch it; only recomputing the
+    periods ourselves and supplying pre-labeled results removes the model's
+    chance to make either mistake.
+
+    Returns None (falls back to the generic nudge + grounding-check safety
+    net in ask()) when fewer than two known period phrases are mentioned --
+    e.g. a device-vs-device comparison with only one implied timeframe, or
+    a comparison with no relative-time phrase at all."""
+    bounds = _relative_time_bounds(now)
+    lowered = question.lower()
+    matched = [
+        (label, *bounds[label])
+        for label, phrases in _PERIOD_PHRASE_ALIASES
+        if any(phrase in lowered for phrase in phrases)
+    ]
+    return matched[:2] if len(matched) >= 2 else None
 
 
 def _parse_tool_datetime(value) -> datetime | None:
@@ -650,6 +709,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     messages: list[dict] = [{"role": "user", "content": opening}]
     sources: list[LogHit] = []
     needs_multiple = _needs_multiple_data_points(query.question)
+    comparison_periods = _detect_comparison_periods(query.question, now)
+    periods_resolved = False
     data_tool_calls = 0
     grounded_counts: set[int] = set()
     known_identifiers: set[str] = set()
@@ -716,6 +777,49 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
         for call in tool_calls:
             fn = call["function"]
             arguments = fn.get("arguments") or {}
+
+            if fn["name"] == "count_events" and comparison_periods and not periods_resolved:
+                # Deterministic override: ignore whatever start/end the model
+                # passed and fetch BOTH compared periods ourselves, pre-labeled
+                # -- confirmed on net-flow this is necessary, not just
+                # defensive (see _detect_comparison_periods' docstring for the
+                # exact incident: the model's own call silently blended
+                # yesterday+today together, then its final answer swapped
+                # which number it called "today" vs. "yesterday" on top of
+                # that -- both numbers were individually real, from actual
+                # tool calls, so the grounding check alone didn't catch it).
+                periods_resolved = True
+                filter_args = {k: v for k, v in arguments.items() if k not in ("start", "end")}
+                labeled_counts = []
+                for label, period_start, period_end in comparison_periods:
+                    count = await asyncio.to_thread(
+                        log_search_service.count_events,
+                        ch_client,
+                        hostname=filter_args.get("hostname"),
+                        source_ip=filter_args.get("source_ip"),
+                        severity=filter_args.get("severity"),
+                        program=filter_args.get("program"),
+                        keyword=filter_args.get("keyword"),
+                        only_anomalies=bool(filter_args.get("only_anomalies", False)),
+                        start=period_start,
+                        end=period_end,
+                    )
+                    labeled_counts.append({"period": label, "count": count})
+                    grounded_counts.add(count)
+                    data_tool_calls += 1
+                result = {
+                    "note": (
+                        "These are the exact, already-verified counts for every period being compared. "
+                        "State them exactly as labeled -- do not call count_events again for this "
+                        "comparison, and do not swap or relabel which number belongs to which period."
+                    ),
+                    "results": labeled_counts,
+                }
+                hits: list[LogHit] = []
+                log.info("Log Assistant tool call OVERRIDDEN (deterministic period comparison): %s -> %s", arguments, result)
+                messages.append({"role": "tool", "content": json.dumps(result)})
+                continue
+
             result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client)
             # Temporary diagnostic: the only way to see what the model actually
             # asked for and what came back, since the old plain access-log line
