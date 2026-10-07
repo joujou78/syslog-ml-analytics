@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { logAssistantApi } from '../api/logAssistant'
 import type { LogAssistantQuery, LogHit } from '../types'
@@ -97,29 +97,69 @@ function SourcesTable({ sources, coverageNote }: { sources: LogHit[]; coverageNo
   )
 }
 
+// One exchange in the thread: a question the user sent (with whatever
+// filters were active at the time -- kept per-turn, not just globally,
+// since filters can change between messages and a past turn should still
+// show what it was actually answered against) plus however far its
+// response has gotten. Each turn is answered independently by the backend
+// -- no conversation memory -- so a later turn can't reference an earlier
+// one; this is purely a display thread, not a stateful conversation. See
+// the "best possible" discussion in this project's history for why: this
+// model already needed several rounds of fixes for reliable single-turn
+// reasoning, and layering real multi-turn memory on top would multiply
+// that surface area rather than improve the experience.
+interface ChatTurn {
+  id: string
+  kind: 'ask' | 'search'
+  question: string
+  filters: { sourceIp?: string; vendor?: string; start?: string; end?: string }
+  status: 'pending' | 'done' | 'error'
+  answer?: string
+  model?: string
+  sources?: LogHit[]
+  coverageNote?: string | null
+  error?: string
+}
+
+function filtersSummary(filters: ChatTurn['filters']): string | null {
+  const parts: string[] = []
+  if (filters.sourceIp) parts.push(`IP ${filters.sourceIp}`)
+  if (filters.vendor) parts.push(`vendor ${filters.vendor}`)
+  if (filters.start) parts.push(`from ${formatBeirutDateTime(filters.start)}`)
+  if (filters.end) parts.push(`to ${formatBeirutDateTime(filters.end)}`)
+  return parts.length ? parts.join(' · ') : null
+}
+
 export function LogAssistant() {
   const [searchParams] = useSearchParams()
   const initialQuery = () => queryFromSearchParams(searchParams)
 
-  const [question, setQuestion] = useState(() => initialQuery()?.question ?? '')
+  const [question, setQuestion] = useState('')
   const [sourceIp, setSourceIp] = useState(() => initialQuery()?.source_ip ?? '')
   const [vendor, setVendor] = useState(() => initialQuery()?.vendor ?? '')
   const [start, setStart] = useState(() => initialQuery()?.start ?? '')
   const [end, setEnd] = useState(() => initialQuery()?.end ?? '')
+  const [showFilters, setShowFilters] = useState(() => Boolean(sourceIp || vendor || start || end))
 
-  const [answer, setAnswer] = useState<string | null>(null)
-  const [model, setModel] = useState<string | null>(null)
-  const [sources, setSources] = useState<LogHit[] | null>(null)
-  const [coverageNote, setCoverageNote] = useState<string | null>(null)
-  const [loading, setLoading] = useState<'ask' | 'search' | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [turns, setTurns] = useState<ChatTurn[]>([])
+  const [pending, setPending] = useState<'ask' | 'search' | null>(null)
+  const threadEndRef = useRef<HTMLDivElement>(null)
 
-  function currentQuery(): LogAssistantQuery {
-    const query: LogAssistantQuery = { question }
-    if (sourceIp) query.source_ip = sourceIp
-    if (vendor) query.vendor = vendor
-    if (start) query.start = start
-    if (end) query.end = end
+  function currentFilters(): ChatTurn['filters'] {
+    const filters: ChatTurn['filters'] = {}
+    if (sourceIp) filters.sourceIp = sourceIp
+    if (vendor) filters.vendor = vendor
+    if (start) filters.start = start
+    if (end) filters.end = end
+    return filters
+  }
+
+  function queryFor(questionText: string, filters: ChatTurn['filters']): LogAssistantQuery {
+    const query: LogAssistantQuery = { question: questionText }
+    if (filters.sourceIp) query.source_ip = filters.sourceIp
+    if (filters.vendor) query.vendor = filters.vendor
+    if (filters.start) query.start = filters.start
+    if (filters.end) query.end = filters.end
     return query
   }
 
@@ -136,130 +176,170 @@ export function LogAssistant() {
     return null
   }
 
-  function runAsk(e?: React.FormEvent) {
-    e?.preventDefault()
-    if (!question.trim()) return
-    const rangeError = invalidRange()
-    if (rangeError) {
-      setError(rangeError)
-      return
-    }
-    setLoading('ask')
-    setError(null)
-    setAnswer(null)
-    setCoverageNote(null)
-    logAssistantApi
-      .ask(currentQuery())
-      .then((res) => {
-        setAnswer(res.answer)
-        setModel(res.model)
-        setSources(res.sources)
-      })
-      .catch((err) => setError(extractErrorMessage(err, logAssistantErrorFallback(err))))
-      .finally(() => setLoading(null))
+  function updateTurn(id: string, patch: Partial<ChatTurn>) {
+    setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)))
   }
 
-  function runSearchOnly() {
-    if (!question.trim()) return
+  function send(kind: 'ask' | 'search', questionText: string) {
+    const trimmed = questionText.trim()
+    if (!trimmed) return
     const rangeError = invalidRange()
     if (rangeError) {
-      setError(rangeError)
+      // Not worth a whole turn in the thread for a client-side validation
+      // error that never reached the backend -- surfaced the same way the
+      // old single-form version did.
+      window.alert(rangeError)
       return
     }
-    setLoading('search')
-    setError(null)
-    setAnswer(null)
-    logAssistantApi
-      .search(currentQuery())
+    const filters = currentFilters()
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    setTurns((prev) => [...prev, { id, kind, question: trimmed, filters, status: 'pending' }])
+    setQuestion('')
+    setPending(kind)
+
+    const query = queryFor(trimmed, filters)
+    const request = kind === 'ask' ? logAssistantApi.ask(query) : logAssistantApi.search(query)
+    request
       .then((res) => {
-        setSources(res.items)
-        setCoverageNote(res.coverage_note)
+        if (kind === 'ask' && 'answer' in res) {
+          updateTurn(id, { status: 'done', answer: res.answer, model: res.model, sources: res.sources })
+        } else if ('items' in res) {
+          updateTurn(id, { status: 'done', sources: res.items, coverageNote: res.coverage_note })
+        }
       })
-      .catch((err) => setError(extractErrorMessage(err, logAssistantErrorFallback(err))))
-      .finally(() => setLoading(null))
+      .catch((err) => updateTurn(id, { status: 'error', error: extractErrorMessage(err, logAssistantErrorFallback(err)) }))
+      .finally(() => setPending(null))
   }
+
+  useEffect(() => {
+    threadEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [turns])
 
   useEffect(() => {
     // Auto-run only for a deep link that already carries a question (e.g.
     // an "Explain with AI" link from Anomaly Windows/Anomaly Summary) --
     // never on a bare page load, since the LLM call is slow and shouldn't
     // fire just from visiting the page.
-    if (initialQuery()) runAsk()
+    const initial = initialQuery()
+    if (initial) send('ask', initial.question)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    send('ask', question)
+  }
+
   return (
-    <div>
+    <div className="chat-page">
       <h2>Log Assistant</h2>
       <p className="page-hint">
-        Ask a question in plain language and get an answer synthesized by a local LLM from the log lines it finds
-        semantically related — separate from Log Search's exact-match filtering, this finds lines by <em>meaning</em>,
-        even when they don't share the same words as your question. Runs entirely on-host (see README): nothing here
-        is sent to an external service. The LLM call can take a while on CPU-only hardware — "Search only" skips it
-        and just shows matching log lines directly.
+        Ask a question in plain language and get an answer synthesized by a local LLM, backed by real queries against
+        your log data — not just a guess from matching log lines. Runs entirely on-host (see README): nothing here is
+        sent to an external service. Each question is answered independently (no memory of earlier questions in this
+        thread). The LLM call can take a while on CPU-only hardware — "Search only" skips it and just shows matching
+        log lines directly.
       </p>
 
-      <form className="credential-form" onSubmit={runAsk}>
-        <label>
-          Question
-          <textarea
-            rows={3}
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder="e.g. why has sw1 been logging interface errors this morning?"
-          />
-        </label>
-        <div className="form-grid">
-          <label>
-            Source IP
-            <input type="text" value={sourceIp} onChange={(e) => setSourceIp(e.target.value)} />
-          </label>
-          <label>
-            Vendor
-            <input type="text" value={vendor} onChange={(e) => setVendor(e.target.value)} />
-          </label>
-          <label>
-            Start (Beirut time)
-            <input
-              type="datetime-local"
-              value={start ? toDatetimeLocalBeirut(start) : ''}
-              onChange={(e) => setStart(e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
-            />
-          </label>
-          <label>
-            End (Beirut time)
-            <input
-              type="datetime-local"
-              value={end ? toDatetimeLocalBeirut(end) : ''}
-              onChange={(e) => setEnd(e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
-            />
-          </label>
-        </div>
-        <div className="form-actions">
-          <button type="submit" disabled={loading !== null || !question.trim()}>
-            {loading === 'ask' ? 'Asking…' : 'Ask'}
+      <div className="chat-thread">
+        {turns.length === 0 && <p className="page-hint chat-empty">Ask something to get started.</p>}
+        {turns.map((turn) => (
+          <div key={turn.id} className="chat-turn">
+            <div className="chat-bubble chat-bubble-user">
+              <div className="chat-bubble-label">You{turn.kind === 'search' ? ' (search only)' : ''}</div>
+              <div className="chat-bubble-text">{turn.question}</div>
+              {filtersSummary(turn.filters) && <div className="chat-filters-hint">{filtersSummary(turn.filters)}</div>}
+            </div>
+
+            <div className="chat-bubble chat-bubble-assistant">
+              {turn.status === 'pending' && (
+                <div className="chat-bubble-label">
+                  {turn.kind === 'ask' ? 'Asking…' : 'Searching…'}
+                </div>
+              )}
+              {turn.status === 'error' && <p className="form-error">{turn.error}</p>}
+              {turn.status === 'done' && (
+                <>
+                  {turn.kind === 'ask' && (
+                    <>
+                      <div className="chat-bubble-label">Answer{turn.model ? ` (${turn.model})` : ''}</div>
+                      <p className="chat-bubble-text">{turn.answer}</p>
+                    </>
+                  )}
+                  {turn.sources && (
+                    <>
+                      <h3>{turn.kind === 'ask' ? 'Cited log lines' : 'Matching log lines'}</h3>
+                      <SourcesTable sources={turn.sources} coverageNote={turn.coverageNote ?? null} />
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+        <div ref={threadEndRef} />
+      </div>
+
+      <form className="chat-compose" onSubmit={handleSubmit}>
+        <textarea
+          rows={2}
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => {
+            // Enter sends, Shift+Enter inserts a newline -- the usual chat-box
+            // convention, so the textarea doesn't need a separate send button
+            // to feel natural, though the button is still there for mouse use.
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault()
+              send('ask', question)
+            }
+          }}
+          placeholder="e.g. which device is noisiest today?"
+        />
+        <div className="chat-compose-actions">
+          <button type="button" className="chat-filters-toggle" onClick={() => setShowFilters((v) => !v)}>
+            {showFilters ? 'Hide filters' : 'Filters'}
+            {!showFilters && filtersSummary(currentFilters()) ? ' •' : ''}
           </button>
-          <button type="button" onClick={runSearchOnly} disabled={loading !== null || !question.trim()}>
-            {loading === 'search' ? 'Searching…' : 'Search only'}
-          </button>
+          <div className="chat-compose-buttons">
+            <button type="button" onClick={() => send('search', question)} disabled={pending !== null || !question.trim()}>
+              {pending === 'search' ? 'Searching…' : 'Search only'}
+            </button>
+            <button type="submit" disabled={pending !== null || !question.trim()}>
+              {pending === 'ask' ? 'Asking…' : 'Ask'}
+            </button>
+          </div>
         </div>
+
+        {showFilters && (
+          <div className="form-grid chat-filters-grid">
+            <label>
+              Source IP
+              <input type="text" value={sourceIp} onChange={(e) => setSourceIp(e.target.value)} />
+            </label>
+            <label>
+              Vendor
+              <input type="text" value={vendor} onChange={(e) => setVendor(e.target.value)} />
+            </label>
+            <label>
+              Start (Beirut time)
+              <input
+                type="datetime-local"
+                value={start ? toDatetimeLocalBeirut(start) : ''}
+                onChange={(e) => setStart(e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+              />
+            </label>
+            <label>
+              End (Beirut time)
+              <input
+                type="datetime-local"
+                value={end ? toDatetimeLocalBeirut(end) : ''}
+                onChange={(e) => setEnd(e.target.value ? fromDatetimeLocalBeirut(e.target.value) : '')}
+              />
+            </label>
+          </div>
+        )}
       </form>
-
-      {error && <p className="form-error">{error}</p>}
-
-      {answer && (
-        <div className="assistant-answer">
-          <strong>Answer{model ? ` (${model})` : ''}:</strong>
-          <p>{answer}</p>
-        </div>
-      )}
-
-      {sources && (
-        <>
-          <h3>{answer ? 'Cited log lines' : 'Matching log lines'}</h3>
-          <SourcesTable sources={sources} coverageNote={coverageNote} />
-        </>
-      )}
     </div>
   )
 }

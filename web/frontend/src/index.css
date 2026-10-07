@@ -386,3 +386,109 @@ label {
   margin: 2px;
   white-space: nowrap;
 }
+
+/* Log Assistant chat UI -- a scrolling thread of past turns above a fixed
+   compose box at the bottom, the usual chat-app layout. Each turn is
+   answered independently by the backend (no conversation memory), so this
+   is purely a display convention, not a sign of real multi-turn state. */
+.chat-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 48px);
+  max-width: 900px;
+}
+
+.chat-thread {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 4px 2px 16px;
+}
+
+.chat-empty {
+  margin: 24px 0;
+}
+
+.chat-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-bubble {
+  border-radius: 10px;
+  padding: 12px 16px;
+  max-width: 85%;
+}
+
+.chat-bubble-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+}
+
+.chat-bubble-user .chat-bubble-label {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.chat-bubble-assistant {
+  align-self: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  width: 100%;
+  max-width: 100%;
+}
+
+.chat-bubble-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.chat-bubble-text {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+}
+
+.chat-filters-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.chat-compose {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-compose textarea {
+  width: 100%;
+}
+
+.chat-compose-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.chat-compose-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-filters-toggle {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+.chat-filters-grid {
+  padding-top: 4px;
+}
