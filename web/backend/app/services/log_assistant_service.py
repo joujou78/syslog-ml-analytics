@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -288,7 +289,91 @@ _NO_HITS_ANSWER = (
 # question after deploying -- if tool calls never fire (model just answers
 # in plain text, ignoring the tools), check Ollama's version supports
 # tool-calling for this model.
-MAX_TOOL_ITERATIONS = 4
+#
+# Confirmed on net-flow: asked to compare one device's event count today
+# vs. yesterday, the model called count_events ONCE (a blended ~38-hour
+# window matching neither period), then invented a two-way split from that
+# single number in its final answer -- despite an explicit instruction not
+# to. Prompting alone isn't enough for a 3B model on a genuinely multi-step
+# question, so ask() below also enforces this structurally: a
+# comparison-phrased question can't get a final answer until at least 2
+# real tool calls have happened (see _needs_multiple_data_points), and any
+# final answer's count-like numbers are checked against what tools actually
+# returned (see _extract_count_claims/_grounded_counts_from_result) --
+# an unverifiable number gets a visible caveat instead of being presented
+# as fact.
+MAX_TOOL_ITERATIONS = 6
+
+_COMPARISON_MARKERS = ("compare", " vs ", " vs. ", "versus", "difference between")
+
+
+def _needs_multiple_data_points(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _COMPARISON_MARKERS)
+
+
+def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
+    """Exact numeric counts a tool call actually returned, for cross-checking
+    against what the model later claims in its final answer -- deliberately
+    narrow (only fields we know represent a real count), not a blind walk of
+    the whole JSON, since that would also pick up limits/offsets/timestamps
+    and produce false "unverified" flags on a correct answer."""
+    if tool_name == "count_events":
+        count = result.get("count")
+        return {count} if isinstance(count, int) else set()
+    if tool_name == "list_devices":
+        return {
+            d["event_count"] for d in result.get("devices_sorted_busiest_first", [])
+            if isinstance(d.get("event_count"), int)
+        }
+    return set()
+
+
+def _identifiers_from_result(tool_name: str, result: dict) -> set[str]:
+    """Hostnames/IPs a tool result mentioned -- these routinely contain
+    digit runs of their own (confirmed: 'SF-200-POE-DBN-01' made the claim
+    extractor below misread '200' as a claimed count instead of the real
+    number, '14', appearing later in the same sentence). Stripping these
+    exact strings out of the answer text before counting digits removes
+    that false-positive source instead of trying to out-guess it with a
+    cleverer regex."""
+    ids: set[str] = set()
+    if tool_name == "list_devices":
+        for d in result.get("devices_sorted_busiest_first", []):
+            ids.update(v for v in (d.get("ip"), d.get("hostname")) if isinstance(v, str) and len(v) >= 3)
+    elif tool_name == "search_logs":
+        for row in result.get("matching_rows", []):
+            ids.update(v for v in (row.get("hostname"), row.get("source_ip")) if isinstance(v, str) and len(v) >= 3)
+    elif tool_name == "semantic_search":
+        for hit in result.get("hits", []):
+            ids.update(v for v in (hit.get("hostname"), hit.get("source_ip")) if isinstance(v, str) and len(v) >= 3)
+    return ids
+
+
+# Matches a number next to a count-ish word in either order ("14 events",
+# "a total of 122,319") -- deliberately anchored to those words rather than
+# any bare digit, so a stray timestamp or port number in the answer text
+# doesn't get mistaken for a claimed count. Hostnames/IPs are stripped from
+# the text before this runs (see _identifiers_from_result) -- without that,
+# this still mismatched a hostname's embedded digits for the real count.
+_COUNT_CLAIM_RE = re.compile(
+    r"(\d[\d,]*)\s*(?:events?|logs?|log lines?|lines?|entries|occurrences?|times?)\b"
+    r"|(?:events?|logs?|log lines?|lines?|entries|count(?:ed)?|total(?:\s+of)?)\D{0,12}?(\d[\d,]*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_count_claims(text: str, known_identifiers: set[str]) -> set[int]:
+    for identifier in known_identifiers:
+        text = re.sub(re.escape(identifier), " ", text, flags=re.IGNORECASE)
+    claims = set()
+    for first, second in _COUNT_CLAIM_RE.findall(text):
+        raw = first or second
+        try:
+            claims.add(int(raw.replace(",", "")))
+        except ValueError:
+            continue
+    return claims
 
 _AGENT_INSTRUCTIONS = (
     "You have tools that query this network's real, current log data. ALWAYS call a tool to get "
@@ -564,6 +649,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
         )
     messages: list[dict] = [{"role": "user", "content": opening}]
     sources: list[LogHit] = []
+    needs_multiple = _needs_multiple_data_points(query.question)
+    data_tool_calls = 0
+    grounded_counts: set[int] = set()
+    known_identifiers: set[str] = set()
+    nudged = False
 
     for _ in range(MAX_TOOL_ITERATIONS):
         body = await asyncio.to_thread(
@@ -587,7 +677,40 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
         message = body["message"]
         tool_calls = message.get("tool_calls")
         if not tool_calls:
-            return AskResponse(answer=message["content"], sources=sources, model=settings.ollama_chat_model)
+            answer = message["content"]
+            # Confirmed on net-flow: a comparison question got "answered"
+            # after a single tool call, with the second data point invented
+            # out of nothing. Rather than trust the model's own judgment
+            # that it's done, a comparison-phrased question is refused a
+            # final answer until it has actually gone back for a second
+            # real data point -- once, not in a retry loop, so a model that
+            # ignores the nudge still gets an answer rather than hanging.
+            if needs_multiple and data_tool_calls < 2 and not nudged:
+                nudged = True
+                messages.append(message)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "This question compares multiple things (devices, time periods, etc.), but "
+                        "you've only retrieved ONE real data point so far. Call the appropriate tool "
+                        "AGAIN for the other item/period before answering -- do not guess, estimate, or "
+                        "reuse the first number for the second item."
+                    ),
+                })
+                continue
+            claims = _extract_count_claims(answer, known_identifiers)
+            if grounded_counts and claims and not claims.issubset(grounded_counts):
+                # The model stated a count that doesn't match anything a tool
+                # actually returned this turn -- surfaced visibly rather than
+                # presented with the same confidence as a verified number,
+                # since prompting alone hasn't reliably prevented this (see
+                # module comment above MAX_TOOL_ITERATIONS for the incident
+                # that prompted this check).
+                answer += (
+                    "\n\n(Note: at least one number above doesn't match the raw data this answer's "
+                    "tool calls actually returned -- double-check it before relying on it.)"
+                )
+            return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
         messages.append(message)
         for call in tool_calls:
@@ -599,6 +722,18 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             # (POST /api/log-assistant/ask 200) hides both -- a 200 here says
             # nothing about whether the tool call itself found real data.
             log.info("Log Assistant tool call: %s(%s) -> %s", fn["name"], arguments, _truncate(json.dumps(result), 1000))
+            data_tool_calls += 1
+            grounded_counts |= _grounded_counts_from_result(fn["name"], result)
+            # From the result (hostnames/IPs the tool found) AND from the call's
+            # own arguments -- count_events/search_logs never echo the hostname
+            # filter back in their result, only in what was asked for, so the
+            # result alone misses the exact case that originally motivated this
+            # (a hostname filter argument, not a result field, polluting the
+            # digit extraction below).
+            known_identifiers |= _identifiers_from_result(fn["name"], result)
+            known_identifiers |= {
+                v for v in (arguments.get("hostname"), arguments.get("source_ip")) if isinstance(v, str) and len(v) >= 3
+            }
             sources.extend(hits)
             messages.append({"role": "tool", "content": json.dumps(result)})
 
