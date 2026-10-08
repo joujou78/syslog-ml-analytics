@@ -546,6 +546,34 @@ _PERIOD_PHRASE_ALIASES: list[tuple[str, tuple[str, ...]]] = [
     ("this week", ("this week", "past week", "last week")),
 ]
 
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+# "<N> days ago/before/back" -- confirmed on net-flow as a real gap: only the
+# three fixed phrases above were covered, so "three days before" fell through
+# to the old generic nudge+grounding path, which produced a redundant
+# duplicate tool call and a final answer that silently dropped "today" from
+# the comparison entirely (reporting one blended number instead of two).
+# Unlike arbitrary date phrasing ("last Monday", "the 1st of October"), which
+# can't practically be enumerated, "N days ago" is a small, well-defined
+# pattern worth parsing directly rather than hardcoding every example of it.
+_N_DAYS_AGO_RE = re.compile(
+    r"\b(\d{1,3}|" + "|".join(_NUMBER_WORDS) + r")\s+days?\s+(?:ago|before|back)\b", re.IGNORECASE,
+)
+
+
+def _parse_n_days_ago(question: str, now: datetime) -> tuple[str, datetime, datetime] | None:
+    match = _N_DAYS_AGO_RE.search(question.lower())
+    if not match:
+        return None
+    raw = match.group(1)
+    n = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
+    if not 1 <= n <= 365:
+        return None
+    day_start = (now - timedelta(days=n)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return f"{n} day(s) ago", day_start, day_start + timedelta(days=1)
+
 
 def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, datetime, datetime]] | None:
     """If the question names (at least) two of today/yesterday/this week,
@@ -567,7 +595,9 @@ def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, 
     Returns None (falls back to the generic nudge + grounding-check safety
     net in ask()) when fewer than two known period phrases are mentioned --
     e.g. a device-vs-device comparison with only one implied timeframe, or
-    a comparison with no relative-time phrase at all."""
+    a comparison with no relative-time phrase at all. Also recognizes "N
+    days ago/before/back" (see _parse_n_days_ago) as a third kind of period,
+    alongside the three fixed phrases -- e.g. "today vs. three days before"."""
     bounds = _relative_time_bounds(now)
     lowered = question.lower()
     matched = [
@@ -575,6 +605,9 @@ def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, 
         for label, phrases in _PERIOD_PHRASE_ALIASES
         if any(phrase in lowered for phrase in phrases)
     ]
+    n_days_ago = _parse_n_days_ago(question, now)
+    if n_days_ago:
+        matched.append(n_days_ago)
     return matched[:2] if len(matched) >= 2 else None
 
 
