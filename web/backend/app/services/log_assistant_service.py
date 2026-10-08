@@ -816,7 +816,31 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     "results": labeled_counts,
                 }
                 hits: list[LogHit] = []
+                known_identifiers |= {
+                    v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
+                }
                 log.info("Log Assistant tool call OVERRIDDEN (deterministic period comparison): %s -> %s", arguments, result)
+                messages.append({"role": "tool", "content": json.dumps(result)})
+                continue
+
+            if fn["name"] == "count_events" and periods_resolved:
+                # Confirmed on net-flow that the "do not call again" note above
+                # isn't always enough: the model called count_events a THIRD
+                # time anyway (with no hostname filter at all -- a network-wide
+                # total over an unrelated window) and then substituted THAT
+                # number in place of the correct, already-labeled "today" value
+                # in its final answer. Refusing to execute any further
+                # count_events call removes this path entirely rather than
+                # trying to catch a bad substitution after the fact in the
+                # final answer's text.
+                result = {
+                    "error": (
+                        "Already answered -- use the labeled today/yesterday/this-week results already "
+                        "given above. Do not call count_events again for this question."
+                    ),
+                }
+                hits = []
+                log.info("Log Assistant tool call REFUSED (periods already resolved): %s(%s)", fn["name"], arguments)
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
