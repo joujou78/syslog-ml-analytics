@@ -730,6 +730,39 @@ def _parse_tool_datetime(value) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+def _parse_tool_int(value, default: int) -> int:
+    """Confirmed on net-flow: the model sent the literal STRING 'null' for
+    an omitted limit argument (not an actually-missing key or JSON null,
+    either of which the old `int(value or default)` pattern already
+    handled via the falsy/None path) -- a non-empty string isn't falsy, so
+    it reached a bare int('null') and raised an unhandled ValueError,
+    surfaced to the user as an opaque 502. Any value that doesn't parse as
+    an int now degrades to the default instead of crashing the request."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_tool_bool(value) -> bool:
+    """Confirmed live in this app's own logs (not hypothetical): the model
+    routinely sends only_anomalies as the STRING 'false' rather than an
+    actual JSON boolean. bool('false') is True in Python -- any non-empty
+    string is truthy -- so plain bool(value) was silently inverting the
+    filter every time this happened, turning 'no anomaly filter' into
+    'anomalies only' with no error or warning anywhere. A real bool passes
+    through unchanged; a string is matched case-insensitively against the
+    common true/false spellings; anything else (None, missing, a stray
+    'null') defaults to False exactly as the old `False` default did."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return False
+
+
 async def _execute_tool(
     name: str, arguments: dict, os_client: OpenSearch, ch_client: Client,
 ) -> tuple[dict, list[LogHit]]:
@@ -741,7 +774,7 @@ async def _execute_tool(
             ch_client,
             start=_parse_tool_datetime(arguments.get("start")),
             end=_parse_tool_datetime(arguments.get("end")),
-            limit=min(int(arguments.get("limit") or 10), 50),
+            limit=min(_parse_tool_int(arguments.get("limit"), 10), 50),
         )
         return {
             "devices_sorted_busiest_first": [
@@ -760,7 +793,7 @@ async def _execute_tool(
             severity=arguments.get("severity"),
             program=arguments.get("program"),
             keyword=arguments.get("keyword"),
-            only_anomalies=bool(arguments.get("only_anomalies", False)),
+            only_anomalies=_parse_tool_bool(arguments.get("only_anomalies")),
             start=_parse_tool_datetime(arguments.get("start")),
             end=_parse_tool_datetime(arguments.get("end")),
         )
@@ -775,10 +808,10 @@ async def _execute_tool(
             severity=arguments.get("severity"),
             program=arguments.get("program"),
             keyword=arguments.get("keyword"),
-            only_anomalies=bool(arguments.get("only_anomalies", False)),
+            only_anomalies=_parse_tool_bool(arguments.get("only_anomalies")),
             start=_parse_tool_datetime(arguments.get("start")),
             end=_parse_tool_datetime(arguments.get("end")),
-            limit=min(int(arguments.get("limit") or 20), 50),
+            limit=min(_parse_tool_int(arguments.get("limit"), 20), 50),
         )
         return {
             "has_more_beyond_this_page": result.has_more,
@@ -799,7 +832,7 @@ async def _execute_tool(
             vendor=arguments.get("vendor"),
             start=_parse_tool_datetime(arguments.get("start")),
             end=_parse_tool_datetime(arguments.get("end")),
-            limit=min(int(arguments.get("limit") or 10), 50),
+            limit=min(_parse_tool_int(arguments.get("limit"), 10), 50),
         )
         hits = await semantic_search(os_client, sub_query)
         if not hits:
@@ -925,7 +958,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         severity=attempted_filter_args.get("severity"),
                         program=attempted_filter_args.get("program"),
                         keyword=attempted_filter_args.get("keyword"),
-                        only_anomalies=bool(attempted_filter_args.get("only_anomalies", False)),
+                        only_anomalies=_parse_tool_bool(attempted_filter_args.get("only_anomalies")),
                         start=period_start,
                         end=period_end,
                     )
@@ -1039,7 +1072,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         severity=filter_args.get("severity"),
                         program=filter_args.get("program"),
                         keyword=filter_args.get("keyword"),
-                        only_anomalies=bool(filter_args.get("only_anomalies", False)),
+                        only_anomalies=_parse_tool_bool(filter_args.get("only_anomalies")),
                         start=period_start,
                         end=period_end,
                     )
@@ -1084,7 +1117,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     severity=filter_args.get("severity"),
                     program=filter_args.get("program"),
                     keyword=filter_args.get("keyword"),
-                    only_anomalies=bool(filter_args.get("only_anomalies", False)),
+                    only_anomalies=_parse_tool_bool(filter_args.get("only_anomalies")),
                     start=period_start,
                     end=period_end,
                 )
