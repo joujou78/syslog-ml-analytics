@@ -905,6 +905,34 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             fn = call["function"]
             arguments = fn.get("arguments") or {}
 
+            if (comparison_periods or single_period) and not periods_resolved and fn["name"] != "count_events":
+                # Confirmed on net-flow: even with comparison_periods/
+                # single_period correctly identifying this as a "count over
+                # a known period" question, the model sometimes picks a
+                # DIFFERENT tool entirely instead of count_events -- one run
+                # called semantic_search with phrase='yesterday' and no
+                # device filter, got back 10 unrelated log lines from random
+                # other devices, and reported "10 events yesterday" as if
+                # that were a real count for the device actually being
+                # asked about. Neither override above can catch this since
+                # they only intercept count_events calls. Refusing any other
+                # tool here forces a retry at count_events specifically,
+                # with a concrete device hint pulled from conversation
+                # history when one is available.
+                hinted = next(iter(_identifiers_from_history(query.history)), None)
+                result = {
+                    "error": (
+                        f"This question asks for an exact count over a specific time period -- call "
+                        f"count_events for this, not {fn['name']}."
+                        + (f" The device being discussed is {hinted} -- use that as the hostname filter."
+                           if hinted else "")
+                    ),
+                }
+                hits = []
+                log.info("Log Assistant tool call REDIRECTED (wrong tool for a period-count question): %s(%s)", fn["name"], arguments)
+                messages.append({"role": "tool", "content": json.dumps(result)})
+                continue
+
             if fn["name"] == "count_events" and comparison_periods and not periods_resolved:
                 # Deterministic override: ignore whatever start/end the model
                 # passed and fetch BOTH compared periods ourselves, pre-labeled
