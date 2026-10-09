@@ -342,6 +342,21 @@ def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
             d["event_count"] for d in result.get("devices_sorted_busiest_first", [])
             if isinstance(d.get("event_count"), int)
         }
+    if tool_name == "search_logs":
+        # Confirmed on net-flow this blind spot let a real incident through:
+        # search_logs returned matching_rows=[] (a redundant keyword filter
+        # had excluded the one real matching row), but the final answer
+        # still said "1" anyway -- not fabricated, just silently echoed from
+        # conversation history rather than drawn from this turn's actual
+        # (contradicting) tool result. With search_logs never populating
+        # grounded_counts at all, the grounding check below was blind to
+        # this regardless of what the model claimed. len(matching_rows) is
+        # exactly what this turn's tool call actually found, so it's a
+        # legitimate, exact number to ground a stated count against --
+        # unlike count_events/list_devices, that's the only thing worth
+        # extracting here (there's no other standalone count field).
+        rows = result.get("matching_rows")
+        return {len(rows)} if isinstance(rows, list) else set()
     return set()
 
 
@@ -372,8 +387,14 @@ def _identifiers_from_result(tool_name: str, result: dict) -> set[str]:
 # doesn't get mistaken for a claimed count. Hostnames/IPs are stripped from
 # the text before this runs (see _identifiers_from_result) -- without that,
 # this still mismatched a hostname's embedded digits for the real count.
+# The first alternative allows up to 20 non-digit chars between the number
+# and the word (not just \s*) -- confirmed on net-flow that "1 warning-
+# severity log" otherwise didn't match at all (the real phrasing has a
+# qualifier between the digit and "log"), silently skipping the grounding
+# check entirely rather than correctly flagging the mismatch it was added
+# to catch.
 _COUNT_CLAIM_RE = re.compile(
-    r"(\d[\d,]*)\s*(?:events?|logs?|log lines?|lines?|entries|occurrences?|times?)\b"
+    r"(\d[\d,]*)\D{0,20}?(?:events?|logs?|log lines?|lines?|entries|occurrences?|times?)\b"
     r"|(?:events?|logs?|log lines?|lines?|entries|count(?:ed)?|total(?:\s+of)?)\D{0,12}?(\d[\d,]*)",
     re.IGNORECASE,
 )
@@ -813,6 +834,22 @@ async def _execute_tool(
             end=_parse_tool_datetime(arguments.get("end")),
             limit=min(_parse_tool_int(arguments.get("limit"), 20), 50),
         )
+        # Surfaced in the UI's "Cited log lines" table, same as
+        # semantic_search's hits -- previously search_logs's rows were only
+        # ever shown to the MODEL (as JSON text) and never to the user, so
+        # "Cited log lines: No related log lines were found" displayed even
+        # when the model's answer was built from real rows it had actually
+        # seen, with nothing to actually verify it against. score=1.0 is a
+        # sentinel (an exact filter match, not a fuzzy semantic-similarity
+        # value), not a value comparable to semantic_search's real scores.
+        hits = [
+            LogHit(
+                event_time=i.event_time, source_ip=i.source_ip, hostname=i.hostname, vendor=i.vendor,
+                severity=i.severity, program=i.program, predicted_category=i.predicted_category,
+                message=i.message, is_anomaly=i.is_anomaly, anomaly_reasons=i.anomaly_reasons, score=1.0,
+            )
+            for i in result.items
+        ]
         return {
             "has_more_beyond_this_page": result.has_more,
             "matching_rows": [
@@ -822,7 +859,7 @@ async def _execute_tool(
                  "is_anomaly": i.is_anomaly, "anomaly_reasons": i.anomaly_reasons}
                 for i in result.items
             ],
-        }, []
+        }, hits
 
     if name == "semantic_search":
         phrase = arguments.get("phrase") or ""
