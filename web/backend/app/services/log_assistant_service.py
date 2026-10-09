@@ -312,6 +312,22 @@ def _needs_multiple_data_points(question: str) -> bool:
     return any(marker in lowered for marker in _COMPARISON_MARKERS)
 
 
+# Confirmed on net-flow as a real regression: "show me warning-severity logs
+# ... today" mentions "today" (so single_period matches) but explicitly
+# wants the actual log ROWS, not a count -- the model correctly called
+# search_logs (exactly what its own tool description says to use it for),
+# and the wrong-tool-redirect guard below wrongly refused it anyway, then
+# the force-resolve backstop handed back a COUNT instead of the rows asked
+# for. A time phrase alone isn't enough to conclude "this wants
+# count_events"; this explicit negative signal is checked first.
+_LOG_ROWS_MARKERS = ("show me", "show the", "list the", "list all", "display", "which log", "log lines", "the logs", "these logs")
+
+
+def _wants_log_rows(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _LOG_ROWS_MARKERS)
+
+
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
     """Exact numeric counts a tool call actually returned, for cross-checking
     against what the model later claims in its final answer -- deliberately
@@ -837,6 +853,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     # Mutually exclusive with comparison_periods by construction (2+ matches
     # vs. exactly 1) -- only meaningful when comparison_periods is None.
     single_period = _detect_single_period(query.question, now)
+    # Gates the wrong-tool-redirect and force-resolve guards below (NOT the
+    # count_events-correction overrides themselves, which stay unconditional
+    # -- correcting a count_events call's own date math is always safe
+    # regardless of question phrasing). A question wanting actual log rows,
+    # not a count, must be allowed to use search_logs/semantic_search even
+    # when it also names a time period.
+    enforce_count_tool = bool((comparison_periods or single_period) and not _wants_log_rows(query.question))
     periods_resolved = False
     data_tool_calls = 0
     grounded_counts: set[int] = set()
@@ -888,7 +911,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             # (possibly wrong-tool) attempts this turn provided, falling
             # back to conversation history, then hand it the real numbers
             # and require it to just restate them.
-            if (comparison_periods or single_period) and not periods_resolved:
+            if enforce_count_tool and not periods_resolved:
                 periods_resolved = True
                 hostname_hint = attempted_filter_args.get("hostname") or next(iter(known_identifiers), None)
                 periods_to_resolve = comparison_periods or [single_period]
@@ -966,7 +989,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 {k: v for k, v in arguments.items() if k not in ("start", "end", "limit", "phrase") and v}
             )
 
-            if (comparison_periods or single_period) and not periods_resolved and fn["name"] != "count_events":
+            if enforce_count_tool and not periods_resolved and fn["name"] != "count_events":
                 # Confirmed on net-flow: even with comparison_periods/
                 # single_period correctly identifying this as a "count over
                 # a known period" question, the model sometimes picks a
