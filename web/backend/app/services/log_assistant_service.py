@@ -31,7 +31,7 @@ from opensearchpy import OpenSearch
 
 from app.core.ch_time import ch_literal
 from app.core.config import settings
-from app.schemas.log_assistant import AskResponse, LogAssistantQuery, LogHit
+from app.schemas.log_assistant import AskResponse, ConversationTurn, LogAssistantQuery, LogHit
 from app.services import device_service, log_search_service
 
 log = logging.getLogger("log_assistant_service")
@@ -611,6 +611,43 @@ def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, 
     return matched[:2] if len(matched) >= 2 else None
 
 
+# How many prior turns to replay into the prompt -- the frontend may send up
+# to 10 (see ConversationTurn's schema limit), but each one adds real prompt
+# size on top of an already-slow CPU-only generation, so this trims further
+# to just enough for a typical "what about X" follow-up to resolve what it's
+# asking about.
+_MAX_HISTORY_TURNS_IN_PROMPT = 4
+
+
+def _format_history(history: list[ConversationTurn]) -> str:
+    """Prior Q&A turns, bounded and truncated, for ask()'s opening prompt --
+    this is what makes a follow-up like 'what about yesterday?' resolvable
+    at all, since each turn is otherwise answered from nothing but the
+    current question (see ask()'s own history-less behavior before this).
+
+    Deliberately NOT a replay of each turn's full tool-call trace (messages,
+    tool results, etc.) -- only the final question/answer text. Replaying
+    full traces would both bloat the prompt far more on top of an already
+    slow CPU-only generation, and risk the model treating an old tool
+    result as still valid for a brand new question when it may no longer
+    be (time has passed; "today's count" from 10 minutes ago is already
+    stale). The explicit instruction below exists because of that -- a
+    model that just restates an old number without re-verifying it
+    reintroduces the exact class of bug this project spent this session
+    fixing, just one conversation turn removed."""
+    if not history:
+        return ""
+    recent = history[-_MAX_HISTORY_TURNS_IN_PROMPT:]
+    lines = [
+        "Earlier in this conversation (context only -- time has passed, so re-verify with a fresh "
+        "tool call before restating any number from here rather than assuming it's still current):"
+    ]
+    for turn in recent:
+        lines.append(f"Q: {turn.question}")
+        lines.append(f"A: {_truncate(turn.answer, _MAX_MESSAGE_CHARS_IN_PROMPT)}")
+    return "\n".join(lines)
+
+
 def _parse_tool_datetime(value) -> datetime | None:
     # Tool call arguments arrive as whatever JSON-ish types the model
     # produces -- str is the documented/expected case, but defending
@@ -727,11 +764,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     # device has dominated event counts across the whole guessed range --
     # a time-relative question is not safe to trust without this anchor.
     now = datetime.now(timezone.utc)
+    history_block = _format_history(query.history)
     opening = (
         f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\nThe current date/time is "
         f"{now.strftime('%Y-%m-%dT%H:%M:%S')} UTC. Precomputed start/end values for common time "
         f"periods (copy the matching pair exactly, do not recompute):\n{_relative_time_ranges_hint(now)}"
-        f"\n\n---\n\nQuestion: {query.question}"
+        + (f"\n\n{history_block}" if history_block else "")
+        + f"\n\n---\n\nQuestion: {query.question}"
     )
     if query.source_ip or query.vendor or query.start or query.end:
         opening += (

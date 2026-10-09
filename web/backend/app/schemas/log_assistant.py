@@ -3,6 +3,19 @@ from datetime import datetime
 from pydantic import BaseModel, Field, model_validator
 
 
+class ConversationTurn(BaseModel):
+    """One prior exchange in this chat thread, sent by the frontend (which
+    holds the thread's history client-side -- the backend itself stays
+    stateless) so a follow-up question like 'what about yesterday?' can be
+    answered with context. See log_assistant_service.ask() for how this is
+    used, and its explicit instruction that a number from here is context,
+    not a fact to assume still current -- time passes between turns, so a
+    fresh tool call for the CURRENT question is still required."""
+
+    question: str = Field(min_length=1, max_length=1000)
+    answer: str = Field(min_length=1, max_length=4000)
+
+
 class LogAssistantQuery(BaseModel):
     """Shared request body for both semantic search and the LLM 'ask'
     feature -- 'ask' just does everything search does, then feeds the
@@ -14,6 +27,11 @@ class LogAssistantQuery(BaseModel):
     start: datetime | None = None
     end: datetime | None = None
     limit: int = Field(default=10, ge=1, le=50)
+    # Bounded to the last few turns -- ask() truncates further (both turn
+    # count and each answer's length) before building the prompt, but
+    # rejecting an absurdly long history at the API boundary avoids ever
+    # parsing/storing one in the first place.
+    history: list[ConversationTurn] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
     def _validate_time_range(self):

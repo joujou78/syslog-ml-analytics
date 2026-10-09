@@ -266,6 +266,11 @@ export interface VendorCategorySummaryRow {
   last_seen: string
 }
 
+export interface ConversationTurn {
+  question: string
+  answer: string
+}
+
 export interface LogAssistantQuery {
   question: string
   source_ip?: string
@@ -273,6 +278,11 @@ export interface LogAssistantQuery {
   start?: string
   end?: string
   limit?: number
+  // Prior turns in this chat thread, for a follow-up question ("what about
+  // yesterday?") to resolve with context -- see log_assistant_service.py's
+  // ask() for how the backend uses this (and why it's told to re-verify
+  // rather than trust a number from here as still current).
+  history?: ConversationTurn[]
 }
 
 export interface LogHit {

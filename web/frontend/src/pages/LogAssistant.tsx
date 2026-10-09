@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { logAssistantApi } from '../api/logAssistant'
-import type { LogAssistantQuery, LogHit } from '../types'
+import type { ConversationTurn, LogAssistantQuery, LogHit } from '../types'
 import { extractErrorMessage } from '../utils/errors'
 import { formatBeirutDateTime, fromDatetimeLocalBeirut, toDatetimeLocalBeirut } from '../utils/time'
 
@@ -137,13 +137,18 @@ function TypedText({ text }: { text: string }) {
 // filters were active at the time -- kept per-turn, not just globally,
 // since filters can change between messages and a past turn should still
 // show what it was actually answered against) plus however far its
-// response has gotten. Each turn is answered independently by the backend
-// -- no conversation memory -- so a later turn can't reference an earlier
-// one; this is purely a display thread, not a stateful conversation. See
-// the "best possible" discussion in this project's history for why: this
-// model already needed several rounds of fixes for reliable single-turn
-// reasoning, and layering real multi-turn memory on top would multiply
-// that surface area rather than improve the experience.
+// response has gotten. The backend itself stays stateless -- this client-
+// side list IS the conversation's memory: recentHistory() below sends the
+// last few completed "Ask" turns' question/answer text back to the backend
+// on each new request, so a follow-up ("what about yesterday?") can be
+// resolved with context. Only the final text of each turn is replayed, not
+// its tool-call trace, and the backend is explicitly told to re-verify
+// rather than trust an old number as still current -- seeded with the
+// user's own instruction (make it "like chatting with you") after
+// explicitly weighing the tradeoff: this model already needed several
+// rounds of fixes for reliable single-turn reasoning, so cross-turn memory
+// adds real surface area for it to misremember or restate something stale,
+// not just UI polish.
 interface ChatTurn {
   id: string
   kind: 'ask' | 'search'
@@ -190,12 +195,27 @@ export function LogAssistant() {
     return filters
   }
 
+  // Only completed "Ask" turns with a real answer -- a "Search only" turn
+  // has no answer text to replay, and a still-pending/errored one has
+  // nothing useful to hand the model as context. Capped well under the
+  // backend schema's own limit (10) so a long-running thread never trips
+  // that validation; the backend trims further still (to the last 4) before
+  // it ever reaches the model's prompt.
+  function recentHistory(): ConversationTurn[] {
+    return turns
+      .filter((t): t is ChatTurn & { answer: string } => t.kind === 'ask' && t.status === 'done' && Boolean(t.answer))
+      .slice(-8)
+      .map((t) => ({ question: t.question, answer: t.answer }))
+  }
+
   function queryFor(questionText: string, filters: ChatTurn['filters']): LogAssistantQuery {
     const query: LogAssistantQuery = { question: questionText }
     if (filters.sourceIp) query.source_ip = filters.sourceIp
     if (filters.vendor) query.vendor = filters.vendor
     if (filters.start) query.start = filters.start
     if (filters.end) query.end = filters.end
+    const history = recentHistory()
+    if (history.length) query.history = history
     return query
   }
 
@@ -271,10 +291,11 @@ export function LogAssistant() {
       <h2>Log Assistant</h2>
       <p className="page-hint">
         Ask a question in plain language and get an answer synthesized by a local LLM, backed by real queries against
-        your log data — not just a guess from matching log lines. Runs entirely on-host (see README): nothing here is
-        sent to an external service. Each question is answered independently (no memory of earlier questions in this
-        thread). The LLM call can take a while on CPU-only hardware — "Search only" skips it and just shows matching
-        log lines directly.
+        your log data — not just a guess from matching log lines. Follow-up questions ("what about yesterday?") can
+        reference earlier turns in this thread, but every number is re-verified against live data each time, not
+        assumed from memory — a number from a few turns ago may no longer be current. Runs entirely on-host (see
+        README): nothing here is sent to an external service. The LLM call can take a while on CPU-only hardware —
+        "Search only" skips it and just shows matching log lines directly.
       </p>
 
       <div className="chat-thread">
