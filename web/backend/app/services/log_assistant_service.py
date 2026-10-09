@@ -598,6 +598,11 @@ def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, 
     a comparison with no relative-time phrase at all. Also recognizes "N
     days ago/before/back" (see _parse_n_days_ago) as a third kind of period,
     alongside the three fixed phrases -- e.g. "today vs. three days before"."""
+    matched = _detect_named_periods(question, now)
+    return matched[:2] if len(matched) >= 2 else None
+
+
+def _detect_named_periods(question: str, now: datetime) -> list[tuple[str, datetime, datetime]]:
     bounds = _relative_time_bounds(now)
     lowered = question.lower()
     matched = [
@@ -608,7 +613,29 @@ def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, 
     n_days_ago = _parse_n_days_ago(question, now)
     if n_days_ago:
         matched.append(n_days_ago)
-    return matched[:2] if len(matched) >= 2 else None
+    return matched
+
+
+def _detect_single_period(question: str, now: datetime) -> tuple[str, datetime, datetime] | None:
+    """Like _detect_comparison_periods, but for a question naming exactly
+    ONE relative-time phrase (today/yesterday/this week/N days ago) rather
+    than two to compare -- e.g. a bare follow-up like 'what about
+    yesterday?'.
+
+    Confirmed necessary on net-flow: with no deterministic path for a
+    single-period question, the model was left to copy the precomputed
+    boundary from the prompt itself -- and failed, twice in a row, in two
+    different ways ('what about yesterday?' produced a zero-width
+    start==end window; the next turn's 'yesterday' produced an INVERTED
+    start-after-end window). Both returned count=0, which looked like
+    agreement between two independent checks but was actually the same
+    structural guarantee twice over: a degenerate window can only ever
+    return 0, whether or not the device had any real activity. This closes
+    that gap the same way the two-period case was already closed: the
+    model is not trusted to reproduce a date boundary via its own token
+    generation, however clearly it's spelled out for it."""
+    matched = _detect_named_periods(question, now)
+    return matched[0] if len(matched) == 1 else None
 
 
 # How many prior turns to replay into the prompt -- the frontend may send up
@@ -807,6 +834,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     sources: list[LogHit] = []
     needs_multiple = _needs_multiple_data_points(query.question)
     comparison_periods = _detect_comparison_periods(query.question, now)
+    # Mutually exclusive with comparison_periods by construction (2+ matches
+    # vs. exactly 1) -- only meaningful when comparison_periods is None.
+    single_period = _detect_single_period(query.question, now)
     periods_resolved = False
     data_tool_calls = 0
     grounded_counts: set[int] = set()
@@ -917,6 +947,47 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
                 }
                 log.info("Log Assistant tool call OVERRIDDEN (deterministic period comparison): %s -> %s", arguments, result)
+                messages.append({"role": "tool", "content": json.dumps(result)})
+                continue
+
+            if fn["name"] == "count_events" and single_period and not periods_resolved:
+                # Same idea as the comparison override above, for a question
+                # naming only ONE relative-time phrase ("what about
+                # yesterday?") rather than two to compare. Confirmed on
+                # net-flow this gap was real, not hypothetical: with no
+                # deterministic path here, the model's own call for
+                # "yesterday" produced a zero-width start==end window one
+                # turn, then an inverted start-after-end window the very
+                # next turn -- both silently returned count=0 regardless of
+                # whether the device had any real activity. See
+                # _detect_single_period's docstring for the full incident.
+                periods_resolved = True
+                label, period_start, period_end = single_period
+                filter_args = {k: v for k, v in arguments.items() if k not in ("start", "end")}
+                count = await asyncio.to_thread(
+                    log_search_service.count_events,
+                    ch_client,
+                    hostname=filter_args.get("hostname"),
+                    source_ip=filter_args.get("source_ip"),
+                    severity=filter_args.get("severity"),
+                    program=filter_args.get("program"),
+                    keyword=filter_args.get("keyword"),
+                    only_anomalies=bool(filter_args.get("only_anomalies", False)),
+                    start=period_start,
+                    end=period_end,
+                )
+                grounded_counts.add(count)
+                data_tool_calls += 1
+                result = {
+                    "note": "This is the exact, already-verified count for the period asked about. State it exactly as given.",
+                    "period": label,
+                    "count": count,
+                }
+                hits = []
+                known_identifiers |= {
+                    v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
+                }
+                log.info("Log Assistant tool call OVERRIDDEN (deterministic single period): %s -> %s", arguments, result)
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
