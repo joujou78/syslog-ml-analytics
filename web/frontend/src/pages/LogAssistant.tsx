@@ -97,6 +97,42 @@ function SourcesTable({ sources, coverageNote }: { sources: LogHit[]; coverageNo
   )
 }
 
+// Reveals `text` progressively, like a live chat reply being typed, instead
+// of the full answer appearing all at once. Purely a client-side display
+// effect -- the backend already returned the complete, final answer text in
+// one response by the time this renders (see this project's own
+// _post_chat_sync comment: real token-by-token streaming from Ollama over
+// an async transport is confirmed to hang on this exact model/host, so
+// that's deliberately not touched here). Keyed by the caller on turn.id, so
+// a parent re-render (e.g. a later turn being added) doesn't restart an
+// already-finished or in-progress animation.
+function TypedText({ text }: { text: string }) {
+  const [shown, setShown] = useState('')
+  useEffect(() => {
+    setShown('')
+    if (!text) return
+    let i = 0
+    // A handful of characters per tick, not one -- the wait for the answer
+    // itself is already long on CPU-only hardware; a literal one-char reveal
+    // of a multi-hundred-character answer would tack on several more
+    // seconds of pure animation on top of that.
+    const charsPerTick = Math.max(1, Math.ceil(text.length / 120))
+    const id = setInterval(() => {
+      i += charsPerTick
+      setShown(text.slice(0, i))
+      if (i >= text.length) clearInterval(id)
+    }, 12)
+    return () => clearInterval(id)
+  }, [text])
+  const done = shown.length >= text.length
+  return (
+    <>
+      {shown}
+      {!done && <span className="chat-typing-cursor" aria-hidden="true" />}
+    </>
+  )
+}
+
 // One exchange in the thread: a question the user sent (with whatever
 // filters were active at the time -- kept per-turn, not just globally,
 // since filters can change between messages and a past turn should still
@@ -254,7 +290,10 @@ export function LogAssistant() {
             <div className="chat-bubble chat-bubble-assistant">
               {turn.status === 'pending' && (
                 <div className="chat-bubble-label">
-                  {turn.kind === 'ask' ? 'Asking…' : 'Searching…'}
+                  {turn.kind === 'ask' ? 'Asking' : 'Searching'}
+                  <span className="chat-typing-dots">
+                    <span /><span /><span />
+                  </span>
                 </div>
               )}
               {turn.status === 'error' && <p className="form-error">{turn.error}</p>}
@@ -263,7 +302,9 @@ export function LogAssistant() {
                   {turn.kind === 'ask' && (
                     <>
                       <div className="chat-bubble-label">Answer{turn.model ? ` (${turn.model})` : ''}</div>
-                      <p className="chat-bubble-text">{turn.answer}</p>
+                      <p className="chat-bubble-text">
+                        <TypedText key={turn.id} text={turn.answer ?? ''} />
+                      </p>
                     </>
                   )}
                   {turn.sources && (
