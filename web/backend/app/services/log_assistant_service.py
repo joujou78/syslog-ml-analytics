@@ -842,6 +842,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     grounded_counts: set[int] = set()
     known_identifiers: set[str] = _identifiers_from_history(query.history)
     nudged = False
+    # Updated on every tool call attempt this turn, including a wrong-tool
+    # one that got redirected -- a best-effort filter hint for the hard
+    # backstop below, when the model gives up calling tools altogether
+    # before periods_resolved is ever reached.
+    attempted_filter_args: dict = {}
 
     for _ in range(MAX_TOOL_ITERATIONS):
         body = await asyncio.to_thread(
@@ -866,6 +871,59 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             answer = message["content"]
+            # Confirmed on net-flow: the wrong-tool redirect above works,
+            # but only AS FAR AS forcing a retry -- if the model, instead of
+            # retrying with count_events, just gives a tool-less final
+            # answer anyway, nothing stopped it from stating a NUMBER THAT
+            # NO TOOL EVER RETURNED, not even a misattributed real one. That
+            # answer's grounded_counts is empty (no tool call succeeded this
+            # turn), and the grounding check below has its own condition
+            # (`grounded_counts and ...`) short-circuit to False when empty
+            # -- so the single worst case, total fabrication with zero real
+            # data behind it, is exactly the one case that check couldn't
+            # catch. Since comparison_periods/single_period means we
+            # already know the exact boundaries needed, there's no reason
+            # to keep hoping the model gets there itself: force-resolve
+            # right here, using whatever device/filter hint its own
+            # (possibly wrong-tool) attempts this turn provided, falling
+            # back to conversation history, then hand it the real numbers
+            # and require it to just restate them.
+            if (comparison_periods or single_period) and not periods_resolved:
+                periods_resolved = True
+                hostname_hint = attempted_filter_args.get("hostname") or next(iter(known_identifiers), None)
+                periods_to_resolve = comparison_periods or [single_period]
+                labeled_counts = []
+                for label, period_start, period_end in periods_to_resolve:
+                    count = await asyncio.to_thread(
+                        log_search_service.count_events,
+                        ch_client,
+                        hostname=hostname_hint,
+                        source_ip=attempted_filter_args.get("source_ip"),
+                        severity=attempted_filter_args.get("severity"),
+                        program=attempted_filter_args.get("program"),
+                        keyword=attempted_filter_args.get("keyword"),
+                        only_anomalies=bool(attempted_filter_args.get("only_anomalies", False)),
+                        start=period_start,
+                        end=period_end,
+                    )
+                    labeled_counts.append({"period": label, "count": count})
+                    grounded_counts.add(count)
+                    data_tool_calls += 1
+                if hostname_hint:
+                    known_identifiers.add(hostname_hint)
+                messages.append(message)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You answered without calling count_events for this question. Here are the "
+                        f"exact, already-verified counts instead: {json.dumps(labeled_counts)}"
+                        + (f" (device: {hostname_hint})" if hostname_hint else "")
+                        + ". State these exactly as given -- do not call any tool again, and do not "
+                        "state a different number."
+                    ),
+                })
+                log.info("Log Assistant FORCE-RESOLVED period(s) after a tool-less answer: %s", labeled_counts)
+                continue
             # Confirmed on net-flow: a comparison question got "answered"
             # after a single tool call, with the second data point invented
             # out of nothing. Rather than trust the model's own judgment
@@ -904,6 +962,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
         for call in tool_calls:
             fn = call["function"]
             arguments = fn.get("arguments") or {}
+            attempted_filter_args.update(
+                {k: v for k, v in arguments.items() if k not in ("start", "end", "limit", "phrase") and v}
+            )
 
             if (comparison_periods or single_period) and not periods_resolved and fn["name"] != "count_events":
                 # Confirmed on net-flow: even with comparison_periods/
