@@ -640,12 +640,37 @@ def _format_history(history: list[ConversationTurn]) -> str:
     recent = history[-_MAX_HISTORY_TURNS_IN_PROMPT:]
     lines = [
         "Earlier in this conversation (context only -- time has passed, so re-verify with a fresh "
-        "tool call before restating any number from here rather than assuming it's still current):"
+        "tool call before restating any number from here rather than assuming it's still current). "
+        "If the CURRENT question doesn't name a device/host/filter of its own (e.g. 'what about "
+        "yesterday?'), it means the SAME one as the most recent turn below -- use that exact "
+        "device/filter in your tool call, never switch to an unfiltered or different one just "
+        "because the current question didn't repeat it:"
     ]
     for turn in recent:
         lines.append(f"Q: {turn.question}")
         lines.append(f"A: {_truncate(turn.answer, _MAX_MESSAGE_CHARS_IN_PROMPT)}")
     return "\n".join(lines)
+
+
+# Hostnames/IPs/device ids mentioned in prior turns routinely contain digit
+# runs of their own (e.g. 'SF-200-POE-DBN-01') -- confirmed as a real false
+# positive: a follow-up's answer that merely REPEATED a device name from
+# history (without that name appearing in any tool call/result THIS turn,
+# so _identifiers_from_result never saw it) had its embedded "200" misread
+# as an ungrounded claimed count. Token shape mirrors _identifiers_from_result's
+# intent (hostnames mix letters/digits/hyphens) rather than attempting real
+# hostname validation.
+_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,}")
+
+
+def _identifiers_from_history(history: list[ConversationTurn]) -> set[str]:
+    out: set[str] = set()
+    for turn in history:
+        for text in (turn.question, turn.answer):
+            for tok in _IDENTIFIER_TOKEN_RE.findall(text):
+                if len(tok) >= 4 and any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok):
+                    out.add(tok)
+    return out
 
 
 def _parse_tool_datetime(value) -> datetime | None:
@@ -785,7 +810,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     periods_resolved = False
     data_tool_calls = 0
     grounded_counts: set[int] = set()
-    known_identifiers: set[str] = set()
+    known_identifiers: set[str] = _identifiers_from_history(query.history)
     nudged = False
 
     for _ in range(MAX_TOOL_ITERATIONS):
