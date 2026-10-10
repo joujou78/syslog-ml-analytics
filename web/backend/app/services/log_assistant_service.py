@@ -328,6 +328,41 @@ def _wants_log_rows(question: str) -> bool:
     return any(marker in lowered for marker in _LOG_ROWS_MARKERS)
 
 
+# A second, separate regression found right after fixing the first one:
+# excluding "show me"-style questions wasn't enough, because the real
+# problem is the inverse of what that fix assumed. "what's going on with
+# authentication failures this week" mentions "this week" (single_period
+# matches) but is a genuinely topical/content question for semantic_search
+# -- not a "show me the rows" request either, so _wants_log_rows didn't
+# exclude it. The model correctly called semantic_search; the wrong-tool
+# redirect refused it anyway; the force-resolve backstop then fell back to
+# a LEFTOVER device hostname from conversation history (from an unrelated
+# earlier question in the same thread) and force-computed THAT device's
+# "this week" event count -- a real number, but with nothing to do with
+# "authentication failures" -- and the final answer stated it as if it
+# were the answer. A negative exclusion list for "doesn't want a count" was
+# never going to cover every way of asking a non-counting question.
+# Flipped to requiring a POSITIVE signal instead: explicit counting
+# language, a comparison (needs_multiple), or the question being
+# genuinely bare (no topical content of its own beyond the time phrase --
+# see _is_bare_followup) -- a bare follow-up is presumed to inherit
+# whatever intent the conversation already had, since there's nothing else
+# in it to go on; a longer, topical question that merely mentions a period
+# is not bare and must not be forced toward count_events just because of
+# that mention.
+_COUNT_INTENT_MARKERS = ("how many", "how much", "count of", "number of", "total of", "total number")
+
+
+def _wants_count(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _COUNT_INTENT_MARKERS)
+
+
+def _is_bare_followup(question: str) -> bool:
+    words = re.findall(r"[a-z']+", question.lower())
+    return len(words) <= 5
+
+
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
     """Exact numeric counts a tool call actually returned, for cross-checking
     against what the model later claims in its final answer -- deliberately
@@ -926,10 +961,17 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     # Gates the wrong-tool-redirect and force-resolve guards below (NOT the
     # count_events-correction overrides themselves, which stay unconditional
     # -- correcting a count_events call's own date math is always safe
-    # regardless of question phrasing). A question wanting actual log rows,
-    # not a count, must be allowed to use search_logs/semantic_search even
-    # when it also names a time period.
-    enforce_count_tool = bool((comparison_periods or single_period) and not _wants_log_rows(query.question))
+    # regardless of question phrasing). Requires a POSITIVE signal that the
+    # question actually wants a count -- explicit counting language, a
+    # comparison, or being a bare follow-up with no topical content of its
+    # own -- rather than just the absence of a "wants rows" phrase; see
+    # _is_bare_followup's docstring for why a negative-only exclusion list
+    # already proved insufficient once.
+    enforce_count_tool = bool(
+        (comparison_periods or single_period)
+        and not _wants_log_rows(query.question)
+        and (needs_multiple or _wants_count(query.question) or _is_bare_followup(query.question))
+    )
     periods_resolved = False
     data_tool_calls = 0
     grounded_counts: set[int] = set()
