@@ -510,6 +510,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "hostname": {"type": "string"},
                     "source_ip": {"type": "string"},
+                    "vendor": {"type": "string"},
                     "severity": {"type": "string", "enum": ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"], "description": "Omit entirely if the question does not ask about a specific severity -- these 8 values are the ONLY valid ones, never 'none' or 'any'."},
                     "program": {"type": "string", "description": "The syslog process/service name (e.g. 'sshd', 'kernel') -- NEVER a hostname or device name."},
                     "keyword": {"type": "string", "description": "Substring to match in the log message"},
@@ -535,6 +536,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "hostname": {"type": "string"},
                     "source_ip": {"type": "string"},
+                    "vendor": {"type": "string"},
                     "severity": {"type": "string", "enum": ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"], "description": "Omit entirely if the question does not ask about a specific severity -- these 8 values are the ONLY valid ones, never 'none' or 'any'."},
                     "program": {"type": "string", "description": "The syslog process/service name (e.g. 'sshd', 'kernel') -- NEVER a hostname or device name."},
                     "keyword": {"type": "string", "description": "Substring to match in the log message"},
@@ -943,12 +945,25 @@ def _sanitize_equality_filters(args: dict) -> dict:
     hostname=(the same value), but `program` holds a process/service name
     (e.g. 'sshd'), never a hostname, so that condition can also never
     match any row -- again silently forcing count=0 on what should have
-    been a real, non-zero count. Returns a copy with any such field
-    cleared to None; everything else passes through unchanged."""
+    been a real, non-zero count; (3) a generic placeholder word in place of
+    simply omitting an optional argument -- confirmed: a redirected
+    semantic_search call during a UI-filter test carried vendor='None' (the
+    literal string, not Python None) straight through from the model's own
+    JSON. `vendor` has no fixed enum to validate against the way severity
+    does, but it's open-ended free text describing a real vendor name
+    ('mikrotik', 'cisco', ...), and no real vendor is ever literally the
+    word 'none'/'null'/etc, so these are always a placeholder rather than a
+    genuine filter whatever field they show up in. Returns a copy with any
+    such field cleared to None; everything else passes through unchanged."""
+    _PLACEHOLDER_STRINGS = frozenset({"none", "null", "n/a", "na", "unknown", "any", "unset", ""})
     out = dict(args)
     severity = out.get("severity")
     if isinstance(severity, str) and severity.strip().lower() not in _VALID_SEVERITIES:
         out["severity"] = None
+    for field in ("hostname", "source_ip", "vendor", "program", "keyword"):
+        value = out.get(field)
+        if isinstance(value, str) and value.strip().lower() in _PLACEHOLDER_STRINGS:
+            out[field] = None
     hostname = out.get("hostname")
     if isinstance(hostname, str) and hostname.strip():
         for field in ("program", "vendor", "source_ip", "keyword"):
@@ -986,6 +1001,7 @@ async def _execute_tool(
             ch_client,
             hostname=arguments.get("hostname"),
             source_ip=arguments.get("source_ip"),
+            vendor=arguments.get("vendor"),
             severity=arguments.get("severity"),
             program=arguments.get("program"),
             keyword=arguments.get("keyword"),
@@ -1001,6 +1017,7 @@ async def _execute_tool(
             ch_client,
             hostname=arguments.get("hostname"),
             source_ip=arguments.get("source_ip"),
+            vendor=arguments.get("vendor"),
             severity=arguments.get("severity"),
             program=arguments.get("program"),
             keyword=arguments.get("keyword"),
@@ -1168,7 +1185,20 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 filter_args = _sanitize_equality_filters(
                     _filter_args_for_period_override(query.question, query.history, attempted_filter_args)
                 )
-                hostname_hint = filter_args.get("hostname") or next(iter(known_identifiers), None)
+                # The known_identifiers sweep is a last resort, deliberately NOT
+                # consulted when source_ip/vendor already scope this query: the
+                # same thread-wide, unordered-set ambiguity Test 7 fixed for a
+                # bare follow-up's PRIMARY identifier choice still applies here
+                # one layer down (next(iter(...)) can surface ANY identifier
+                # ever mentioned in the thread, including an unrelated one from
+                # a much earlier turn) -- confirmed live in Test 12 ("and this
+                # week?" with an explicit UI source_ip filter already active):
+                # adding an unrelated hostname on top of an already-sufficient
+                # source_ip would have formed an impossible AND, forcing a false
+                # zero on what should have been a real, non-zero count.
+                hostname_hint = filter_args.get("hostname")
+                if not hostname_hint and not filter_args.get("source_ip") and not filter_args.get("vendor"):
+                    hostname_hint = next(iter(known_identifiers), None)
                 periods_to_resolve = comparison_periods or [single_period]
                 labeled_counts = []
                 for label, period_start, period_end in periods_to_resolve:
@@ -1177,6 +1207,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         ch_client,
                         hostname=hostname_hint,
                         source_ip=filter_args.get("source_ip"),
+                        vendor=filter_args.get("vendor"),
                         severity=filter_args.get("severity"),
                         program=filter_args.get("program"),
                         keyword=filter_args.get("keyword"),
@@ -1200,7 +1231,16 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         "state a different number."
                     ),
                 })
-                log.info("Log Assistant FORCE-RESOLVED period(s) after a tool-less answer: %s", labeled_counts)
+                # Logs the actual filter_args/hostname_hint used, same reasoning
+                # as the other two overrides' logging fix -- this exact gap made
+                # Test 12 unverifiable from the log alone (no way to tell whether
+                # hostname_hint silently added a wrong device on top of the
+                # explicit source_ip filter already in play).
+                log.info(
+                    "Log Assistant FORCE-RESOLVED period(s) after a tool-less answer: "
+                    "filter=%s hostname_hint=%s -> %s",
+                    filter_args, hostname_hint, labeled_counts,
+                )
                 continue
             # Confirmed on net-flow: a comparison question got "answered"
             # after a single tool call, with the second data point invented
@@ -1311,6 +1351,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         ch_client,
                         hostname=filter_args.get("hostname"),
                         source_ip=filter_args.get("source_ip"),
+                        vendor=filter_args.get("vendor"),
                         severity=filter_args.get("severity"),
                         program=filter_args.get("program"),
                         keyword=filter_args.get("keyword"),
@@ -1370,6 +1411,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     ch_client,
                     hostname=filter_args.get("hostname"),
                     source_ip=filter_args.get("source_ip"),
+                    vendor=filter_args.get("vendor"),
                     severity=filter_args.get("severity"),
                     program=filter_args.get("program"),
                     keyword=filter_args.get("keyword"),
