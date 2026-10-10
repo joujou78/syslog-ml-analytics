@@ -1059,6 +1059,23 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 {k: v for k, v in arguments.items() if k not in ("start", "end", "limit", "phrase") and v}
             )
 
+            # Confirmed on net-flow: "show me warning logs ... yesterday" (an
+            # explicit row-listing request, not a count -- enforce_count_tool
+            # is correctly False for it) got search_logs called with
+            # start==end for "yesterday", the exact zero-width-window bug
+            # already fixed for count_events -- but that fix only ever
+            # corrected count_events's own arguments. search_logs and
+            # semantic_search take the identical start/end arguments and are
+            # equally vulnerable to the same unreliable date arithmetic;
+            # nothing was correcting theirs. count_events is excluded here
+            # since it already gets its own, more thorough override below
+            # (which also fetches/labels the result, not just the dates).
+            if single_period and not comparison_periods and fn["name"] in ("search_logs", "semantic_search", "list_devices"):
+                _, period_start, period_end = single_period
+                fmt = "%Y-%m-%dT%H:%M:%S"
+                arguments["start"] = period_start.strftime(fmt)
+                arguments["end"] = period_end.strftime(fmt)
+
             if enforce_count_tool and not periods_resolved and fn["name"] != "count_events":
                 # Confirmed on net-flow: even with comparison_periods/
                 # single_period correctly identifying this as a "count over
