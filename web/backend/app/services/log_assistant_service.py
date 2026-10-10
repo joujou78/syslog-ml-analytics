@@ -630,9 +630,28 @@ _NUMBER_WORDS = {
 # Unlike arbitrary date phrasing ("last Monday", "the 1st of October"), which
 # can't practically be enumerated, "N days ago" is a small, well-defined
 # pattern worth parsing directly rather than hardcoding every example of it.
+# \d{1,4} (not {1,3}) to allow the bound below (up to 3650) to actually be
+# reachable -- a 3-digit cap on the regex silently truncated any 4+ digit
+# day count before _MAX_N_DAYS_AGO ever got a chance to validate it.
 _N_DAYS_AGO_RE = re.compile(
-    r"\b(\d{1,3}|" + "|".join(_NUMBER_WORDS) + r")\s+days?\s+(?:ago|before|back)\b", re.IGNORECASE,
+    r"\b(\d{1,4}|" + "|".join(_NUMBER_WORDS) + r")\s+days?\s+(?:ago|before|back)\b", re.IGNORECASE,
 )
+# `events` has no TTL (retained indefinitely by explicit design choice -- see
+# clickhouse/init.sql) so there's no principled reason to reject a count
+# further back than 365 days. Confirmed on net-flow as a real gap, not just
+# a theoretical one: "how many events 400 days ago" fell outside the old
+# 1-365 bound, so NONE of the deterministic machinery below (or even the
+# precomputed today/yesterday/this-week hints) applied, and the model was
+# left to invent its own window -- it produced a 3-month span in entirely
+# the wrong part of the calendar (nowhere near 400 real days before now).
+# The answer still came back 0 and so LOOKED fine, purely because this young
+# deployment has no data in either the real or the fabricated window -- with
+# real historical data, this would have confidently answered the wrong
+# question with no grounding-check mismatch to catch it (the model honestly
+# echoed what its own, wrongly-windowed tool call returned). 3650 (10 years)
+# is a generous bound that covers any realistic query while still rejecting
+# pathological input that could otherwise overflow datetime arithmetic.
+_MAX_N_DAYS_AGO = 3650
 
 
 def _parse_n_days_ago(question: str, now: datetime) -> tuple[str, datetime, datetime] | None:
@@ -641,7 +660,7 @@ def _parse_n_days_ago(question: str, now: datetime) -> tuple[str, datetime, date
         return None
     raw = match.group(1)
     n = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
-    if not 1 <= n <= 365:
+    if not 1 <= n <= _MAX_N_DAYS_AGO:
         return None
     day_start = (now - timedelta(days=n)).replace(hour=0, minute=0, second=0, microsecond=0)
     return f"{n} day(s) ago", day_start, day_start + timedelta(days=1)
@@ -1314,7 +1333,18 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 known_identifiers |= {
                     v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
                 }
-                log.info("Log Assistant tool call OVERRIDDEN (deterministic period comparison): %s -> %s", arguments, result)
+                # Logs the ACTUAL filter/windows used (filter_args + comparison_periods),
+                # not just the model's raw, now-discarded `arguments` -- confirmed on
+                # net-flow that logging only `arguments` here was actively misleading
+                # during a later investigation: the real, deterministic start/end this
+                # override used is invisible in that case, so a correct answer and
+                # the model's own (irrelevant) date-math mistake were indistinguishable
+                # from the log alone.
+                log.info(
+                    "Log Assistant tool call OVERRIDDEN (deterministic period comparison): "
+                    "model_args=%s -> filter=%s periods=%s -> %s",
+                    arguments, filter_args, comparison_periods, result,
+                )
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
@@ -1358,7 +1388,14 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 known_identifiers |= {
                     v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
                 }
-                log.info("Log Assistant tool call OVERRIDDEN (deterministic single period): %s -> %s", arguments, result)
+                # See the comparison override above for why this logs the actual
+                # filter_args/period_start/period_end used, not just the model's
+                # raw (discarded) `arguments`.
+                log.info(
+                    "Log Assistant tool call OVERRIDDEN (deterministic single period): "
+                    "model_args=%s -> filter=%s period=%s(%s to %s) -> %s",
+                    arguments, filter_args, label, period_start, period_end, result,
+                )
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
