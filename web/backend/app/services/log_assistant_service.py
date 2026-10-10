@@ -762,14 +762,95 @@ def _format_history(history: list[ConversationTurn]) -> str:
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,}")
 
 
+def _looks_like_identifier_token(tok: str) -> bool:
+    """A hostname/IP/device-id token, as opposed to an ordinary English word
+    that happens to match _IDENTIFIER_TOKEN_RE's shape. Originally required
+    a digit AND a letter (hostnames 'routinely' mix both, e.g.
+    'SF-200-POE-DBN-01') -- confirmed wrong on net-flow (Test 7) for a
+    purely alphabetic, underscore-separated hostname
+    ('PTP_Ksara_to_Chams_Anjar'): it never satisfied the digit requirement,
+    so it was silently invisible to every identifier-tracking path that
+    uses this check, including the one meant to carry it across a
+    follow-up turn. A token now also qualifies via a separator character
+    (_, -, .) instead of a digit -- still excludes plain prose words like
+    'today'/'events', which have neither digits nor separators.
+    """
+    return (
+        len(tok) >= 4
+        and any(c.isalpha() for c in tok)
+        and (any(c.isdigit() for c in tok) or any(c in "_-." for c in tok))
+    )
+
+
+def _strip_trailing_punctuation(tok: str) -> str:
+    """A plain prose word directly followed by sentence punctuation
+    ('today.', at the end of a sentence) is swept up by _IDENTIFIER_TOKEN_RE
+    (its char class includes '.') and, since a trailing '.' alone now
+    satisfies _looks_like_identifier_token's separator check, would
+    otherwise false-positive as a device-id-shaped token. Stripped before
+    that check runs so only real embedded separators ('SW-42-Beirut',
+    'PTP_Ksara_to_Chams_Anjar') still qualify."""
+    return tok.rstrip(".,!?;:")
+
+
 def _identifiers_from_history(history: list[ConversationTurn]) -> set[str]:
     out: set[str] = set()
     for turn in history:
         for text in (turn.question, turn.answer):
-            for tok in _IDENTIFIER_TOKEN_RE.findall(text):
-                if len(tok) >= 4 and any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok):
+            for raw_tok in _IDENTIFIER_TOKEN_RE.findall(text):
+                tok = _strip_trailing_punctuation(raw_tok)
+                if _looks_like_identifier_token(tok):
                     out.add(tok)
     return out
+
+
+def _filter_args_for_period_override(
+    question: str, history: list[ConversationTurn], model_filter_args: dict,
+) -> dict:
+    """What a deterministic period override (single-period or comparison)
+    should actually filter count_events by: the model's own call
+    arguments (or, in the tool-less force-resolve path, this turn's
+    best-effort attempted_filter_args) -- UNLESS this is a bare follow-up,
+    in which case the ENTIRE filter is replaced with just the entity from
+    the turn directly before it (see _primary_identifier_from_last_turn).
+    A bare follow-up has no topical content of its own, so nothing this
+    turn's call guessed -- or an earlier, unrelated turn's leftover filter
+    -- can be trusted over the immediately preceding turn's own topic.
+    Falls back to model_filter_args unchanged when no last-turn identifier
+    is found (nothing better to go on).
+    """
+    if _is_bare_followup(question):
+        hint = _primary_identifier_from_last_turn(history)
+        if hint:
+            return {"hostname": hint}
+    return model_filter_args
+
+
+def _primary_identifier_from_last_turn(history: list[ConversationTurn]) -> str | None:
+    """For a bare follow-up ("and yesterday?") with no topical content of
+    its own, the entity it refers to is whatever the IMMEDIATELY PRECEDING
+    turn was about -- not just anything mentioned anywhere earlier in a
+    long thread. Confirmed on net-flow as a real bug (Test 7): the thread
+    also contained an earlier, unrelated turn about network-wide
+    authentication failures; when "and yesterday?" followed a turn about
+    one specific device, the model's own tool call carried over a
+    `keyword="authentication failure"` filter from that EARLIER topic
+    instead of the device from the turn directly before it, and the
+    deterministic period override (which only corrects start/end, not
+    hostname/keyword/severity/program) executed that stale filter
+    verbatim -- a real, grounded count, for entirely the wrong question.
+    Scoped to ONLY the last turn (not swept across the whole history as a
+    set) so the most recent topic always wins over an older one.
+    """
+    if not history:
+        return None
+    last = history[-1]
+    for text in (last.answer, last.question):
+        for raw_tok in _IDENTIFIER_TOKEN_RE.findall(text):
+            tok = _strip_trailing_punctuation(raw_tok)
+            if _looks_like_identifier_token(tok):
+                return tok
+    return None
 
 
 def _parse_tool_datetime(value) -> datetime | None:
@@ -1025,7 +1106,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             # and require it to just restate them.
             if enforce_count_tool and not periods_resolved:
                 periods_resolved = True
-                hostname_hint = attempted_filter_args.get("hostname") or next(iter(known_identifiers), None)
+                filter_args = _filter_args_for_period_override(query.question, query.history, attempted_filter_args)
+                hostname_hint = filter_args.get("hostname") or next(iter(known_identifiers), None)
                 periods_to_resolve = comparison_periods or [single_period]
                 labeled_counts = []
                 for label, period_start, period_end in periods_to_resolve:
@@ -1033,11 +1115,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         log_search_service.count_events,
                         ch_client,
                         hostname=hostname_hint,
-                        source_ip=attempted_filter_args.get("source_ip"),
-                        severity=attempted_filter_args.get("severity"),
-                        program=attempted_filter_args.get("program"),
-                        keyword=attempted_filter_args.get("keyword"),
-                        only_anomalies=_parse_tool_bool(attempted_filter_args.get("only_anomalies")),
+                        source_ip=filter_args.get("source_ip"),
+                        severity=filter_args.get("severity"),
+                        program=filter_args.get("program"),
+                        keyword=filter_args.get("keyword"),
+                        only_anomalies=_parse_tool_bool(filter_args.get("only_anomalies")),
                         start=period_start,
                         end=period_end,
                     )
@@ -1157,7 +1239,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 # that -- both numbers were individually real, from actual
                 # tool calls, so the grounding check alone didn't catch it).
                 periods_resolved = True
-                filter_args = {k: v for k, v in arguments.items() if k not in ("start", "end")}
+                filter_args = _filter_args_for_period_override(
+                    query.question, query.history,
+                    {k: v for k, v in arguments.items() if k not in ("start", "end")},
+                )
                 labeled_counts = []
                 for label, period_start, period_end in comparison_periods:
                     count = await asyncio.to_thread(
@@ -1204,7 +1289,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 # _detect_single_period's docstring for the full incident.
                 periods_resolved = True
                 label, period_start, period_end = single_period
-                filter_args = {k: v for k, v in arguments.items() if k not in ("start", "end")}
+                filter_args = _filter_args_for_period_override(
+                    query.question, query.history,
+                    {k: v for k, v in arguments.items() if k not in ("start", "end")},
+                )
                 count = await asyncio.to_thread(
                     log_search_service.count_events,
                     ch_client,
