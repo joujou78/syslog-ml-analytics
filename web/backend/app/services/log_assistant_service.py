@@ -510,8 +510,8 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "hostname": {"type": "string"},
                     "source_ip": {"type": "string"},
-                    "severity": {"type": "string", "description": "e.g. emerg, alert, crit, err, warning, notice, info, debug"},
-                    "program": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"], "description": "Omit entirely if the question does not ask about a specific severity -- these 8 values are the ONLY valid ones, never 'none' or 'any'."},
+                    "program": {"type": "string", "description": "The syslog process/service name (e.g. 'sshd', 'kernel') -- NEVER a hostname or device name."},
                     "keyword": {"type": "string", "description": "Substring to match in the log message"},
                     "only_anomalies": {"type": "boolean"},
                     "start": {"type": "string", "description": "ISO 8601 UTC start"},
@@ -535,8 +535,8 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "hostname": {"type": "string"},
                     "source_ip": {"type": "string"},
-                    "severity": {"type": "string", "description": "e.g. emerg, alert, crit, err, warning, notice, info, debug"},
-                    "program": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"], "description": "Omit entirely if the question does not ask about a specific severity -- these 8 values are the ONLY valid ones, never 'none' or 'any'."},
+                    "program": {"type": "string", "description": "The syslog process/service name (e.g. 'sshd', 'kernel') -- NEVER a hostname or device name."},
                     "keyword": {"type": "string", "description": "Substring to match in the log message"},
                     "only_anomalies": {"type": "boolean"},
                     "start": {"type": "string", "description": "ISO 8601 UTC start"},
@@ -900,11 +900,51 @@ def _parse_tool_bool(value) -> bool:
     return False
 
 
+# Mirrors web/frontend/src/pages/Logs.tsx's SEVERITY_OPTIONS -- the real,
+# fixed set of values the `severity` column actually holds (see
+# clickhouse/init.sql). Kept here rather than imported since this is a
+# backend service importing from a frontend source file; duplication is
+# the lesser evil (flagged in both places' comments pointing at each
+# other), not a reason to skip validating against it.
+_VALID_SEVERITIES = frozenset({"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"})
+
+
+def _sanitize_equality_filters(args: dict) -> dict:
+    """Guards two confirmed net-flow failure modes in the model's own tool-
+    call arguments, neither caught by _parse_tool_bool/_parse_tool_int
+    since both are valid-shaped strings, not an obviously-wrong type:
+    (1) a severity value the model invented instead of omitting the
+    argument -- confirmed: the literal string 'none' (not one of the 8 real
+    severities above) for 'how many events ... yesterday', which
+    _build_conditions' `if value:` check still treats as a real filter,
+    silently forcing count=0 regardless of the real answer; (2)
+    duplicating the hostname's own value into an unrelated equality field
+    -- confirmed: 'how many events today for PTP_Ksara_to_Chams_Anjar'
+    called count_events with program='PTP_Ksara_to_Chams_Anjar' as well as
+    hostname=(the same value), but `program` holds a process/service name
+    (e.g. 'sshd'), never a hostname, so that condition can also never
+    match any row -- again silently forcing count=0 on what should have
+    been a real, non-zero count. Returns a copy with any such field
+    cleared to None; everything else passes through unchanged."""
+    out = dict(args)
+    severity = out.get("severity")
+    if isinstance(severity, str) and severity.strip().lower() not in _VALID_SEVERITIES:
+        out["severity"] = None
+    hostname = out.get("hostname")
+    if isinstance(hostname, str) and hostname.strip():
+        for field in ("program", "vendor", "source_ip", "keyword"):
+            value = out.get(field)
+            if isinstance(value, str) and value.strip().lower() == hostname.strip().lower():
+                out[field] = None
+    return out
+
+
 async def _execute_tool(
     name: str, arguments: dict, os_client: OpenSearch, ch_client: Client,
 ) -> tuple[dict, list[LogHit]]:
     """Returns (JSON-able result for the model, LogHits to surface as this
     response's cited sources -- only semantic_search produces any)."""
+    arguments = _sanitize_equality_filters(arguments)
     if name == "list_devices":
         result = await asyncio.to_thread(
             device_service.list_devices,
@@ -1106,7 +1146,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             # and require it to just restate them.
             if enforce_count_tool and not periods_resolved:
                 periods_resolved = True
-                filter_args = _filter_args_for_period_override(query.question, query.history, attempted_filter_args)
+                filter_args = _sanitize_equality_filters(
+                    _filter_args_for_period_override(query.question, query.history, attempted_filter_args)
+                )
                 hostname_hint = filter_args.get("hostname") or next(iter(known_identifiers), None)
                 periods_to_resolve = comparison_periods or [single_period]
                 labeled_counts = []
@@ -1239,10 +1281,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 # that -- both numbers were individually real, from actual
                 # tool calls, so the grounding check alone didn't catch it).
                 periods_resolved = True
-                filter_args = _filter_args_for_period_override(
+                filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
                     query.question, query.history,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
-                )
+                ))
                 labeled_counts = []
                 for label, period_start, period_end in comparison_periods:
                     count = await asyncio.to_thread(
@@ -1289,10 +1331,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 # _detect_single_period's docstring for the full incident.
                 periods_resolved = True
                 label, period_start, period_end = single_period
-                filter_args = _filter_args_for_period_override(
+                filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
                     query.question, query.history,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
-                )
+                ))
                 count = await asyncio.to_thread(
                     log_search_service.count_events,
                     ch_client,
