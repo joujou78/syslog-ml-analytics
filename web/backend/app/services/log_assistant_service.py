@@ -32,7 +32,7 @@ from opensearchpy import OpenSearch
 from app.core.ch_time import ch_literal
 from app.core.config import settings
 from app.schemas.log_assistant import AskResponse, ConversationTurn, LogAssistantQuery, LogHit
-from app.services import device_service, log_search_service
+from app.services import anomaly_summary_service, device_service, log_search_service
 
 log = logging.getLogger("log_assistant_service")
 
@@ -473,7 +473,10 @@ _AGENT_INSTRUCTIONS = (
     "already -- the first one is the answer), or to look up/disambiguate a device by a partial or "
     "casual name via its optional hostname parameter (a case-insensitive substring match). Once you "
     "know a device's exact real hostname, though, use count_events/search_logs for its actual counts "
-    "or log content -- never substitute list_devices' event_count for a real count_events call. For "
+    "or log content -- never substitute list_devices' event_count for a real count_events call. Use "
+    "anomaly_summary for 'which device/vendor has the most anomalies' or 'what anomaly reasons are "
+    "most common' -- it is a cumulative, ALL-TIME view (not scoped to a time period you'd give it "
+    "start/end for), and never claims acknowledgment status. For "
     "'how many events/logs' for a specific device, "
     "severity, or filter -- including comparing two time periods -- use count_events once PER time "
     "period being asked about (e.g. once for today, once for yesterday); it returns an exact total, "
@@ -511,6 +514,28 @@ TOOL_DEFINITIONS = [
                     "end": {"type": "string", "description": "ISO 8601 UTC end. Omit to mean 'now'."},
                     "hostname": {"type": "string", "description": "Optional: find devices whose hostname contains this text (case-insensitive substring match) -- use this to look up or disambiguate a device by a partial/casual name (e.g. 'anjar' finds every device with 'anjar' anywhere in its name). Omit entirely for a plain busiest-first ranking."},
                     "limit": {"type": "integer", "description": "Max devices to return. Default 10."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "anomaly_summary",
+            "description": (
+                "Returns which devices (or vendors) have triggered the most anomalies, and why "
+                "(each anomaly_reason), ranked by event count -- a CUMULATIVE, ALL-TIME view (not "
+                "scoped to any time window, matching the Anomaly Summary page), since acknowledgment "
+                "review needs a stable count from the beginning, not a rolling one. Use for 'which "
+                "device/vendor has the most anomalies', 'what anomaly reasons are most common', or "
+                "'has X device had anomaly type Y'. Does NOT include acknowledgment status (whether "
+                "someone has already reviewed/dismissed it) -- don't claim to know that from this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default): one row per device+reason. 'vendor': aggregated across every device of that vendor."},
+                    "limit": {"type": "integer", "description": "Max rows to return, ranked by event count. Default 10."},
                 },
             },
         },
@@ -1210,6 +1235,34 @@ async def _execute_tool(
                 "seemed related."
             )
         return list_result, []
+
+    if name == "anomaly_summary":
+        limit = min(_parse_tool_int(arguments.get("limit"), 10), 50)
+        note = (
+            "Cumulative, ALL-TIME totals (not scoped to any time window) -- do not describe this as "
+            "'today' or 'this week'. Does not include acknowledgment status."
+        )
+        if arguments.get("group_by") == "vendor":
+            rows = await asyncio.to_thread(anomaly_summary_service.list_vendor_summary, ch_client)
+            return {
+                "anomaly_summary_by_vendor_sorted_busiest_first": [
+                    {"vendor": r.vendor, "anomaly_reason": r.anomaly_reason, "device_count": r.device_count,
+                     "event_count": r.event_count, "first_seen": r.first_seen.isoformat(),
+                     "last_seen": r.last_seen.isoformat()}
+                    for r in rows[:limit]
+                ],
+                "note": note,
+            }, []
+        rows = await asyncio.to_thread(anomaly_summary_service.list_device_summary, ch_client)
+        return {
+            "anomaly_summary_by_device_sorted_busiest_first": [
+                {"hostname": r["hostname"], "source_ip": r["source_ip"], "vendor": r["vendor"],
+                 "anomaly_reason": r["anomaly_reason"], "event_count": r["event_count"],
+                 "first_seen": r["first_seen"].isoformat(), "last_seen": r["last_seen"].isoformat()}
+                for r in rows[:limit]
+            ],
+            "note": note,
+        }, []
 
     if name == "count_events":
         count, hostname_note = await _count_events_resolving_hostname(
