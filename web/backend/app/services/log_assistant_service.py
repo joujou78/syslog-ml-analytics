@@ -1296,7 +1296,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         f"exact, already-verified counts instead: {json.dumps(labeled_counts)}"
                         + (
                             f" -- scoped to {_describe_filter_scope(filter_args)}, say so explicitly, "
-                            "not the whole network"
+                            "not the whole network, and do not mention any OTHER device, IP, or filter"
                             if _describe_filter_scope(filter_args) else
                             " -- for the WHOLE NETWORK (no device/vendor filter applied), say so "
                             "explicitly, do not attribute it to any single device"
@@ -1441,7 +1441,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     "note": (
                         "These are the exact, already-verified counts for every period being compared, "
                         f"scoped to {scope} -- say explicitly that they're for {scope}, not the whole "
-                        "network. "
+                        "network, and do not mention any OTHER device, IP, or filter. "
                         if scope else
                         "These are the exact, already-verified counts for every period being compared, "
                         "for the WHOLE NETWORK (no device/vendor filter applied) -- say so explicitly, "
@@ -1508,7 +1508,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     "note": (
                         "This is the exact, already-verified count for the period asked about, "
                         f"scoped to {scope}. Say explicitly that it's for {scope}, not the whole "
-                        "network. State the number exactly as given."
+                        "network, and do not mention any OTHER device, IP, or filter. State the "
+                        "number exactly as given."
                         if scope else
                         "This is the exact, already-verified count for the period asked about, "
                         "for the WHOLE NETWORK (no device/vendor filter applied). Say so explicitly "
@@ -1542,10 +1543,22 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 # count_events call removes this path entirely rather than
                 # trying to catch a bad substitution after the fact in the
                 # final answer's text.
+                # Re-states the scope description here too, not just where periods
+                # were first resolved -- confirmed on net-flow that it doesn't
+                # survive the model making further (refused) tool-call attempts
+                # afterward: a comparison scoped to vendor=mikrotik still said "on
+                # the network" in its FINAL answer once this refusal fired in
+                # between, because the original scope instruction was by then
+                # several messages back. Repeating it right before the model's
+                # last chance to answer keeps it close enough to actually stick.
+                resolved_scope = _describe_filter_scope(filter_args)
                 result = {
                     "error": (
                         "Already answered -- use the labeled today/yesterday/this-week results already "
-                        "given above. Do not call count_events again for this question."
+                        "given above"
+                        + (f" (scoped to {resolved_scope}, say so explicitly)" if resolved_scope else
+                           " (for the WHOLE NETWORK, say so explicitly)")
+                        + ". Do not call count_events again for this question."
                     ),
                 }
                 hits = []
