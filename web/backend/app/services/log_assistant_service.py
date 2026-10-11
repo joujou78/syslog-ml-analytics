@@ -825,6 +825,29 @@ def _identifiers_from_history(history: list[ConversationTurn]) -> set[str]:
     return out
 
 
+def _describe_filter_scope(filter_args: dict) -> str | None:
+    """Human-readable summary of which device/vendor a deterministic
+    override's count is actually scoped to, for folding into the
+    instruction the override hands back to the model. Confirmed as a real
+    gap: scoped to source_ip=172.20.17.68 via an explicit UI filter (a
+    real, grounded, correctly-filtered count), the model's own final
+    answer still phrased it as "events on the network today" -- implying
+    unfiltered -- because nothing in the override's result told it this
+    was scoped to one device rather than the whole network. Returns None
+    when nothing scopes the query (a genuine network-wide count), so the
+    caller can state that plainly instead of naming an empty scope."""
+    parts = [
+        f"{field}={value}"
+        for field, value in (
+            ("hostname", filter_args.get("hostname")),
+            ("source_ip", filter_args.get("source_ip")),
+            ("vendor", filter_args.get("vendor")),
+        )
+        if value
+    ]
+    return ", ".join(parts) if parts else None
+
+
 def _filter_args_for_period_override(
     query: LogAssistantQuery, model_filter_args: dict,
 ) -> dict:
@@ -1271,7 +1294,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     "content": (
                         "You answered without calling count_events for this question. Here are the "
                         f"exact, already-verified counts instead: {json.dumps(labeled_counts)}"
-                        + (f" (device: {hostname_hint})" if hostname_hint else "")
+                        + (
+                            f" -- scoped to {_describe_filter_scope(filter_args)}, say so explicitly, "
+                            "not the whole network"
+                            if _describe_filter_scope(filter_args) else
+                            " -- for the WHOLE NETWORK (no device/vendor filter applied), say so "
+                            "explicitly, do not attribute it to any single device"
+                        )
                         + ". State these exactly as given -- do not call any tool again, and do not "
                         "state a different number."
                     ),
@@ -1407,9 +1436,17 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     labeled_counts.append({"period": label, "count": count})
                     grounded_counts.add(count)
                     data_tool_calls += 1
+                scope = _describe_filter_scope(filter_args)
                 result = {
                     "note": (
-                        "These are the exact, already-verified counts for every period being compared. "
+                        "These are the exact, already-verified counts for every period being compared, "
+                        f"scoped to {scope} -- say explicitly that they're for {scope}, not the whole "
+                        "network. "
+                        if scope else
+                        "These are the exact, already-verified counts for every period being compared, "
+                        "for the WHOLE NETWORK (no device/vendor filter applied) -- say so explicitly, "
+                        "do not attribute them to any single device. "
+                    ) + (
                         "State them exactly as labeled -- do not call count_events again for this "
                         "comparison, and do not swap or relabel which number belongs to which period."
                     ),
@@ -1466,8 +1503,17 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 )
                 grounded_counts.add(count)
                 data_tool_calls += 1
+                scope = _describe_filter_scope(filter_args)
                 result = {
-                    "note": "This is the exact, already-verified count for the period asked about. State it exactly as given.",
+                    "note": (
+                        "This is the exact, already-verified count for the period asked about, "
+                        f"scoped to {scope}. Say explicitly that it's for {scope}, not the whole "
+                        "network. State the number exactly as given."
+                        if scope else
+                        "This is the exact, already-verified count for the period asked about, "
+                        "for the WHOLE NETWORK (no device/vendor filter applied). Say so explicitly "
+                        "-- do not attribute it to any single device. State the number exactly as given."
+                    ),
                     "period": label,
                     "count": count,
                 }
