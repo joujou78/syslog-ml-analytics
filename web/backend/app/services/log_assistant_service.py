@@ -1077,26 +1077,47 @@ async def _resolve_hostname_fuzzy(ch_client: Client, hostname: str) -> tuple[str
     where an operator typing a deliberately narrow, exact hostname should
     get an exact answer, not a surprise substring expansion.
 
+    Tries the WHOLE string as a substring first, then falls back to each
+    individual word in it (split on whitespace/underscore/hyphen, 3+ chars)
+    -- confirmed necessary, not just defensive: "anjar MKT" doesn't
+    substring-match 'PTP_Ksara_to_Chams_Anjar' as a WHOLE phrase at all
+    (there's no "MKT" anywhere in the real name -- "MKT" was the user's own
+    shorthand for the vendor, mikrotik, concatenated onto the device
+    nickname, not part of it), so a single whole-string search found
+    nothing and never resolved. Searching "anjar" and "MKT" separately
+    lets the real device-name fragment match on its own even when mixed
+    with unrelated words in the same casual phrase.
+
     Returns (resolved_hostname, note): resolved_hostname is the real
-    hostname when EXACTLY one device matched (None otherwise -- zero
-    matches means genuinely no such device even loosely; more than one is
+    hostname when EXACTLY one real device matched, across the whole-string
+    search or any word search (None otherwise -- zero matches means
+    genuinely no such device even loosely; more than one DISTINCT device is
     ambiguous and must not be guessed at). note is non-None whenever this
     is worth relaying to the model (a resolution happened, or the match
     was ambiguous), so the final answer can say so instead of silently
     substituting or silently staying at an unexplained zero.
     """
-    candidates = await asyncio.to_thread(
-        device_service.list_devices,
-        ch_client,
-        hostname=hostname,
-        start=datetime.now(timezone.utc) - timedelta(days=365),
-        limit=3,
-    )
-    if len(candidates.items) == 1:
-        resolved = candidates.items[0].hostname
+    search_terms = [hostname] + [w for w in re.split(r"[\s_-]+", hostname) if len(w) >= 3]
+    matches: dict[str, object] = {}
+    for term in search_terms:
+        candidates = await asyncio.to_thread(
+            device_service.list_devices,
+            ch_client,
+            hostname=term,
+            start=datetime.now(timezone.utc) - timedelta(days=365),
+            limit=5,
+        )
+        for d in candidates.items:
+            matches[d.hostname] = d
+        if len(matches) > 4:
+            # Already clearly too broad to narrow down further (e.g. a
+            # short, common word) -- stop early rather than keep searching.
+            break
+    if len(matches) == 1:
+        resolved = next(iter(matches))
         return resolved, f"'{hostname}' isn't an exact device name -- resolved to the real device '{resolved}'."
-    if len(candidates.items) > 1:
-        names = ", ".join(d.hostname for d in candidates.items)
+    if len(matches) > 1:
+        names = ", ".join(matches)
         return None, (
             f"'{hostname}' isn't an exact device name and matches more than one real device "
             f"({names}) -- tell the user which devices matched and ask them to pick one, don't guess."
