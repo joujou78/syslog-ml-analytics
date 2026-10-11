@@ -826,7 +826,7 @@ def _identifiers_from_history(history: list[ConversationTurn]) -> set[str]:
 
 
 def _filter_args_for_period_override(
-    question: str, history: list[ConversationTurn], model_filter_args: dict,
+    query: LogAssistantQuery, model_filter_args: dict,
 ) -> dict:
     """What a deterministic period override (single-period or comparison)
     should actually filter count_events by: the model's own call
@@ -837,11 +837,31 @@ def _filter_args_for_period_override(
     A bare follow-up has no topical content of its own, so nothing this
     turn's call guessed -- or an earlier, unrelated turn's leftover filter
     -- can be trusted over the immediately preceding turn's own topic.
+
+    EXCEPT when query.source_ip/query.vendor is set -- an explicit,
+    structural filter the user picked in the UI's filter panel for THIS
+    request, not text the model or an earlier turn produced. Confirmed as
+    a real bug: with the UI's Source IP filter set, a bare "how many
+    events today" (4 words, so "bare" by word count despite having real
+    topical content) discarded that explicit filter entirely in favor of a
+    hostname guessed from an unrelated older turn's text -- happened to be
+    the same device here, so the count still came out right, but it would
+    silently scope to the WRONG device the moment the UI filter pointed
+    somewhere else. An explicit per-request filter always wins over a
+    text-inferred one, bare follow-up or not.
+
     Falls back to model_filter_args unchanged when no last-turn identifier
-    is found (nothing better to go on).
+    is found and no explicit filter is set (nothing better to go on).
     """
-    if _is_bare_followup(question):
-        hint = _primary_identifier_from_last_turn(history)
+    if query.source_ip or query.vendor:
+        explicit = dict(model_filter_args)
+        if query.source_ip:
+            explicit["source_ip"] = query.source_ip
+        if query.vendor:
+            explicit["vendor"] = query.vendor
+        return explicit
+    if _is_bare_followup(query.question):
+        hint = _primary_identifier_from_last_turn(query.history)
         if hint:
             return {"hostname": hint}
     return model_filter_args
@@ -1208,7 +1228,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             if enforce_count_tool and not periods_resolved:
                 periods_resolved = True
                 filter_args = _sanitize_equality_filters(
-                    _filter_args_for_period_override(query.question, query.history, attempted_filter_args)
+                    _filter_args_for_period_override(query, attempted_filter_args)
                 )
                 # The known_identifiers sweep is a last resort, deliberately NOT
                 # consulted when source_ip/vendor already scope this query: the
@@ -1366,7 +1386,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 # tool calls, so the grounding check alone didn't catch it).
                 periods_resolved = True
                 filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
-                    query.question, query.history,
+                    query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
                 ))
                 labeled_counts = []
@@ -1428,7 +1448,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 periods_resolved = True
                 label, period_start, period_end = single_period
                 filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
-                    query.question, query.history,
+                    query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
                 ))
                 count = await asyncio.to_thread(
