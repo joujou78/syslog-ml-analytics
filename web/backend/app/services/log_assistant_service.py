@@ -1058,6 +1058,84 @@ def _sanitize_equality_filters(args: dict) -> dict:
     return out
 
 
+async def _resolve_hostname_fuzzy(ch_client: Client, hostname: str) -> tuple[str | None, str | None]:
+    """If `hostname` doesn't exactly match any real device, try a case-
+    insensitive SUBSTRING match via device_service.list_devices -- which
+    already supports exactly this (see its own docstring: hostname is
+    matched with positionCaseInsensitive, not equality) -- before accepting
+    a count_events/search_logs zero as genuine. Searches a generous year of
+    history independent of whatever window the actual count/search is
+    scoped to, since resolving a NAME is a different question from "did
+    this device have activity in this window".
+
+    Confirmed as a real gap, not hypothetical: "give the top 10 logs for
+    anjar MKT" (a casual, partial reference -- the real hostname is
+    'PTP_Ksara_to_Chams_Anjar') returned a correct-but-unhelpful zero via
+    exact match, when a substring search finds the real device immediately
+    and unambiguously. Deliberately NOT changing count_events/search_logs
+    themselves to fuzzy-match -- those also back the plain Log Search page,
+    where an operator typing a deliberately narrow, exact hostname should
+    get an exact answer, not a surprise substring expansion.
+
+    Returns (resolved_hostname, note): resolved_hostname is the real
+    hostname when EXACTLY one device matched (None otherwise -- zero
+    matches means genuinely no such device even loosely; more than one is
+    ambiguous and must not be guessed at). note is non-None whenever this
+    is worth relaying to the model (a resolution happened, or the match
+    was ambiguous), so the final answer can say so instead of silently
+    substituting or silently staying at an unexplained zero.
+    """
+    candidates = await asyncio.to_thread(
+        device_service.list_devices,
+        ch_client,
+        hostname=hostname,
+        start=datetime.now(timezone.utc) - timedelta(days=365),
+        limit=3,
+    )
+    if len(candidates.items) == 1:
+        resolved = candidates.items[0].hostname
+        return resolved, f"'{hostname}' isn't an exact device name -- resolved to the real device '{resolved}'."
+    if len(candidates.items) > 1:
+        names = ", ".join(d.hostname for d in candidates.items)
+        return None, (
+            f"'{hostname}' isn't an exact device name and matches more than one real device "
+            f"({names}) -- tell the user which devices matched and ask them to pick one, don't guess."
+        )
+    return None, None
+
+
+async def _count_events_resolving_hostname(
+    ch_client: Client, *, hostname: str | None, **kwargs,
+) -> tuple[int, str | None, str | None]:
+    """log_search_service.count_events with the _resolve_hostname_fuzzy
+    fallback applied -- see its docstring. Returns (count, effective_hostname,
+    note) -- effective_hostname is whichever hostname actually produced
+    `count` (unchanged, or the fuzzy-resolved name), so a caller resolving
+    the SAME hostname across multiple periods (a comparison) can reuse it
+    on subsequent calls instead of re-resolving (and re-querying
+    device_service) every time."""
+    count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=hostname, **kwargs)
+    if count or not hostname:
+        return count, hostname, None
+    resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
+    if resolved:
+        count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=resolved, **kwargs)
+        return count, resolved, note
+    return count, hostname, note
+
+
+async def _search_logs_resolving_hostname(ch_client: Client, *, hostname: str | None, **kwargs):
+    """log_search_service.search_logs with the _resolve_hostname_fuzzy
+    fallback applied -- see its docstring. Returns (LogSearchResponse, note)."""
+    result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=hostname, **kwargs)
+    if result.items or not hostname:
+        return result, None
+    resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
+    if resolved:
+        result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=resolved, **kwargs)
+    return result, note
+
+
 async def _execute_tool(
     name: str, arguments: dict, os_client: OpenSearch, ch_client: Client,
 ) -> tuple[dict, list[LogHit]]:
@@ -1081,8 +1159,7 @@ async def _execute_tool(
         }, []
 
     if name == "count_events":
-        count = await asyncio.to_thread(
-            log_search_service.count_events,
+        count, hostname_note = await _count_events_resolving_hostname(
             ch_client,
             hostname=arguments.get("hostname"),
             source_ip=arguments.get("source_ip"),
@@ -1094,11 +1171,13 @@ async def _execute_tool(
             start=_parse_tool_datetime(arguments.get("start")),
             end=_parse_tool_datetime(arguments.get("end")),
         )
-        return {"count": count}, []
+        result = {"count": count}
+        if hostname_note:
+            result["note"] = hostname_note
+        return result, []
 
     if name == "search_logs":
-        result = await asyncio.to_thread(
-            log_search_service.search_logs,
+        result, hostname_note = await _search_logs_resolving_hostname(
             ch_client,
             hostname=arguments.get("hostname"),
             source_ip=arguments.get("source_ip"),
@@ -1127,7 +1206,7 @@ async def _execute_tool(
             )
             for i in result.items
         ]
-        return {
+        search_result = {
             "has_more_beyond_this_page": result.has_more,
             "matching_rows": [
                 {"event_time": i.event_time.isoformat(), "hostname": i.hostname, "source_ip": i.source_ip,
@@ -1136,7 +1215,10 @@ async def _execute_tool(
                  "is_anomaly": i.is_anomaly, "anomaly_reasons": i.anomaly_reasons}
                 for i in result.items
             ],
-        }, hits
+        }
+        if hostname_note:
+            search_result["note"] = hostname_note
+        return search_result, hits
 
     if name == "semantic_search":
         phrase = arguments.get("phrase") or ""
@@ -1286,9 +1368,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     hostname_hint = next(iter(known_identifiers), None)
                 periods_to_resolve = comparison_periods or [single_period]
                 labeled_counts = []
+                hostname_resolution_note = None
                 for label, period_start, period_end in periods_to_resolve:
-                    count = await asyncio.to_thread(
-                        log_search_service.count_events,
+                    count, hostname_hint, note = await _count_events_resolving_hostname(
                         ch_client,
                         hostname=hostname_hint,
                         source_ip=filter_args.get("source_ip"),
@@ -1300,11 +1382,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         start=period_start,
                         end=period_end,
                     )
+                    hostname_resolution_note = hostname_resolution_note or note
                     labeled_counts.append({"period": label, "count": count})
                     grounded_counts.add(count)
                     data_tool_calls += 1
                 if hostname_hint:
                     known_identifiers.add(hostname_hint)
+                    filter_args["hostname"] = hostname_hint
                 messages.append(message)
                 messages.append({
                     "role": "user",
@@ -1318,6 +1402,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                             " -- for the WHOLE NETWORK (no device/vendor filter applied), say so "
                             "explicitly, do not attribute it to any single device"
                         )
+                        + (f" {hostname_resolution_note}" if hostname_resolution_note else "")
                         + ". State these exactly as given -- do not call any tool again, and do not "
                         "state a different number."
                     ),
@@ -1436,9 +1521,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
                 ))
                 labeled_counts = []
+                hostname_resolution_note = None
                 for label, period_start, period_end in comparison_periods:
-                    count = await asyncio.to_thread(
-                        log_search_service.count_events,
+                    count, resolved_hostname, note = await _count_events_resolving_hostname(
                         ch_client,
                         hostname=filter_args.get("hostname"),
                         source_ip=filter_args.get("source_ip"),
@@ -1450,6 +1535,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         start=period_start,
                         end=period_end,
                     )
+                    filter_args["hostname"] = resolved_hostname
+                    hostname_resolution_note = hostname_resolution_note or note
                     labeled_counts.append({"period": label, "count": count})
                     grounded_counts.add(count)
                     data_tool_calls += 1
@@ -1463,7 +1550,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                         "These are the exact, already-verified counts for every period being compared, "
                         "for the WHOLE NETWORK (no device/vendor filter applied) -- say so explicitly, "
                         "do not attribute them to any single device. "
-                    ) + (
+                    ) + (f"{hostname_resolution_note} " if hostname_resolution_note else "") + (
                         "State them exactly as labeled -- do not call count_events again for this "
                         "comparison, and do not swap or relabel which number belongs to which period."
                     ),
@@ -1505,8 +1592,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
                 ))
-                count = await asyncio.to_thread(
-                    log_search_service.count_events,
+                count, resolved_hostname, hostname_note = await _count_events_resolving_hostname(
                     ch_client,
                     hostname=filter_args.get("hostname"),
                     source_ip=filter_args.get("source_ip"),
@@ -1518,6 +1604,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     start=period_start,
                     end=period_end,
                 )
+                filter_args["hostname"] = resolved_hostname
                 grounded_counts.add(count)
                 data_tool_calls += 1
                 scope = _describe_filter_scope(filter_args)
@@ -1525,8 +1612,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     "note": (
                         "This is the exact, already-verified count for the period asked about, "
                         f"scoped to {scope}. Say explicitly that it's for {scope}, not the whole "
-                        "network, and do not mention any OTHER device, IP, or filter. State the "
-                        "number exactly as given."
+                        "network, and do not mention any OTHER device, IP, or filter. "
+                        + (f"{hostname_note} " if hostname_note else "")
+                        + "State the number exactly as given."
                         if scope else
                         "This is the exact, already-verified count for the period asked about, "
                         "for the WHOLE NETWORK (no device/vendor filter applied). Say so explicitly "
