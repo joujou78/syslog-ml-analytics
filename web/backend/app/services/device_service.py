@@ -28,9 +28,27 @@ def list_devices(
     devices show up here too and can be triaged.
 
     hostname/vendor are case-insensitive substring matches against each
-    device's most-recently-seen identity, so they're applied in HAVING
-    (after the argMax aggregation) rather than WHERE; ip matches against
-    the raw, un-aggregated source_ip column, so it's a WHERE condition.
+    device's most-recently-seen identity, applied in an OUTER query against
+    the already-aggregated plain columns -- NOT a HAVING clause re-invoking
+    argMax() on the raw columns, which was the original approach here and
+    is confirmed broken: `argMax(hostname, event_time)` inside HAVING
+    collides with this SELECT's own `AS hostname` alias for that identical
+    expression, and ClickHouse's analyzer resolves the bare `hostname`
+    reference in HAVING back through that alias, producing a nested
+    `argMax(argMax(hostname, event_time), event_time)` -- which ClickHouse
+    rejects outright (Code 184, ILLEGAL_AGGREGATION: "Aggregate function
+    ... is found inside another aggregate function"). This had apparently
+    never actually been exercised with a real hostname/vendor value before
+    (nothing in this codebase called list_devices with one) until the Log
+    Assistant's fuzzy hostname resolution became the first real caller --
+    it crashed the whole request with a 500 the moment it ran, and would
+    crash the Devices page's own hostname search filter identically.
+    Wrapping the aggregation in a subquery and filtering the OUTER query's
+    plain (non-aggregate) columns sidesteps the ambiguity entirely while
+    keeping identical filtering semantics (substring match against the
+    most-recently-seen identity the inner argMax already picked). ip
+    matches against the raw, un-aggregated source_ip column, so it stays a
+    WHERE condition on the inner query.
 
     Paginated the same way as log search: fetches one row past `limit` to
     derive has_more instead of a separate COUNT(*), since with hundreds of
@@ -51,30 +69,32 @@ def list_devices(
         conditions.append("positionCaseInsensitive(source_ip, %(ip)s) > 0")
         params["ip"] = ip
 
-    having_conditions = []
+    outer_conditions = []
     if hostname:
-        having_conditions.append("positionCaseInsensitive(argMax(hostname, event_time), %(hostname)s) > 0")
+        outer_conditions.append("positionCaseInsensitive(hostname, %(hostname)s) > 0")
         params["hostname"] = hostname
     if vendor:
-        having_conditions.append("positionCaseInsensitive(argMax(vendor, event_time), %(vendor)s) > 0")
+        outer_conditions.append("positionCaseInsensitive(vendor, %(vendor)s) > 0")
         params["vendor"] = vendor
-    having_clause = f"HAVING {' AND '.join(having_conditions)}" if having_conditions else ""
+    outer_where = f"WHERE {' AND '.join(outer_conditions)}" if outer_conditions else ""
 
     query = f"""
-        SELECT
-            source_ip,
-            argMax(hostname, event_time) AS hostname,
-            argMax(vendor, event_time) AS vendor,
-            argMax(vendor_source, event_time) AS vendor_source,
-            argMax(model, event_time) AS model,
-            argMax(resolution_method, event_time) AS resolution_method,
-            min(event_time) AS first_seen_in_window,
-            max(event_time) AS last_seen,
-            count() AS event_count
-        FROM syslog_ml.events
-        WHERE {" AND ".join(conditions)}
-        GROUP BY source_ip
-        {having_clause}
+        SELECT * FROM (
+            SELECT
+                source_ip,
+                argMax(hostname, event_time) AS hostname,
+                argMax(vendor, event_time) AS vendor,
+                argMax(vendor_source, event_time) AS vendor_source,
+                argMax(model, event_time) AS model,
+                argMax(resolution_method, event_time) AS resolution_method,
+                min(event_time) AS first_seen_in_window,
+                max(event_time) AS last_seen,
+                count() AS event_count
+            FROM syslog_ml.events
+            WHERE {" AND ".join(conditions)}
+            GROUP BY source_ip
+        )
+        {outer_where}
         ORDER BY event_count DESC
         LIMIT %(fetch_limit)s OFFSET %(offset)s
     """
