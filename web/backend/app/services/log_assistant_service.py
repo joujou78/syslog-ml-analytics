@@ -1353,6 +1353,17 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
     data_tool_calls = 0
     grounded_counts: set[int] = set()
     known_identifiers: set[str] = _identifiers_from_history(query.history)
+    # Separate from known_identifiers (which deliberately mixes in history so
+    # a bare follow-up can inherit a device from an earlier turn) -- this
+    # tracks ONLY identifiers a list_devices call actually returned THIS
+    # turn, so a device-listing answer can be checked against exactly what
+    # was just fetched, not anything merely mentioned earlier in the thread.
+    # See the grounding check below for the confirmed incident this guards:
+    # "which devices have anjar in the name" correctly called
+    # list_devices(hostname='anjar') and got back 4 real matches, but the
+    # model's final answer added 5 more devices straight out of an EARLIER,
+    # differently-scoped turn's candidate list.
+    list_devices_results_this_turn: set[str] = set()
     nudged = False
     # Updated on every tool call attempt this turn, including a wrong-tool
     # one that got redirected -- a best-effort filter hint for the hard
@@ -1503,6 +1514,32 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     "\n\n(Note: at least one number above doesn't match the raw data this answer's "
                     "tool calls actually returned -- double-check it before relying on it.)"
                 )
+            if list_devices_results_this_turn:
+                # Same idea, for device NAMES instead of counts. Confirmed on
+                # net-flow: "which devices have anjar in the name" correctly
+                # called list_devices(hostname='anjar') and got back 4 real
+                # matches, with the tool result's own note explicitly saying
+                # "these are the ONLY devices... do not add any other device
+                # mentioned earlier in this conversation" -- the model still
+                # added 5 more devices straight out of an EARLIER, differently
+                # -scoped turn's candidate list anyway. The instruction alone
+                # didn't survive against salient prior context, same lesson as
+                # the count-claim check above. this_turn_result_tokens excludes
+                # anything that's actually part of a name THIS turn's call
+                # returned, so a legitimately-repeated device isn't flagged --
+                # only a leftover from strictly earlier in the thread is.
+                this_turn_result_tokens = {
+                    tok for name in list_devices_results_this_turn
+                    for tok in _IDENTIFIER_TOKEN_RE.findall(name)
+                }
+                stale_identifiers = _identifiers_from_history(query.history) - this_turn_result_tokens
+                mentioned_stale = {ident for ident in stale_identifiers if ident.lower() in answer.lower()}
+                if mentioned_stale:
+                    answer += (
+                        "\n\n(Note: this answer mentions something that isn't part of this turn's "
+                        f"actual device search result ({', '.join(sorted(mentioned_stale))}) -- it may be "
+                        "left over from earlier in this conversation; double-check before relying on it.)"
+                    )
             return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
         messages.append(message)
@@ -1739,6 +1776,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
             # (a hostname filter argument, not a result field, polluting the
             # digit extraction below).
             known_identifiers |= _identifiers_from_result(fn["name"], result)
+            if fn["name"] == "list_devices":
+                list_devices_results_this_turn |= {
+                    d.get("hostname") for d in result.get("devices_sorted_busiest_first", [])
+                    if isinstance(d.get("hostname"), str)
+                }
             known_identifiers |= {
                 v for v in (arguments.get("hostname"), arguments.get("source_ip")) if isinstance(v, str) and len(v) >= 3
             }
