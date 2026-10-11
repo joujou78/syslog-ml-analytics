@@ -1185,13 +1185,31 @@ async def _execute_tool(
             end=_parse_tool_datetime(arguments.get("end")),
             limit=min(_parse_tool_int(arguments.get("limit"), 10), 50),
         )
-        return {
+        list_result = {
             "devices_sorted_busiest_first": [
                 {"ip": d.ip, "hostname": d.hostname, "vendor": d.vendor, "event_count": d.event_count,
                  "resolution_method": d.resolution_method, "last_seen": d.last_seen.isoformat()}
                 for d in result.items
             ],
-        }, []
+        }
+        if hostname_filter:
+            # Confirmed as a real bug, not hypothetical: asked "which devices
+            # have anjar in the name" right after an earlier turn's ambiguity
+            # note had listed BOTH anjar-matching AND unrelated MKT-matching
+            # devices (from a previous two-word "anjar MKT" search), the
+            # model's final answer merged this turn's clean, correct 3-device
+            # result with those unrelated MKT devices from the EARLIER note --
+            # fabricating 5 devices that were never part of THIS call's
+            # result. Nothing told it this result was complete and
+            # exhaustive on its own; it's easy for a small model to treat an
+            # explicit list shown earlier in the same conversation as still
+            # relevant. Spelled out explicitly to close that gap.
+            list_result["note"] = (
+                f"These are the ONLY devices matching hostname containing '{hostname_filter}' -- "
+                "do not add any other device mentioned earlier in this conversation, even if it also "
+                "seemed related."
+            )
+        return list_result, []
 
     if name == "count_events":
         count, hostname_note = await _count_events_resolving_hostname(
