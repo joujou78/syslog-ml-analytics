@@ -929,11 +929,17 @@ def _parse_tool_bool(value) -> bool:
 # other), not a reason to skip validating against it.
 _VALID_SEVERITIES = frozenset({"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"})
 
+# Loose enough to catch a real dotted-quad before it's used as a literal
+# `hostname =` equality match (which is all this guards against -- an
+# actual malformed IP still fails at the database as "no such value",
+# exactly as today, just via source_ip instead of hostname).
+_IPV4_SHAPE_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
 
 def _sanitize_equality_filters(args: dict) -> dict:
-    """Guards two confirmed net-flow failure modes in the model's own tool-
-    call arguments, neither caught by _parse_tool_bool/_parse_tool_int
-    since both are valid-shaped strings, not an obviously-wrong type:
+    """Guards confirmed net-flow failure modes in the model's own tool-call
+    arguments, none caught by _parse_tool_bool/_parse_tool_int since all
+    are valid-shaped strings, not an obviously-wrong type:
     (1) a severity value the model invented instead of omitting the
     argument -- confirmed: the literal string 'none' (not one of the 8 real
     severities above) for 'how many events ... yesterday', which
@@ -953,10 +959,29 @@ def _sanitize_equality_filters(args: dict) -> dict:
     does, but it's open-ended free text describing a real vendor name
     ('mikrotik', 'cisco', ...), and no real vendor is ever literally the
     word 'none'/'null'/etc, so these are always a placeholder rather than a
-    genuine filter whatever field they show up in. Returns a copy with any
-    such field cleared to None; everything else passes through unchanged."""
+    genuine filter whatever field they show up in; (4) an IP address put in
+    `hostname` instead of `source_ip` -- confirmed: with the UI's Source IP
+    filter set to 172.20.17.68, the model's own tool call put that value
+    under `hostname` (no `source_ip` key at all). The `hostname` column
+    holds names like 'PTP_Ksara_to_Chams_Anjar', never a raw IP string, so
+    that equality condition matched zero rows -- a busy device's real,
+    non-zero count silently came back 0. Moved to `source_ip` instead
+    whenever `hostname` is IP-shaped and `source_ip` isn't already set to
+    something else (never overwrites a source_ip the model separately,
+    correctly provided). Returns a copy with any such field moved or
+    cleared to None; everything else passes through unchanged."""
     _PLACEHOLDER_STRINGS = frozenset({"none", "null", "n/a", "na", "unknown", "any", "unset", ""})
     out = dict(args)
+    hostname = out.get("hostname")
+    if isinstance(hostname, str) and _IPV4_SHAPE_RE.match(hostname.strip()):
+        # Always cleared -- an IP-shaped value is never a valid `hostname`
+        # filter regardless of what source_ip already holds. Only BACKFILLS
+        # source_ip when it's not already set to something else, so a
+        # separately-correct source_ip the model also provided is never
+        # overwritten by this recovery path.
+        if not out.get("source_ip"):
+            out["source_ip"] = hostname.strip()
+        out["hostname"] = None
     severity = out.get("severity")
     if isinstance(severity, str) and severity.strip().lower() not in _VALID_SEVERITIES:
         out["severity"] = None
