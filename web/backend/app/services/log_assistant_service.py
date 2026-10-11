@@ -470,8 +470,11 @@ _AGENT_INSTRUCTIONS = (
     "'busiest', 'most'), or specific log content -- never guess or estimate from memory, and never "
     "answer from a tool's result until you've actually called it. Use list_devices for 'which "
     "device is noisiest/busiest/most active' questions (it returns devices sorted by event count "
-    "already -- the first one is the answer) -- it does NOT accept a hostname/IP filter, so never use "
-    "it to ask about ONE already-named device. For 'how many events/logs' for a specific device, "
+    "already -- the first one is the answer), or to look up/disambiguate a device by a partial or "
+    "casual name via its optional hostname parameter (a case-insensitive substring match). Once you "
+    "know a device's exact real hostname, though, use count_events/search_logs for its actual counts "
+    "or log content -- never substitute list_devices' event_count for a real count_events call. For "
+    "'how many events/logs' for a specific device, "
     "severity, or filter -- including comparing two time periods -- use count_events once PER time "
     "period being asked about (e.g. once for today, once for yesterday); it returns an exact total, "
     "never estimate or reuse a number from a different tool call. Use search_logs only when the "
@@ -506,6 +509,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "start": {"type": "string", "description": "ISO 8601 UTC start, e.g. 2026-10-01T00:00:00. Omit for 'last 24 hours'."},
                     "end": {"type": "string", "description": "ISO 8601 UTC end. Omit to mean 'now'."},
+                    "hostname": {"type": "string", "description": "Optional: find devices whose hostname contains this text (case-insensitive substring match) -- use this to look up or disambiguate a device by a partial/casual name (e.g. 'anjar' finds every device with 'anjar' anywhere in its name). Omit entirely for a plain busiest-first ranking."},
                     "limit": {"type": "integer", "description": "Max devices to return. Default 10."},
                 },
             },
@@ -1164,10 +1168,20 @@ async def _execute_tool(
     response's cited sources -- only semantic_search produces any)."""
     arguments = _sanitize_equality_filters(arguments)
     if name == "list_devices":
+        hostname_filter = arguments.get("hostname")
+        start = _parse_tool_datetime(arguments.get("start"))
+        if hostname_filter and not start:
+            # A name lookup/disambiguation, not a "busiest in a recent
+            # window" ranking -- widen the search so a device with no
+            # traffic in list_devices' own default 24h window still turns
+            # up by name, same reasoning as _resolve_hostname_fuzzy's own
+            # 365-day lookback.
+            start = datetime.now(timezone.utc) - timedelta(days=365)
         result = await asyncio.to_thread(
             device_service.list_devices,
             ch_client,
-            start=_parse_tool_datetime(arguments.get("start")),
+            hostname=hostname_filter,
+            start=start,
             end=_parse_tool_datetime(arguments.get("end")),
             limit=min(_parse_tool_int(arguments.get("limit"), 10), 50),
         )
