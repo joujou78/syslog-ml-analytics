@@ -447,6 +447,23 @@ def _extract_count_claims(text: str, known_identifiers: set[str]) -> set[int]:
             continue
     return claims
 
+
+# A number the question itself used as a requested limit ("top 10", "first
+# 5"), not a claim about real data -- confirmed as a grounding-check false
+# positive: asked for "the top 10 log[s] for anjar MKT" (a hostname that,
+# being an informal nickname rather than the real
+# 'PTP_Ksara_to_Chams_Anjar', correctly matched zero rows), the model
+# honestly answered that it couldn't find enough information -- but its
+# answer's own "top 10 logs" phrasing, merely echoing the question, still
+# got picked up by _COUNT_CLAIM_RE as a claimed count of 10 and compared
+# against the real grounded result (0), producing an unwarranted "doesn't
+# match" caveat on an already-honest, correct answer.
+_REQUESTED_LIMIT_RE = re.compile(r"\b(?:top|first|last|give me|show me)\s+(\d{1,4})\b", re.IGNORECASE)
+
+
+def _requested_limit_numbers(question: str) -> set[int]:
+    return {int(n) for n in _REQUESTED_LIMIT_RE.findall(question)}
+
 _AGENT_INSTRUCTIONS = (
     "You have tools that query this network's real, current log data. ALWAYS call a tool to get "
     "real data before answering any question involving a count, a comparison ('noisiest', "
@@ -1336,7 +1353,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                     ),
                 })
                 continue
-            claims = _extract_count_claims(answer, known_identifiers)
+            claims = _extract_count_claims(answer, known_identifiers) - _requested_limit_numbers(query.question)
             if grounded_counts and claims and not claims.issubset(grounded_counts):
                 # The model stated a count that doesn't match anything a tool
                 # actually returned this turn -- surfaced visibly rather than
