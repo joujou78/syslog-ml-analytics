@@ -5,8 +5,10 @@ from clickhouse_connect.driver.client import Client
 from fastapi import APIRouter, Depends, HTTPException, status
 from opensearchpy import OpenSearch
 from opensearchpy.exceptions import OpenSearchException
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_ch_client, get_current_user, get_os_client
+from app.db.base import get_db
 from app.schemas.log_assistant import AskResponse, LogAssistantQuery, SemanticSearchResponse
 from app.services import log_assistant_service
 
@@ -70,8 +72,9 @@ async def ask(
     _user=_authenticated,
     os_client: OpenSearch = Depends(get_os_client),
     ch_client: Client = Depends(get_ch_client),
+    db: AsyncSession = Depends(get_db),
 ):
     try:
-        return await log_assistant_service.ask(os_client, ch_client, payload)
+        return await log_assistant_service.ask(os_client, ch_client, payload, db)
     except _UPSTREAM_ERRORS as exc:
         raise _upstream_error(exc)

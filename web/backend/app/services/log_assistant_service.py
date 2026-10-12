@@ -28,11 +28,14 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from clickhouse_connect.driver.client import Client
 from opensearchpy import OpenSearch
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ch_time import ch_literal
 from app.core.config import settings
 from app.schemas.log_assistant import AskResponse, ConversationTurn, LogAssistantQuery, LogHit
-from app.services import anomaly_summary_service, device_service, log_search_service
+from app.services import (
+    alert_service, anomaly_summary_service, device_service, device_silence_service, log_search_service,
+)
 
 log = logging.getLogger("log_assistant_service")
 
@@ -476,7 +479,10 @@ _AGENT_INSTRUCTIONS = (
     "or log content -- never substitute list_devices' event_count for a real count_events call. Use "
     "anomaly_summary for 'which device/vendor has the most anomalies' or 'what anomaly reasons are "
     "most common' -- it is a cumulative, ALL-TIME view (not scoped to a time period you'd give it "
-    "start/end for), and never claims acknowledgment status. For "
+    "start/end for), and never claims acknowledgment status. Use alert_rules for 'is there an alert "
+    "for X' or 'what alerts are configured' -- it's CONFIGURATION, not a live count. Use "
+    "silent_devices for 'which devices have gone quiet' or 'is X still reporting' -- every row in it "
+    "is currently silent right now, so a device's absence from it means it IS reporting normally. For "
     "'how many events/logs' for a specific device, "
     "severity, or filter -- including comparing two time periods -- use count_events once PER time "
     "period being asked about (e.g. once for today, once for yesterday); it returns an exact total, "
@@ -540,6 +546,47 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default) or 'vendor'."},
                     "limit": {"type": "integer", "description": "Max rows to return per list. Default 10."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "alert_rules",
+            "description": (
+                "Lists configured alert rules -- name, enabled/disabled, the filters each one watches "
+                "(hostname/source_ip/program/severity/predicted_category/only_anomalies), its window/"
+                "threshold/cooldown, and when it last fired (last_triggered_at, null if never). Use for "
+                "'is there an alert for X', 'what alerts are set up', or 'has the Y alert fired "
+                "recently' (check last_triggered_at). This is CONFIGURATION, not live event data -- it "
+                "does not itself count anything; for an actual count use count_events/anomaly_summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Optional: only rules whose name contains this text (case-insensitive). Omit to list all."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "silent_devices",
+            "description": (
+                "Lists devices that have gone quiet -- stopped logging past their own expected "
+                "interval. Each row: hostname/source_ip, how long it's normally expected to report "
+                "(expected_interval_minutes), last_seen_at, and silence_started_at (when it went quiet). "
+                "Every row here IS currently silent (this list only ever holds devices presently in that "
+                "state -- a device that logs again is removed from it immediately), so finding a device "
+                "in this result already answers 'is X silent/quiet right now' on its own. Use for 'which "
+                "devices have gone quiet/silent', 'when did X last report', or 'is X still reporting'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hostname": {"type": "string", "description": "Optional: only devices whose hostname contains this text (case-insensitive). Omit to list all currently-silent devices."},
                 },
             },
         },
@@ -1191,7 +1238,7 @@ async def _search_logs_resolving_hostname(ch_client: Client, *, hostname: str | 
 
 
 async def _execute_tool(
-    name: str, arguments: dict, os_client: OpenSearch, ch_client: Client,
+    name: str, arguments: dict, os_client: OpenSearch, ch_client: Client, db: AsyncSession,
 ) -> tuple[dict, list[LogHit]]:
     """Returns (JSON-able result for the model, LogHits to surface as this
     response's cited sources -- only semantic_search produces any)."""
@@ -1297,6 +1344,42 @@ async def _execute_tool(
             "note": note,
         }, []
 
+    if name == "alert_rules":
+        name_filter = arguments.get("name")
+        rules = await alert_service.list_rules(db)
+        if name_filter:
+            rules = [r for r in rules if name_filter.lower() in r.name.lower()]
+        return {
+            "alert_rules": [
+                {
+                    "name": r.name, "enabled": r.enabled, "hostname": r.hostname, "source_ip": r.source_ip,
+                    "program": r.program, "severity": r.severity, "predicted_category": r.predicted_category,
+                    "only_anomalies": r.only_anomalies, "window_minutes": r.window_minutes,
+                    "threshold": r.threshold, "cooldown_minutes": r.cooldown_minutes,
+                    "last_triggered_at": r.last_triggered_at.isoformat() if r.last_triggered_at else None,
+                }
+                for r in rules
+            ],
+        }, []
+
+    if name == "silent_devices":
+        hostname_filter = arguments.get("hostname")
+        devices = await device_silence_service.list_silent_devices(db)
+        if hostname_filter:
+            devices = [d for d in devices if d.hostname and hostname_filter.lower() in d.hostname.lower()]
+        return {
+            "currently_silent_devices": [
+                {
+                    "hostname": d.hostname, "source_ip": d.source_ip,
+                    "expected_interval_minutes": d.expected_interval_minutes,
+                    "last_seen_at": d.last_seen_at.isoformat(),
+                    "silence_started_at": d.silence_started_at.isoformat() if d.silence_started_at else None,
+                }
+                for d in devices
+            ],
+            "note": "Every row here is currently, presently silent -- absence from this list means the device IS reporting normally.",
+        }, []
+
     if name == "count_events":
         count, hostname_note = await _count_events_resolving_hostname(
             ch_client,
@@ -1386,7 +1469,7 @@ async def _execute_tool(
     return {"error": f"unknown tool '{name}'"}, []
 
 
-async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> AskResponse:
+async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: AsyncSession) -> AskResponse:
     # Folded into the one user message, not a separate system-role message
     # -- see _post_chat_sync's docstring: a system-role message hung this
     # exact model/Ollama combination for the old single-shot prompt. Not
@@ -1847,7 +1930,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery) -> Ask
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
-            result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client)
+            result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client, db)
             # Temporary diagnostic: the only way to see what the model actually
             # asked for and what came back, since the old plain access-log line
             # (POST /api/log-assistant/ask 200) hides both -- a 200 here says
