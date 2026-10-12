@@ -523,19 +523,23 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "anomaly_summary",
             "description": (
-                "Returns which devices (or vendors) have triggered the most anomalies, and why "
-                "(each anomaly_reason), ranked by event count -- a CUMULATIVE, ALL-TIME view (not "
-                "scoped to any time window, matching the Anomaly Summary page), since acknowledgment "
-                "review needs a stable count from the beginning, not a rolling one. Use for 'which "
-                "device/vendor has the most anomalies', 'what anomaly reasons are most common', or "
-                "'has X device had anomaly type Y'. Does NOT include acknowledgment status (whether "
-                "someone has already reviewed/dismissed it) -- don't claim to know that from this."
+                "Returns TWO lists about anomalies -- a CUMULATIVE, ALL-TIME view (not scoped to any "
+                "time window, matching the Anomaly Summary page), since acknowledgment review needs a "
+                "stable count from the beginning, not a rolling one: (1) *_ranked_by_total_anomalies -- "
+                "one row per device/vendor, already sorted by its TRUE total anomalous-event count; for "
+                "'which device/vendor has the most anomalies', the first entry IS the answer, no further "
+                "math needed. (2) *_breakdown_by_reason -- one row per device/vendor PER anomaly_reason "
+                "(the same entity can appear several times); use this only for 'what anomaly reasons "
+                "does X have' or 'what reasons are most common' -- NEVER sum or compare its numbers to "
+                "answer a 'which has the most' question, since one entity's total is split across "
+                "several of its rows there. Does NOT include acknowledgment status (whether someone has "
+                "already reviewed/dismissed it) -- don't claim to know that from this."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default): one row per device+reason. 'vendor': aggregated across every device of that vendor."},
-                    "limit": {"type": "integer", "description": "Max rows to return, ranked by event count. Default 10."},
+                    "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default) or 'vendor'."},
+                    "limit": {"type": "integer", "description": "Max rows to return per list. Default 10."},
                 },
             },
         },
@@ -1240,26 +1244,49 @@ async def _execute_tool(
         limit = min(_parse_tool_int(arguments.get("limit"), 10), 50)
         note = (
             "Cumulative, ALL-TIME totals (not scoped to any time window) -- do not describe this as "
-            "'today' or 'this week'. Does not include acknowledgment status."
+            "'today' or 'this week'. Does not include acknowledgment status. For 'which has the MOST "
+            "anomalies', use ONLY the *_ranked_by_total_anomalies list -- it's already sorted, so the "
+            "first entry is the answer. The *_breakdown_by_reason list is PER REASON (one entity can "
+            "appear in it several times, once per reason) -- NEVER sum or compare its event_count "
+            "values to answer a 'which has the most' question, that double-counts an entity with "
+            "multiple reasons; it's only for 'what reasons does X have' style questions."
         )
         if arguments.get("group_by") == "vendor":
-            rows = await asyncio.to_thread(anomaly_summary_service.list_vendor_summary, ch_client)
+            totals, breakdown = await asyncio.gather(
+                asyncio.to_thread(anomaly_summary_service.list_vendor_total_anomalies, ch_client),
+                asyncio.to_thread(anomaly_summary_service.list_vendor_summary, ch_client),
+            )
             return {
-                "anomaly_summary_by_vendor_sorted_busiest_first": [
+                "vendors_ranked_by_total_anomalies": [
+                    {"vendor": r["vendor"], "device_count": r["device_count"],
+                     "anomaly_event_count": r["anomaly_event_count"],
+                     "first_seen": r["first_seen"].isoformat(), "last_seen": r["last_seen"].isoformat()}
+                    for r in totals[:limit]
+                ],
+                "vendor_breakdown_by_reason": [
                     {"vendor": r.vendor, "anomaly_reason": r.anomaly_reason, "device_count": r.device_count,
                      "event_count": r.event_count, "first_seen": r.first_seen.isoformat(),
                      "last_seen": r.last_seen.isoformat()}
-                    for r in rows[:limit]
+                    for r in breakdown[:limit]
                 ],
                 "note": note,
             }, []
-        rows = await asyncio.to_thread(anomaly_summary_service.list_device_summary, ch_client)
+        totals, breakdown = await asyncio.gather(
+            asyncio.to_thread(anomaly_summary_service.list_device_total_anomalies, ch_client),
+            asyncio.to_thread(anomaly_summary_service.list_device_summary, ch_client),
+        )
         return {
-            "anomaly_summary_by_device_sorted_busiest_first": [
+            "devices_ranked_by_total_anomalies": [
+                {"hostname": r["hostname"], "source_ip": r["source_ip"], "vendor": r["vendor"],
+                 "anomaly_event_count": r["anomaly_event_count"],
+                 "first_seen": r["first_seen"].isoformat(), "last_seen": r["last_seen"].isoformat()}
+                for r in totals[:limit]
+            ],
+            "device_breakdown_by_reason": [
                 {"hostname": r["hostname"], "source_ip": r["source_ip"], "vendor": r["vendor"],
                  "anomaly_reason": r["anomaly_reason"], "event_count": r["event_count"],
                  "first_seen": r["first_seen"].isoformat(), "last_seen": r["last_seen"].isoformat()}
-                for r in rows[:limit]
+                for r in breakdown[:limit]
             ],
             "note": note,
         }, []

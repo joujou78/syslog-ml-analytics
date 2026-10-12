@@ -35,6 +35,45 @@ _DEVICE_SUMMARY_QUERY = """
     ORDER BY event_count DESC
 """
 
+# Deliberately NOT built from _DEVICE_SUMMARY_QUERY's per-reason rows summed
+# together -- an event with 2+ anomaly_reasons is fanned out by arrayJoin
+# into one row PER reason there, so summing event_count across a device's
+# reason-rows double/triple-counts any event with multiple reasons. This
+# counts real, distinct anomalous events directly (no arrayJoin), giving a
+# true ranking usable the same way list_devices' own event_count already is
+# -- the first row IS the answer, no cross-row arithmetic required.
+# Confirmed as a real, not hypothetical, gap: asked "which vendor has the
+# most anomalies" with only the per-reason breakdown available, the model
+# picked 'mikrotik' over the single highest EVENT_COUNT row (vendor=
+# 'unknown', one reason, outscoring any single mikrotik row) -- arguably
+# right if mikrotik's rows truly summed higher, but there was no way to
+# confirm it actually did that arithmetic correctly rather than guessing
+# from vendor name frequency.
+_DEVICE_TOTAL_ANOMALY_QUERY = """
+    SELECT source_ip,
+           argMax(hostname, event_time) AS hostname,
+           argMax(vendor, event_time) AS vendor,
+           count() AS anomaly_event_count,
+           min(event_time) AS first_seen,
+           max(event_time) AS last_seen
+    FROM syslog_ml.events
+    WHERE is_anomaly = 1
+    GROUP BY source_ip
+    ORDER BY anomaly_event_count DESC
+"""
+
+_VENDOR_TOTAL_ANOMALY_QUERY = """
+    SELECT vendor,
+           uniqExact(source_ip) AS device_count,
+           count() AS anomaly_event_count,
+           min(event_time) AS first_seen,
+           max(event_time) AS last_seen
+    FROM syslog_ml.events
+    WHERE is_anomaly = 1
+    GROUP BY vendor
+    ORDER BY anomaly_event_count DESC
+"""
+
 _VENDOR_SUMMARY_QUERY = """
     SELECT vendor, reason,
            uniqExact(source_ip) AS device_count,
@@ -104,6 +143,32 @@ def list_device_summary(client: Client) -> list[dict]:
             "source_ip": row[0], "anomaly_reason": row[1], "hostname": row[2], "vendor": row[3],
             "event_count": row[4], "first_seen": row[5], "last_seen": row[6],
         }
+        for row in result.result_rows
+    ]
+
+
+def list_device_total_anomalies(client: Client) -> list[dict]:
+    """Real, distinct anomalous-event totals per device (see
+    _DEVICE_TOTAL_ANOMALY_QUERY's comment for why this is NOT the same as
+    summing list_device_summary's per-reason rows), already sorted
+    busiest-first -- for "which device has the most anomalies" questions
+    where the answer should just be the first row, not something a caller
+    has to aggregate itself."""
+    result = client.query(_DEVICE_TOTAL_ANOMALY_QUERY)
+    return [
+        {
+            "source_ip": row[0], "hostname": row[1], "vendor": row[2],
+            "anomaly_event_count": row[3], "first_seen": row[4], "last_seen": row[5],
+        }
+        for row in result.result_rows
+    ]
+
+
+def list_vendor_total_anomalies(client: Client) -> list[dict]:
+    """Same idea as list_device_total_anomalies, aggregated by vendor."""
+    result = client.query(_VENDOR_TOTAL_ANOMALY_QUERY)
+    return [
+        {"vendor": row[0], "device_count": row[1], "anomaly_event_count": row[2], "first_seen": row[3], "last_seen": row[4]}
         for row in result.result_rows
     ]
 
