@@ -1252,10 +1252,17 @@ async def _execute_tool(
             "multiple reasons; it's only for 'what reasons does X have' style questions."
         )
         if arguments.get("group_by") == "vendor":
-            totals, breakdown = await asyncio.gather(
-                asyncio.to_thread(anomaly_summary_service.list_vendor_total_anomalies, ch_client),
-                asyncio.to_thread(anomaly_summary_service.list_vendor_summary, ch_client),
-            )
+            # Sequential, not asyncio.gather -- confirmed live:
+            # clickhouse_connect's Client raises ProgrammingError ("Attempt
+            # to execute concurrent queries within the same session") when
+            # two queries run concurrently on the SAME client instance, even
+            # each wrapped in its own to_thread. Unlike
+            # list_device_summary_with_acks' concurrent gather elsewhere in
+            # this file, which is safe because it pairs a ClickHouse query
+            # with a SEPARATE Postgres connection, both queries here share
+            # this one ch_client.
+            totals = await asyncio.to_thread(anomaly_summary_service.list_vendor_total_anomalies, ch_client)
+            breakdown = await asyncio.to_thread(anomaly_summary_service.list_vendor_summary, ch_client)
             return {
                 "vendors_ranked_by_total_anomalies": [
                     {"vendor": r["vendor"], "device_count": r["device_count"],
@@ -1271,10 +1278,9 @@ async def _execute_tool(
                 ],
                 "note": note,
             }, []
-        totals, breakdown = await asyncio.gather(
-            asyncio.to_thread(anomaly_summary_service.list_device_total_anomalies, ch_client),
-            asyncio.to_thread(anomaly_summary_service.list_device_summary, ch_client),
-        )
+        # Sequential for the same reason as the vendor branch above.
+        totals = await asyncio.to_thread(anomaly_summary_service.list_device_total_anomalies, ch_client)
+        breakdown = await asyncio.to_thread(anomaly_summary_service.list_device_summary, ch_client)
         return {
             "devices_ranked_by_total_anomalies": [
                 {"hostname": r["hostname"], "source_ip": r["source_ip"], "vendor": r["vendor"],
