@@ -373,6 +373,44 @@ def _is_bare_followup(question: str) -> bool:
     return len(words) <= 5
 
 
+# Confirmed as a real, reproduced bug on net-flow: asked "give me the top
+# device with ethernet flapping" and, in a follow-up, "...with wireless
+# disconnections", the model ignored the system prompt's explicit
+# instruction to use anomaly_summary's `reason` parameter for this exact
+# question shape and called list_devices with a hostname carried over from
+# conversation history instead -- twice, producing an answer with nothing
+# to do with the actual question both times (the second with NO tool call
+# at all, just restating the first answer). Prompting alone wasn't enough,
+# the same lesson already drawn for count/period questions (see
+# enforce_count_tool above) -- so this question shape gets the same
+# treatment: detected deterministically and the correct tool forced,
+# instead of trusted to the model's own tool choice.
+_RANKING_MARKERS = ("most", "top", "which device", "which vendor", "highest", "worst")
+
+
+def _wants_ranking(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _RANKING_MARKERS)
+
+
+def _wants_vendor_grouping(question: str) -> bool:
+    return "vendor" in question.lower()
+
+
+def _detect_anomaly_reason(question: str) -> str | None:
+    """Resolves a 'which device/vendor has the most <anomaly type>' question
+    to a real anomaly_reason category, or None if this isn't that kind of
+    question. Gated on ranking language (top/most/which device/which
+    vendor) on top of _resolve_anomaly_reason's own word-overlap/synonym
+    matching -- a plain 'which device is busiest' (no anomaly type
+    mentioned at all) correctly resolves to nothing here and is left alone
+    for list_devices, which is the right tool for that question."""
+    if not _wants_ranking(question):
+        return None
+    resolved, _note = _resolve_anomaly_reason(question)
+    return resolved
+
+
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
     """Exact numeric counts a tool call actually returned, for cross-checking
     against what the model later claims in its final answer -- deliberately
@@ -402,6 +440,21 @@ def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
         # extracting here (there's no other standalone count field).
         rows = result.get("matching_rows")
         return {len(rows)} if isinstance(rows, list) else set()
+    if tool_name == "anomaly_summary":
+        # Covers both the reason-filtered rows (*_ranked_by_reason_count)
+        # and the unfiltered totals (*_ranked_by_total_anomalies) -- whichever
+        # shape this particular call produced -- under whichever field name
+        # that shape uses for the count (event_count vs. anomaly_event_count).
+        counts: set[int] = set()
+        for key in (
+            "devices_ranked_by_reason_count", "vendors_ranked_by_reason_count",
+            "devices_ranked_by_total_anomalies", "vendors_ranked_by_total_anomalies",
+        ):
+            for row in result.get(key, []):
+                value = row.get("event_count", row.get("anomaly_event_count"))
+                if isinstance(value, int):
+                    counts.add(value)
+        return counts
     return set()
 
 
@@ -423,6 +476,12 @@ def _identifiers_from_result(tool_name: str, result: dict) -> set[str]:
     elif tool_name == "semantic_search":
         for hit in result.get("hits", []):
             ids.update(v for v in (hit.get("hostname"), hit.get("source_ip")) if isinstance(v, str) and len(v) >= 3)
+    elif tool_name == "anomaly_summary":
+        for key in (
+            "devices_ranked_by_reason_count", "devices_ranked_by_total_anomalies", "device_breakdown_by_reason",
+        ):
+            for row in result.get(key, []):
+                ids.update(v for v in (row.get("hostname"), row.get("source_ip")) if isinstance(v, str) and len(v) >= 3)
     return ids
 
 
@@ -1193,6 +1252,24 @@ _VALID_ANOMALY_REASONS = (
     "volume_spike", "unusual_template_mix", "unusual_transition", "interface_flapping",
 )
 
+# Confirmed as a real gap on net-flow, live: asked for "the top device with
+# wireless disconnections", the word-overlap matching below found ZERO
+# shared words with any category -- "wireless"/"disconnections" share
+# nothing with "interface"/"flapping" literally, even though
+# interface_flapping's own real definition (ml/interface_flap_anomaly.py)
+# is explicitly link-layer-agnostic, covering any interface (wired or
+# wireless) repeatedly cycling up/down, i.e. exactly what "disconnections"
+# describes. A small curated synonym list, not a general synonym engine --
+# broad guessing risks matching an unrelated question that happens to share
+# a word with a category by coincidence, so this stays narrow and only
+# covers phrasing confirmed to mean the same real signal.
+_ANOMALY_REASON_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "interface_flapping": (
+        "disconnect", "disconnects", "disconnection", "disconnections",
+        "dropout", "dropouts", "drop", "drops", "link down", "goes down", "going down",
+    ),
+}
+
 
 def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     """Maps a casual anomaly-type phrase onto the real, fixed anomaly_reason
@@ -1238,6 +1315,11 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
             f"'{value}' could mean more than one real anomaly category ({', '.join(matches)}) -- "
             "ask the user which one is meant, don't guess."
         )
+    # Zero word-overlap matches -- try the curated synonym list before
+    # giving up (see _ANOMALY_REASON_SYNONYMS).
+    for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
+        if any(s in lowered for s in synonyms):
+            return reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
     return None, (
         f"'{value}' doesn't match any real anomaly category. The only real values are: "
         f"{', '.join(_VALID_ANOMALY_REASONS)}."
@@ -1779,6 +1861,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         and not _wants_log_rows(query.question)
         and (needs_multiple or _wants_count(query.question) or _is_bare_followup(query.question))
     )
+    # Same idea as enforce_count_tool, for "which device/vendor has the most
+    # <anomaly type>" questions -- see _detect_anomaly_reason's docstring
+    # for the confirmed net-flow incident this closes.
+    forced_anomaly_reason = _detect_anomaly_reason(query.question)
+    anomaly_reason_resolved = False
     periods_resolved = False
     data_tool_calls = 0
     grounded_counts: set[int] = set()
@@ -1824,6 +1911,39 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             answer = message["content"]
+            # Same tool-less-fabrication risk as the count/period case below,
+            # reproduced live for this question shape specifically: asked
+            # "...with wireless disconnections" right after an identically-
+            # shaped prior turn, the model answered with NO tool call at all,
+            # just restating the previous turn's device/number from the
+            # conversation history text. Force-resolve the real answer
+            # ourselves rather than trust a retry to happen.
+            if forced_anomaly_reason and not anomaly_reason_resolved:
+                anomaly_reason_resolved = True
+                is_vendor = _wants_vendor_grouping(query.question)
+                result, _ = await _execute_tool(
+                    "anomaly_summary",
+                    {"reason": forced_anomaly_reason, "group_by": "vendor" if is_vendor else "device"},
+                    os_client, ch_client, db,
+                )
+                data_tool_calls += 1
+                grounded_counts |= _grounded_counts_from_result("anomaly_summary", result)
+                known_identifiers |= _identifiers_from_result("anomaly_summary", result)
+                messages.append(message)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You answered without calling anomaly_summary for this question. Here is the "
+                        f"exact, already-verified result instead: {json.dumps(result)}. State this "
+                        "exactly as given -- do not call any tool again, and do not state a different "
+                        "device, vendor, or number than what's in this result."
+                    ),
+                })
+                log.info(
+                    "Log Assistant FORCE-RESOLVED anomaly reason ranking after a tool-less answer: "
+                    "reason=%s -> %s", forced_anomaly_reason, _truncate(json.dumps(result), 1000),
+                )
+                continue
             # Confirmed on net-flow: the wrong-tool redirect above works,
             # but only AS FAR AS forcing a retry -- if the model, instead of
             # retrying with count_events, just gives a tool-less final
@@ -2001,6 +2121,40 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 fmt = "%Y-%m-%dT%H:%M:%S"
                 arguments["start"] = period_start.strftime(fmt)
                 arguments["end"] = period_end.strftime(fmt)
+
+            if forced_anomaly_reason and not anomaly_reason_resolved and fn["name"] != "anomaly_summary":
+                # Confirmed on net-flow: asked "which device has the most
+                # <anomaly type>", the model called list_devices with a
+                # hostname carried over from conversation history instead --
+                # a real, executable tool call, but for the wrong question.
+                # Refuse it and force a retry with the right tool, same
+                # pattern as the count_events wrong-tool-redirect below.
+                result = {
+                    "error": (
+                        f"This question asks which device/vendor has the most '{forced_anomaly_reason}' "
+                        f"anomalies -- call anomaly_summary with reason='{forced_anomaly_reason}' for "
+                        f"this, not {fn['name']}."
+                    ),
+                }
+                hits = []
+                log.info(
+                    "Log Assistant tool call REDIRECTED (wrong tool for an anomaly-reason ranking "
+                    "question): %s(%s) -> forcing anomaly_summary(reason=%s)",
+                    fn["name"], arguments, forced_anomaly_reason,
+                )
+                messages.append({"role": "tool", "content": json.dumps(result)})
+                continue
+
+            if forced_anomaly_reason and not anomaly_reason_resolved and fn["name"] == "anomaly_summary":
+                # Trust our own deterministic resolution over whatever
+                # phrasing the model itself passed as `reason` -- it's
+                # already been resolved once (including via the synonym
+                # fallback _resolve_anomaly_reason's own word-overlap
+                # matching alone wouldn't have caught), so there's no reason
+                # to let the model's own, possibly-different reason argument
+                # override it. group_by/limit are left as the model chose.
+                arguments["reason"] = forced_anomaly_reason
+                anomaly_reason_resolved = True
 
             if enforce_count_tool and not periods_resolved and fn["name"] != "count_events":
                 # Confirmed on net-flow: even with comparison_periods/
