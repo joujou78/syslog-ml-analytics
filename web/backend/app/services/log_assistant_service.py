@@ -1075,6 +1075,25 @@ _VALID_SEVERITIES = frozenset({"emerg", "alert", "crit", "err", "warning", "noti
 # exactly as today, just via source_ip instead of hostname).
 _IPV4_SHAPE_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
+# Module-level (not local to _sanitize_equality_filters) so other optional-
+# filter call sites can reuse it -- confirmed needed: asked "which devices
+# have gone quiet" (no specific name given), the model passed
+# hostname='*' to silent_devices rather than omitting the argument. A
+# plain substring filter treats '*' as a literal character (no real
+# hostname contains one), so this would have silently matched nothing even
+# with real silent devices present -- it only happened not to matter
+# because the real result was already empty before filtering. Same
+# underlying pattern as 'none'/'null'/'None' elsewhere, just a glob-style
+# placeholder instead of a word.
+_PLACEHOLDER_STRINGS = frozenset({"none", "null", "n/a", "na", "unknown", "any", "unset", "*", "all", ""})
+
+
+def _is_real_filter_value(value) -> bool:
+    """True if `value` looks like an actual filter someone meant, not a
+    placeholder the model sent instead of simply omitting an optional
+    argument (see _PLACEHOLDER_STRINGS)."""
+    return isinstance(value, str) and value.strip().lower() not in _PLACEHOLDER_STRINGS
+
 
 def _sanitize_equality_filters(args: dict) -> dict:
     """Guards confirmed net-flow failure modes in the model's own tool-call
@@ -1110,7 +1129,6 @@ def _sanitize_equality_filters(args: dict) -> dict:
     something else (never overwrites a source_ip the model separately,
     correctly provided). Returns a copy with any such field moved or
     cleared to None; everything else passes through unchanged."""
-    _PLACEHOLDER_STRINGS = frozenset({"none", "null", "n/a", "na", "unknown", "any", "unset", ""})
     out = dict(args)
     hostname = out.get("hostname")
     if isinstance(hostname, str) and _IPV4_SHAPE_RE.match(hostname.strip()):
@@ -1245,6 +1263,8 @@ async def _execute_tool(
     arguments = _sanitize_equality_filters(arguments)
     if name == "list_devices":
         hostname_filter = arguments.get("hostname")
+        if not _is_real_filter_value(hostname_filter):
+            hostname_filter = None
         start = _parse_tool_datetime(arguments.get("start"))
         if hostname_filter and not start:
             # A name lookup/disambiguation, not a "busiest in a recent
@@ -1347,7 +1367,7 @@ async def _execute_tool(
     if name == "alert_rules":
         name_filter = arguments.get("name")
         rules = await alert_service.list_rules(db)
-        if name_filter:
+        if _is_real_filter_value(name_filter):
             rules = [r for r in rules if name_filter.lower() in r.name.lower()]
         return {
             "alert_rules": [
@@ -1365,7 +1385,7 @@ async def _execute_tool(
     if name == "silent_devices":
         hostname_filter = arguments.get("hostname")
         devices = await device_silence_service.list_silent_devices(db)
-        if hostname_filter:
+        if _is_real_filter_value(hostname_filter):
             devices = [d for d in devices if d.hostname and hostname_filter.lower() in d.hostname.lower()]
         return {
             "currently_silent_devices": [
