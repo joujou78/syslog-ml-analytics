@@ -307,7 +307,13 @@ _NO_HITS_ANSWER = (
 # as fact.
 MAX_TOOL_ITERATIONS = 6
 
-_COMPARISON_MARKERS = ("compare", " vs ", " vs. ", "versus", "difference between")
+_COMPARISON_MARKERS = (
+    "compare", " vs ", " vs. ", "versus", "difference between",
+    # Trend phrasing ("is traffic increasing this week vs last week") --
+    # defense-in-depth for the post-tool-call nudge safety net, alongside
+    # _PERIOD_PHRASE_ALIASES' own detection of the two actual periods.
+    "trend", "trending", "increasing", "decreasing", "increase", "decrease", "growing", "declining",
+)
 
 
 def _needs_multiple_data_points(question: str) -> bool:
@@ -677,14 +683,29 @@ def _relative_time_bounds(now: datetime) -> dict[str, tuple[datetime, datetime]]
     hint below (for the model to copy) and _detect_comparison_periods
     (which bypasses the model entirely for a detected today/yesterday/this
     week comparison) -- see both call sites for why neither trusts the
-    model to derive these itself."""
+    model to derive these itself.
+
+    'last week' is a genuinely DIFFERENT window from 'this week' -- the 7
+    days immediately before it, i.e. days 8-14 ago -- not just another
+    name for the same trailing week. Confirmed as a real gap while
+    building trend questions ("is traffic increasing this week vs last
+    week"): 'last week' used to be grouped as an ALIAS of 'this week' in
+    _PERIOD_PHRASE_ALIASES (alongside 'past week', which genuinely IS a
+    synonym for the same trailing-7-days window), so a question naming
+    both 'this week' and 'last week' only ever matched ONE period, not
+    two -- _detect_comparison_periods needs 2+ matches, so this fell
+    through to the fully unguided generic path with no deterministic
+    handling at all, for what is arguably the single most natural
+    week-over-week trend question there is."""
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
     week_start = now - timedelta(days=7)
+    last_week_start = now - timedelta(days=14)
     return {
         "today": (today_start, now),
         "yesterday": (yesterday_start, today_start),
         "this week": (week_start, now),
+        "last week": (last_week_start, week_start),
     }
 
 
@@ -701,20 +722,28 @@ def _relative_time_ranges_hint(now: datetime) -> str:
     today_start, today_end = bounds["today"]
     yesterday_start, yesterday_end = bounds["yesterday"]
     week_start, week_end = bounds["this week"]
+    last_week_start, last_week_end = bounds["last week"]
     return (
         f"today: start={today_start.strftime(fmt)}, end={today_end.strftime(fmt)}\n"
         f"yesterday: start={yesterday_start.strftime(fmt)}, end={yesterday_end.strftime(fmt)}\n"
-        f"this week / past week: start={week_start.strftime(fmt)}, end={week_end.strftime(fmt)}"
+        f"this week / past week: start={week_start.strftime(fmt)}, end={week_end.strftime(fmt)}\n"
+        f"last week (a DIFFERENT, earlier 7-day window than 'this week'): "
+        f"start={last_week_start.strftime(fmt)}, end={last_week_end.strftime(fmt)}"
     )
 
 
 # Phrase aliases that map onto the same _relative_time_bounds() key -- "this
-# week" and "past week" are used interchangeably in real questions (see the
-# original noisiest-device incident, which used "this week").
+# week" and "past week" are genuine synonyms for the same trailing-7-days
+# window (see the original noisiest-device incident, which used "this
+# week"). "last week" is its own, separate entry below -- it names a
+# DIFFERENT window (the 7 days before "this week"'s), not another name for
+# the same one; see _relative_time_bounds' docstring for the trend-question
+# incident that gap caused.
 _PERIOD_PHRASE_ALIASES: list[tuple[str, tuple[str, ...]]] = [
     ("today", ("today",)),
     ("yesterday", ("yesterday",)),
-    ("this week", ("this week", "past week", "last week")),
+    ("this week", ("this week", "past week")),
+    ("last week", ("last week",)),
 ]
 
 _NUMBER_WORDS = {
@@ -920,6 +949,44 @@ def _identifiers_from_history(history: list[ConversationTurn]) -> set[str]:
                 if _looks_like_identifier_token(tok):
                     out.add(tok)
     return out
+
+
+def _describe_trend(
+    labeled_counts: list[dict], comparison_periods: list[tuple[str, datetime, datetime]],
+) -> str | None:
+    """A pre-computed, deterministic change-over-time description for a
+    two-period comparison -- built for 'is traffic increasing/decreasing'
+    trend questions, but applies to any two-period comparison. Confirmed
+    necessary by this whole session's pattern, not just convenient: handed
+    two correct, grounded counts, the model would otherwise have to
+    compute a percentage change and a direction itself -- exactly the kind
+    of mental arithmetic already shown repeatedly unreliable here (digit
+    transcription, cross-row summation). Orders by the periods' ACTUAL
+    start time, not list/mention order, which isn't necessarily
+    chronological -- e.g. 'today' is listed before 'yesterday' in
+    _PERIOD_PHRASE_ALIASES despite being the later period -- so "increased"
+    always means earlier-period-to-later-period, regardless of which
+    order the question named them in or which order count_events was
+    called for them.
+    """
+    if len(labeled_counts) != 2 or len(comparison_periods) != 2:
+        return None
+    by_start = sorted(zip(comparison_periods, labeled_counts), key=lambda pair: pair[0][1])
+    (earlier_label, _, _), earlier_entry = by_start[0]
+    (later_label, _, _), later_entry = by_start[1]
+    earlier_count, later_count = earlier_entry["count"], later_entry["count"]
+    delta = later_count - earlier_count
+    if earlier_count:
+        pct_str = f"{abs(delta) / earlier_count * 100:.1f}%"
+    else:
+        pct_str = "undefined (0 in the earlier period)" if delta else "0%"
+    if delta > 0:
+        direction = f"increased by {delta} ({pct_str})"
+    elif delta < 0:
+        direction = f"decreased by {abs(delta)} ({pct_str})"
+    else:
+        direction = "stayed exactly the same"
+    return f"From {earlier_entry['period']} ({earlier_count}) to {later_entry['period']} ({later_count}): {direction}."
 
 
 def _describe_filter_scope(filter_args: dict) -> str | None:
@@ -1658,6 +1725,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                         + (f" {hostname_resolution_note}" if hostname_resolution_note else "")
                         + ". State these exactly as given -- do not call any tool again, and do not "
                         "state a different number."
+                        + (
+                            f" For any increase/decrease/trend claim, use ONLY this pre-computed figure, "
+                            f"stated exactly: {_describe_trend(labeled_counts, comparison_periods)}"
+                            if comparison_periods and _describe_trend(labeled_counts, comparison_periods) else ""
+                        )
                     ),
                 })
                 # Logs the actual filter_args/hostname_hint used, same reasoning
@@ -1820,6 +1892,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     grounded_counts.add(count)
                     data_tool_calls += 1
                 scope = _describe_filter_scope(filter_args)
+                trend = _describe_trend(labeled_counts, comparison_periods)
                 result = {
                     "note": (
                         "These are the exact, already-verified counts for every period being compared, "
@@ -1832,6 +1905,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     ) + (f"{hostname_resolution_note} " if hostname_resolution_note else "") + (
                         "State them exactly as labeled -- do not call count_events again for this "
                         "comparison, and do not swap or relabel which number belongs to which period."
+                        + (f" For any increase/decrease/trend claim, use ONLY this pre-computed figure, "
+                           f"stated exactly: {trend}" if trend else "")
                     ),
                     "results": labeled_counts,
                 }
