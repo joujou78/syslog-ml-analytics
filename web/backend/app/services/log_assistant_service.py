@@ -548,12 +548,18 @@ TOOL_DEFINITIONS = [
                 "does X have' or 'what reasons are most common' -- NEVER sum or compare its numbers to "
                 "answer a 'which has the most' question, since one entity's total is split across "
                 "several of its rows there. Does NOT include acknowledgment status (whether someone has "
-                "already reviewed/dismissed it) -- don't claim to know that from this."
+                "already reviewed/dismissed it) -- don't claim to know that from this. For 'which device/"
+                "vendor has the most <a specific anomaly type>' (e.g. 'ethernet flapping', 'wireless "
+                "disconnections', 'rare templates'), set the `reason` parameter instead of guessing a "
+                "keyword for search_logs -- an anomaly type is a fixed CATEGORY label applied by the ML "
+                "pipeline, not necessarily a phrase that appears in the raw log message, so search_logs "
+                "will usually find nothing even when the real data has plenty of matching anomalies."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default) or 'vendor'."},
+                    "reason": {"type": "string", "description": "Optional: restrict to one anomaly type -- pass it in your own words ('ethernet flapping', 'wireless issues'), it will be matched to the real category for you. When set, the result is already filtered AND sorted for just this type, so its first entry is the answer to 'which has the most'."},
                     "limit": {"type": "integer", "description": "Max rows to return per list. Default 10."},
                 },
             },
@@ -1178,6 +1184,66 @@ def _parse_tool_bool(value) -> bool:
 # other), not a reason to skip validating against it.
 _VALID_SEVERITIES = frozenset({"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"})
 
+# Mirrors web/frontend/src/pages/Logs.tsx's ANOMALY_REASON_OPTIONS -- the
+# real, fixed set of values the `anomaly_reasons` array column actually
+# holds (see ml/anomaly_signals.py). Same duplication trade-off as
+# _VALID_SEVERITIES above.
+_VALID_ANOMALY_REASONS = (
+    "rare_template", "always_severe", "security_content", "severity_spike",
+    "volume_spike", "unusual_template_mix", "unusual_transition", "interface_flapping",
+)
+
+
+def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
+    """Maps a casual anomaly-type phrase onto the real, fixed anomaly_reason
+    category it almost certainly means. Confirmed as a real gap: asked for
+    'the top device with ethernet flapping' / 'wireless disconnections',
+    the model had no way to know the actual stored category is
+    'interface_flapping' -- a generic, link-layer-agnostic reason that
+    covers wired AND wireless interface up/down flapping, with no separate
+    wireless-specific category -- so it guessed a free-text keyword for
+    search_logs instead, which correctly found nothing since that literal
+    phrase was never stored as message text; it's a category label applied
+    by the ML pipeline, not raw text.
+
+    Matches by shared underscore-separated word (so 'flapping' alone
+    matches 'interface_flapping') rather than requiring the real value
+    verbatim or an exact substring either direction.
+
+    Returns (resolved_reason, note): resolved_reason is the one real
+    category matched (None if zero or multiple matched -- never guess
+    between several plausible categories); note explains a no-match or
+    ambiguous-match case so the model can relay it instead of silently
+    giving up or picking one arbitrarily.
+    """
+    lowered = value.strip().lower()
+    if lowered in _VALID_ANOMALY_REASONS:
+        return lowered, None
+    words = set(re.findall(r"[a-z]+", lowered))
+    # Scored by NUMBER of shared words, not just "any shared word" --
+    # confirmed as a real precision gap: 'volume spike' shares the word
+    # 'spike' with BOTH 'severity_spike' and 'volume_spike', which a plain
+    # any-overlap check reports as a false ambiguity between them, when it
+    # unambiguously also shares 'volume' with only one of the two. Only
+    # candidates tied at the single highest overlap count are kept, so a
+    # clearly-stronger match always wins over a weaker, coincidental one.
+    scored = [(r, len(words & set(r.split("_")))) for r in _VALID_ANOMALY_REASONS]
+    scored = [(r, score) for r, score in scored if score > 0]
+    best = max((score for _, score in scored), default=0)
+    matches = [r for r, score in scored if score == best]
+    if len(matches) == 1:
+        return matches[0], f"'{value}' isn't an exact anomaly category -- matched to the real category '{matches[0]}'."
+    if len(matches) > 1:
+        return None, (
+            f"'{value}' could mean more than one real anomaly category ({', '.join(matches)}) -- "
+            "ask the user which one is meant, don't guess."
+        )
+    return None, (
+        f"'{value}' doesn't match any real anomaly category. The only real values are: "
+        f"{', '.join(_VALID_ANOMALY_REASONS)}."
+    )
+
+
 # Loose enough to catch a real dotted-quad before it's used as a literal
 # `hostname =` equality match (which is all this guards against -- an
 # actual malformed IP still fails at the database as "no such value",
@@ -1418,6 +1484,43 @@ async def _execute_tool(
 
     if name == "anomaly_summary":
         limit = min(_parse_tool_int(arguments.get("limit"), 10), 50)
+        reason_filter = arguments.get("reason")
+        resolved_reason, reason_note = (
+            _resolve_anomaly_reason(reason_filter) if _is_real_filter_value(reason_filter) else (None, None)
+        )
+        if reason_filter and not resolved_reason:
+            # Couldn't confidently map the given phrase to one real category
+            # (no match, or ambiguous between several) -- say so rather than
+            # silently falling back to an unfiltered/wrong-reason result.
+            return {"error": reason_note}, []
+        if resolved_reason:
+            is_vendor = arguments.get("group_by") == "vendor"
+            breakdown = await asyncio.to_thread(
+                anomaly_summary_service.list_vendor_summary if is_vendor else anomaly_summary_service.list_device_summary,
+                ch_client,
+            )
+            filtered = [r for r in breakdown if (r.anomaly_reason if is_vendor else r["anomaly_reason"]) == resolved_reason]
+            key = "vendors_ranked_by_reason_count" if is_vendor else "devices_ranked_by_reason_count"
+            rows = (
+                [{"vendor": r.vendor, "device_count": r.device_count, "event_count": r.event_count,
+                  "first_seen": r.first_seen.isoformat(), "last_seen": r.last_seen.isoformat()}
+                 for r in filtered[:limit]]
+                if is_vendor else
+                [{"hostname": r["hostname"], "source_ip": r["source_ip"], "vendor": r["vendor"],
+                  "event_count": r["event_count"], "first_seen": r["first_seen"].isoformat(),
+                  "last_seen": r["last_seen"].isoformat()}
+                 for r in filtered[:limit]]
+            )
+            return {
+                key: rows,
+                "reason": resolved_reason,
+                "note": (
+                    f"Already filtered to anomaly_reason='{resolved_reason}' and sorted by event_count "
+                    "descending -- the first entry IS the answer to 'which has the most', no further "
+                    "filtering or math needed. Cumulative, ALL-TIME total (not scoped to any time "
+                    "window)." + (f" {reason_note}" if reason_note else "")
+                ),
+            }, []
         note = (
             "Cumulative, ALL-TIME totals (not scoped to any time window) -- do not describe this as "
             "'today' or 'this week'. Does not include acknowledgment status. For 'which has the MOST "
