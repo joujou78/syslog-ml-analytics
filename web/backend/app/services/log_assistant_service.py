@@ -34,7 +34,8 @@ from app.core.ch_time import ch_literal
 from app.core.config import settings
 from app.schemas.log_assistant import AskResponse, ConversationTurn, LogAssistantQuery, LogHit
 from app.services import (
-    alert_service, anomaly_summary_service, device_service, device_silence_service, log_search_service,
+    alert_service, anomaly_summary_service, audit_service, device_service, device_silence_service,
+    log_search_service, relay_service,
 )
 
 log = logging.getLogger("log_assistant_service")
@@ -488,7 +489,9 @@ _AGENT_INSTRUCTIONS = (
     "start/end for), and never claims acknowledgment status. Use alert_rules for 'is there an alert "
     "for X' or 'what alerts are configured' -- it's CONFIGURATION, not a live count. Use "
     "silent_devices for 'which devices have gone quiet' or 'is X still reporting' -- every row in it "
-    "is currently silent right now, so a device's absence from it means it IS reporting normally. For "
+    "is currently silent right now, so a device's absence from it means it IS reporting normally. Use "
+    "audit_log for 'who changed/created/deleted X' or 'what changed recently' -- it NEVER contains "
+    "secret values. Use relay_source_ips for 'is X IP a relay' or 'what relay IPs are configured'. For "
     "'how many events/logs' for a specific device, "
     "severity, or filter -- including comparing two time periods -- use count_events once PER time "
     "period being asked about (e.g. once for today, once for yesterday); it returns an exact total, "
@@ -593,6 +596,45 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "hostname": {"type": "string", "description": "Optional: only devices whose hostname contains this text (case-insensitive). Omit to list all currently-silent devices."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "audit_log",
+            "description": (
+                "Lists recent admin actions on this web app -- who did what, and when (e.g. "
+                "'alert_rule.create', 'anomaly.acknowledge', 'credential.update', 'relay_source_ip."
+                "delete'). NEVER includes secret values (SNMP credentials themselves are never "
+                "logged, only that a credential for some IP was changed). Use for 'who created/"
+                "deleted/changed X', 'what changed recently', or 'has anyone acknowledged this "
+                "anomaly'. Most recent first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "contains": {"type": "string", "description": "Optional: only entries whose action or target contains this text (case-insensitive), e.g. 'alert_rule' or an IP/hostname. Omit to list all recent actions."},
+                    "start": {"type": "string", "description": "ISO 8601 UTC start -- only entries at or after this time. Omit for no time limit (just the most recent, per limit)."},
+                    "limit": {"type": "integer", "description": "Max entries to return. Default 20."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "relay_source_ips",
+            "description": (
+                "Lists the source IPs configured to relay/forward syslog on behalf of other devices "
+                "(with an optional note explaining each one) -- configuration, not live traffic. Use "
+                "for 'is X IP a relay', 'what relay IPs are configured'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ip": {"type": "string", "description": "Optional: only entries whose IP contains this text. Omit to list all."},
                 },
             },
         },
@@ -1465,6 +1507,35 @@ async def _execute_tool(
                 for d in devices
             ],
             "note": "Every row here is currently, presently silent -- absence from this list means the device IS reporting normally.",
+        }, []
+
+    if name == "audit_log":
+        contains_filter = arguments.get("contains")
+        entries = await audit_service.list_audit_log(
+            db,
+            since=_parse_tool_datetime(arguments.get("start")),
+            limit=min(_parse_tool_int(arguments.get("limit"), 20), 100),
+        )
+        if _is_real_filter_value(contains_filter):
+            needle = contains_filter.lower()
+            entries = [e for e in entries if needle in e.action.lower() or needle in e.target.lower()]
+        return {
+            "audit_log_most_recent_first": [
+                {
+                    "actor": e.actor_username or "system", "action": e.action, "target": e.target,
+                    "details": e.details, "created_at": e.created_at.isoformat(),
+                }
+                for e in entries
+            ],
+        }, []
+
+    if name == "relay_source_ips":
+        ip_filter = arguments.get("ip")
+        rows = await relay_service.list_relay_source_ips(db)
+        if _is_real_filter_value(ip_filter):
+            rows = [r for r in rows if ip_filter.lower() in r.ip.lower()]
+        return {
+            "relay_source_ips": [{"ip": r.ip, "note": r.note} for r in rows],
         }, []
 
     if name == "count_events":
