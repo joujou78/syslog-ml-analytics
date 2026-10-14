@@ -1954,6 +1954,22 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # already include it, the same pattern as every other grounding check
     # in this function.
     interface_flapping_caveat_needed = False
+    # Separate from anomaly_reason_resolved (which means "we know the right
+    # reason/tool", set the moment that's decided -- possibly in the SAME
+    # iteration that then goes on to actually execute it) -- this tracks
+    # whether anomaly_summary has actually RUN this turn, so the refusal
+    # guard below can tell "the call about to happen is the first real one"
+    # from "a repeat". Confirmed as a real, reproduced cost on net-flow, not
+    # just a theoretical one: after a tool-less force-resolve already
+    # returned the real, grounded ranking, the model called anomaly_summary
+    # a THIRD time anyway (ignoring the "do not call any tool again"
+    # instruction) -- nothing stopped it from executing again, costing
+    # another full round-trip to a slow CPU-only LLM on top of the two
+    # already spent, and the request timed out in the UI before ever
+    # reaching a final answer. count_events already refuses a repeat call
+    # once periods_resolved -- this closes the identical gap for
+    # anomaly_summary.
+    anomaly_summary_executed_this_turn = False
     nudged = False
     # Updated on every tool call attempt this turn, including a wrong-tool
     # one that got redirected -- a best-effort filter hint for the hard
@@ -2000,6 +2016,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     os_client, ch_client, db,
                 )
                 data_tool_calls += 1
+                anomaly_summary_executed_this_turn = True
                 grounded_counts |= _grounded_counts_from_result("anomaly_summary", result)
                 known_identifiers |= _identifiers_from_result("anomaly_summary", result)
                 if result.get("reason") == "interface_flapping":
@@ -2435,6 +2452,18 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
+            if fn["name"] == "anomaly_summary" and anomaly_summary_executed_this_turn:
+                result = {
+                    "error": (
+                        "Already answered -- use the anomaly_summary result already given above. "
+                        "Do not call anomaly_summary again for this question."
+                    ),
+                }
+                hits = []
+                log.info("Log Assistant tool call REFUSED (anomaly_summary already executed this turn): %s(%s)", fn["name"], arguments)
+                messages.append({"role": "tool", "content": json.dumps(result)})
+                continue
+
             result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client, db)
             # Temporary diagnostic: the only way to see what the model actually
             # asked for and what came back, since the old plain access-log line
@@ -2442,8 +2471,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # nothing about whether the tool call itself found real data.
             log.info("Log Assistant tool call: %s(%s) -> %s", fn["name"], arguments, _truncate(json.dumps(result), 1000))
             data_tool_calls += 1
-            if fn["name"] == "anomaly_summary" and result.get("reason") == "interface_flapping":
-                interface_flapping_caveat_needed = True
+            if fn["name"] == "anomaly_summary":
+                anomaly_summary_executed_this_turn = True
+                if result.get("reason") == "interface_flapping":
+                    interface_flapping_caveat_needed = True
             grounded_counts |= _grounded_counts_from_result(fn["name"], result)
             # From the result (hostnames/IPs the tool found) AND from the call's
             # own arguments -- count_events/search_logs never echo the hostname
