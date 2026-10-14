@@ -369,6 +369,30 @@ sudo -u syslog-ml SYSLOG_ML_DATABASE_URL='<value from the grep above>' .venv/bin
 sudo systemctl restart syslog-ml-web-api
 ```
 
+### Applying a future backend code change (no migration)
+
+```bash
+cd /opt/syslog-ml/web/backend
+sudo -u syslog-ml git pull origin main
+sudo find . -name "__pycache__" -exec sudo rm -rf {} +
+sudo systemctl restart syslog-ml-web-api
+```
+
+The `__pycache__` cleanup isn't usually necessary -- Python normally
+invalidates a compiled `.pyc` automatically when its source file's mtime
+changes -- but confirmed as a real, reproduced gap on net-flow: a `git
+pull` + `systemctl restart` cycle, done the "normal" way (no cache
+clearing), left the OLD pre-pull code running for several test cycles
+afterward, with no error of any kind -- the new source was correctly on
+disk and `git log` showed the right commit, but the actual runtime
+behavior kept matching the previous commit until `__pycache__` was wiped
+and the service restarted again. Not fully root-caused (a clock
+discrepancy between the deploying shell and the filesystem's mtime
+resolution is the leading theory), but clearing the cache before every
+restart is cheap and removes the failure mode entirely -- do this any
+time a deployed change doesn't seem to take effect, before assuming the
+code itself is wrong.
+
 ### 3. Wire up the API systemd service and the resolver's shared credentials
 
 ```bash
