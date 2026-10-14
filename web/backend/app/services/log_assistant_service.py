@@ -1943,6 +1943,17 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # model's final answer added 5 more devices straight out of an EARLIER,
     # differently-scoped turn's candidate list.
     list_devices_results_this_turn: set[str] = set()
+    # Confirmed live, immediately after deploying _annotate_resolved_reason's
+    # caveat (12ac03a): the tool result's own "note" field DID contain the
+    # Ethernet-only disclosure, but the model's final answer dropped it
+    # entirely and stated the number as if it were a confirmed wireless
+    # count. The exact same "prompting alone isn't reliable" lesson this
+    # whole file is built around -- a note handed to the model is not the
+    # same as the model actually relaying it. Tracked here so the final
+    # answer gets the caveat appended deterministically if the model didn't
+    # already include it, the same pattern as every other grounding check
+    # in this function.
+    interface_flapping_caveat_needed = False
     nudged = False
     # Updated on every tool call attempt this turn, including a wrong-tool
     # one that got redirected -- a best-effort filter hint for the hard
@@ -1991,6 +2002,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 data_tool_calls += 1
                 grounded_counts |= _grounded_counts_from_result("anomaly_summary", result)
                 known_identifiers |= _identifiers_from_result("anomaly_summary", result)
+                if result.get("reason") == "interface_flapping":
+                    interface_flapping_caveat_needed = True
                 messages.append(message)
                 messages.append({
                     "role": "user",
@@ -2157,6 +2170,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                         f"actual device search result ({', '.join(sorted(mentioned_stale))}) -- it may be "
                         "left over from earlier in this conversation; double-check before relying on it.)"
                     )
+            # Confirmed live: the model's final answer dropped the Ethernet-
+            # only disclosure even though the tool result it was handed
+            # explicitly contained it (see interface_flapping_caveat_needed's
+            # own comment) -- appended deterministically rather than trusted
+            # to the model's own prose, unless it already said so itself.
+            if interface_flapping_caveat_needed and "RouterOS Ethernet" not in answer:
+                answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
             return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
         messages.append(message)
@@ -2422,6 +2442,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # nothing about whether the tool call itself found real data.
             log.info("Log Assistant tool call: %s(%s) -> %s", fn["name"], arguments, _truncate(json.dumps(result), 1000))
             data_tool_calls += 1
+            if fn["name"] == "anomaly_summary" and result.get("reason") == "interface_flapping":
+                interface_flapping_caveat_needed = True
             grounded_counts |= _grounded_counts_from_result(fn["name"], result)
             # From the result (hostnames/IPs the tool found) AND from the call's
             # own arguments -- count_events/search_logs never echo the hostname
