@@ -2241,6 +2241,16 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     anomaly_reason_resolved = False
     periods_resolved = False
     data_tool_calls = 0
+    # Separate from data_tool_calls (which counts every ATTEMPT, including
+    # one that comes back {"error": ...} -- an invalid anomaly_summary
+    # reason or aggregate_events group_by, say): this counts only calls
+    # that actually returned usable data. Confirmed as a real distinction,
+    # not a redundant one: the zero_tool_nudged check below originally used
+    # data_tool_calls == 0 and never fired for the exact case it was built
+    # for, because the model's FIRST attempt (anomaly_summary with an
+    # invalid reason) had already incremented data_tool_calls to 1 despite
+    # producing zero real data.
+    successful_tool_calls = 0
     grounded_counts: set[int] = set()
     known_identifiers: set[str] = _identifiers_from_history(query.history)
     # Separate from known_identifiers (which deliberately mixes in history so
@@ -2282,6 +2292,22 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # anomaly_summary.
     anomaly_summary_executed_this_turn = False
     nudged = False
+    # Confirmed live as a distinct, general failure mode -- not specific to
+    # any one question topic: given a tool-calling nudge, the model
+    # sometimes NARRATES an intention ("I will call the list_devices
+    # tool...") in plain text instead of ever emitting a real tool_calls
+    # field, then stops without completing either a real call or a real
+    # answer. Unlike the fabrication case _TOOL_NAMES/claimed_identifiers
+    # guards against (a confident, specific, invented claim), this one
+    # often makes no identifiable claim at all, so that check doesn't catch
+    # it either -- it's simply an incomplete, unhelpful response. Gives the
+    # model ONE chance to actually execute a real tool call before
+    # accepting whatever it said as final, same bounded-retry pattern as
+    # `nudged` above (not an unconditional nudge on every zero-tool
+    # response -- that would add a costly extra round-trip on this
+    # CPU-only model to perfectly fine conversational answers that
+    # correctly needed no tool at all, e.g. a plain refusal or a greeting).
+    zero_tool_nudged = False
     # Updated on every tool call attempt this turn, including a wrong-tool
     # one that got redirected -- a best-effort filter hint for the hard
     # backstop below, when the model gives up calling tools altogether
@@ -2327,6 +2353,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     os_client, ch_client, db,
                 )
                 data_tool_calls += 1
+                successful_tool_calls += 1
                 anomaly_summary_executed_this_turn = True
                 grounded_counts |= _grounded_counts_from_result("anomaly_summary", result)
                 known_identifiers |= _identifiers_from_result("anomaly_summary", result)
@@ -2396,6 +2423,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     labeled_counts.append({"period": label, "count": count})
                     grounded_counts.add(count)
                     data_tool_calls += 1
+                    successful_tool_calls += 1
                 if hostname_hint:
                     known_identifiers.add(hostname_hint)
                     filter_args["hostname"] = hostname_hint
@@ -2450,6 +2478,30 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                         "you've only retrieved ONE real data point so far. Call the appropriate tool "
                         "AGAIN for the other item/period before answering -- do not guess, estimate, or "
                         "reuse the first number for the second item."
+                    ),
+                })
+                continue
+            if (
+                successful_tool_calls == 0 and not zero_tool_nudged
+                and (_wants_ranking(query.question) or _wants_count(query.question) or _wants_log_rows(query.question))
+            ):
+                # Gated on the question's own shape actually needing real
+                # data (same ranking/count/rows markers used elsewhere in
+                # this file) -- a vague or conversational question that
+                # genuinely needs no tool must not pay for an extra,
+                # expensive round-trip on this CPU-only model just because
+                # it happened not to call one.
+                zero_tool_nudged = True
+                messages.append(message)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You haven't actually executed any tool this turn -- describing a tool call in "
+                        "words is not the same as calling it, and gives an answer with no real data "
+                        "behind it. This question needs real data: call the appropriate tool NOW using "
+                        "the actual function-calling mechanism, not a description of it. Only give a "
+                        "plain-text final answer once you've done that, or if you're certain no tool "
+                        "can answer this."
                     ),
                 })
                 continue
@@ -2652,6 +2704,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     labeled_counts.append({"period": label, "count": count})
                     grounded_counts.add(count)
                     data_tool_calls += 1
+                    successful_tool_calls += 1
                 scope = _describe_filter_scope(filter_args)
                 trend = _describe_trend(labeled_counts, comparison_periods)
                 result = {
@@ -2722,6 +2775,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 filter_args["hostname"] = resolved_hostname
                 grounded_counts.add(count)
                 data_tool_calls += 1
+                successful_tool_calls += 1
                 scope = _describe_filter_scope(filter_args)
                 result = {
                     "note": (
@@ -2805,6 +2859,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # nothing about whether the tool call itself found real data.
             log.info("Log Assistant tool call: %s(%s) -> %s", fn["name"], arguments, _truncate(json.dumps(result), 1000))
             data_tool_calls += 1
+            if "error" not in result:
+                successful_tool_calls += 1
             if fn["name"] == "anomaly_summary":
                 anomaly_summary_executed_this_turn = True
                 if result.get("reason") == "interface_flapping":
