@@ -908,6 +908,12 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+# Real tool names, derived rather than duplicated, so a token matching one
+# of these (e.g. 'list_devices' itself, mentioned in a model's narrated
+# fake tool-call text -- see the data_tool_calls == 0 grounding check
+# below) isn't mistaken for a claimed device/identifier.
+_TOOL_NAMES = frozenset(t["function"]["name"] for t in TOOL_DEFINITIONS)
+
 
 def _relative_time_bounds(now: datetime) -> dict[str, tuple[datetime, datetime]]:
     """Real Python arithmetic for the relative-time phrases this app's
@@ -2441,6 +2447,36 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     "\n\n(Note: at least one number above doesn't match the raw data this answer's "
                     "tool calls actually returned -- double-check it before relying on it.)"
                 )
+            if data_tool_calls == 0:
+                # Confirmed live as a new, distinct failure mode from every
+                # other grounding check above: with no forced override in
+                # play (a plain, undetected question), the model fabricated
+                # an ENTIRE fake ReAct trace in its own prose -- "I will call
+                # the tool `list_devices`... Here is the tool call: ...
+                # The result is: <device name>" -- without ever emitting a
+                # real tool_calls field. Nothing executed, data_tool_calls
+                # stayed 0, and neither check above catches it: there's no
+                # number for the count-claim check to flag, and
+                # list_devices_results_this_turn is empty precisely because
+                # nothing real ran. The device/value named is 100%
+                # invented. _TOOL_NAMES excludes the tool names themselves
+                # (e.g. 'list_devices') from being mistaken for a claimed
+                # device -- they're exactly what a narrated fake trace like
+                # this mentions. known_identifiers still includes anything
+                # genuinely established in conversation HISTORY (a real
+                # tool call from an earlier turn), so only a claim with
+                # zero grounding anywhere, not just this turn, is flagged.
+                claimed_identifiers = {
+                    tok for raw_tok in _IDENTIFIER_TOKEN_RE.findall(answer)
+                    for tok in (_strip_trailing_punctuation(raw_tok),)
+                    if _looks_like_identifier_token(tok) and tok not in known_identifiers and tok not in _TOOL_NAMES
+                }
+                if claimed_identifiers:
+                    answer += (
+                        "\n\n(Note: no tool was actually called for this question -- the value(s) "
+                        f"mentioned above ({', '.join(sorted(claimed_identifiers))}) may be fabricated "
+                        "rather than drawn from real data; double-check before relying on it.)"
+                    )
             if list_devices_results_this_turn:
                 # Same idea, for device NAMES instead of counts. Confirmed on
                 # net-flow: "which devices have anjar in the name" correctly
