@@ -424,7 +424,23 @@ def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | No
         resolved, _note = _resolve_anomaly_reason(question)
         if resolved:
             return resolved
-    if history and _is_bare_followup(question) and _detect_anomaly_reason(history[-1].question) is not None:
+    if (
+        history and _is_bare_followup(question)
+        and not _is_wireless_specific(question)
+        and _detect_anomaly_reason(history[-1].question) is not None
+    ):
+        # The wireless-specific exclusion applies here too: inheriting the
+        # PREVIOUS turn's resolved reason is only reasonable when the
+        # current bare text adds no new information of its own (e.g. "and
+        # yesterday?") -- but "wireless not ethernet" very much DOES add
+        # new information (it's naming a different, wireless-specific link
+        # the previous reason's real detector doesn't cover at all -- see
+        # _resolve_anomaly_reason's own wireless exclusion), so inheriting
+        # the old reason here would be exactly the same mistake in a
+        # different shape. Falls through to None instead, same as a fresh
+        # wireless-specific question -- the general agent loop (now able to
+        # fuzzy-resolve `program` for a question like this) is a better fit
+        # than a fixed anomaly category that doesn't cover it.
         resolved, _note = _resolve_anomaly_reason(question)
         return resolved or _detect_anomaly_reason(history[-1].question)
     return None
@@ -674,17 +690,20 @@ TOOL_DEFINITIONS = [
                 "answer a 'which has the most' question, since one entity's total is split across "
                 "several of its rows there. Does NOT include acknowledgment status (whether someone has "
                 "already reviewed/dismissed it) -- don't claim to know that from this. For 'which device/"
-                "vendor has the most <a specific anomaly type>' (e.g. 'ethernet flapping', 'wireless "
-                "disconnections', 'rare templates'), set the `reason` parameter instead of guessing a "
-                "keyword for search_logs -- an anomaly type is a fixed CATEGORY label applied by the ML "
-                "pipeline, not necessarily a phrase that appears in the raw log message, so search_logs "
-                "will usually find nothing even when the real data has plenty of matching anomalies."
+                "vendor has the most <a specific anomaly type>' (e.g. 'ethernet flapping', 'volume "
+                "spike', 'rare templates'), set the `reason` parameter instead of guessing a keyword for "
+                "search_logs -- an anomaly type is a fixed CATEGORY label applied by the ML pipeline, "
+                "not necessarily a phrase that appears in the raw log message, so search_logs will "
+                "usually find nothing even when the real data has plenty of matching anomalies. Do NOT "
+                "use this tool for a wireless-specific question (e.g. 'wireless disconnections') -- "
+                "there is no wireless-specific anomaly category; use aggregate_events or count_events "
+                "with program='wireless' instead, which finds the real wireless-tagged log data."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default) or 'vendor'."},
-                    "reason": {"type": "string", "description": "Optional: restrict to one anomaly type -- pass it in your own words ('ethernet flapping', 'wireless issues'), it will be matched to the real category for you. When set, the result is already filtered AND sorted for just this type, so its first entry is the answer to 'which has the most'."},
+                    "reason": {"type": "string", "description": "Optional: restrict to one anomaly type -- pass it in your own words ('ethernet flapping', 'volume spike'), it will be matched to the real category for you. When set, the result is already filtered AND sorted for just this type, so its first entry is the answer to 'which has the most'. NEVER pass a wireless-specific phrase here -- there is no wireless-specific category (see this tool's own description)."},
                     "limit": {"type": "integer", "description": "Max rows to return per list. Default 10."},
                 },
             },
@@ -1358,33 +1377,31 @@ _VALID_ANOMALY_REASONS = (
     "volume_spike", "unusual_template_mix", "unusual_transition", "interface_flapping",
 )
 
-# Confirmed as a real gap on net-flow, live: asked for "the top device with
-# wireless disconnections", the word-overlap matching below found ZERO
-# shared words with any category -- "wireless"/"disconnections" share
-# nothing with "interface"/"flapping" literally, even though
-# interface_flapping's own real definition (ml/interface_flap_anomaly.py)
-# is explicitly link-layer-agnostic, covering any interface (wired or
-# wireless) repeatedly cycling up/down, i.e. exactly what "disconnections"
-# describes. A small curated synonym list, not a general synonym engine --
-# broad guessing risks matching an unrelated question that happens to share
-# a word with a category by coincidence, so this stays narrow and only
-# covers phrasing confirmed to mean the same real signal.
-# Confirmed live, directly in ml/interface_flap_anomaly.py: despite that
-# module's own docstring describing interface_flapping as link-layer-
-# agnostic ("covers wired AND wireless interface up/down flapping"), its
-# ACTUAL detector (_INTERFACE_SIGNATURES) recognizes exactly one pattern --
-# RouterOS's `ether<N> link up/down` -- and nothing wireless at all. So a
-# "wireless disconnections" question correctly resolves to this category
-# (the right category NAME, per its own stated design intent), but the
-# real data behind it is 100% Ethernet flapping, never actual wireless
-# events, because nothing currently detects those. Silently answering a
-# wireless question with Ethernet-only data would overstate what's really
-# known -- this caveat is appended to every resolution so the model (and
-# the answer it gives) discloses this rather than implying false
-# precision. Not fixed by guessing a wireless regex here: this project's
-# own stated methodology (see that module's docstring) is evidence-based
-# pattern matching against real traffic, and no confirmed wireless
-# up/down message format exists in this deployment yet to match against.
+# History here, briefly: a synonym list once mapped "wireless"/"wifi"/
+# "radio" onto interface_flapping too, reasoned from that category's own
+# docstring claiming link-layer-agnostic coverage ("covers wired AND
+# wireless interface up/down flapping"). Confirmed live this was wrong in
+# practice -- interface_flapping's ACTUAL detector (_INTERFACE_SIGNATURES
+# in ml/interface_flap_anomaly.py) recognizes exactly one pattern,
+# RouterOS's Ethernet-only `ether<N> link up/down`, and nothing wireless at
+# all. Routing a wireless-specific question there hid real, directly
+# relevant data (program='wireless,debug' events genuinely exist -- see
+# _resolve_program_fuzzy) behind an honest-but-unhelpful Ethernet caveat,
+# rather than ever letting the model reach for the real data. Now
+# deliberately EXCLUDED below (see _is_wireless_specific) -- a question
+# naming a wireless-specific link no longer resolves to this category via
+# the synonym list at all, even though the plain "flapping"/"interface"
+# word-overlap match above still does (so "ethernet flapping" is
+# unaffected). This caveat itself stays, for the remaining case where
+# interface_flapping IS still the right category (a plain "flapping" or
+# "ethernet flapping" question, or an explicit 'reason=interface_flapping'
+# call) -- it's still worth disclosing that even a non-wireless-phrased
+# question only reflects this one RouterOS Ethernet pattern, not every
+# possible interface type. Not fixed by guessing a wireless regex here:
+# this project's own stated methodology (see that module's docstring) is
+# evidence-based pattern matching against real traffic, and no confirmed
+# wireless up/down message format exists in this deployment yet to match
+# against.
 _INTERFACE_FLAPPING_CAVEAT = (
     "Note: in this deployment, interface_flapping is currently only detected for RouterOS "
     "Ethernet interfaces (the literal 'ether<N> link up/down' message) -- no wireless-specific "
@@ -1403,30 +1420,51 @@ _ANOMALY_REASON_SYNONYMS: dict[str, tuple[str, ...]] = {
     "interface_flapping": (
         "disconnect", "disconnects", "disconnection", "disconnections",
         "dropout", "dropouts", "drop", "drops", "link down", "goes down", "going down",
-        # Confirmed as a real gap, live: a follow-up correction "wireless not
-        # ethernet" (no "disconnect"-type word at all) still needs to resolve
-        # to this category -- interface_flapping's own docstring
-        # (ml/interface_flap_anomaly.py) is explicit that it's link-layer-
-        # agnostic, covering wired AND wireless interfaces equally, and it's
-        # the only one of the 8 real categories that has anything to do with
-        # a wireless/radio link at all, so this carries low collision risk
-        # with the other 7 (none of which mention anything wireless-related).
-        "wireless", "wifi", "wi-fi", "radio",
+        # "wireless"/"wifi"/"radio" deliberately removed (were here briefly --
+        # see git history): reasoned from interface_flapping's own docstring
+        # claiming link-layer-agnostic coverage, but confirmed live this was
+        # actively counterproductive. The real data has genuine wireless
+        # activity (program='wireless,debug', e.g. 'wlan1: failed to select
+        # network'), invisible to this anomaly category (its one real
+        # detector pattern is RouterOS's Ethernet-only 'ether<N> link
+        # up/down' -- see ml/interface_flap_anomaly.py), but very much
+        # findable via aggregate_events/count_events/search_logs now that
+        # _resolve_program_fuzzy exists. Routing a "wireless" question to
+        # this category hid real, directly relevant data behind an honest
+        # caveat instead of ever letting the model reach for it. The general
+        # lesson, not just a wireless-specific one: don't force a topic into
+        # one of these 8 fixed categories on an assumption about what it
+        # covers -- only word-overlap with the category's OWN name (handled
+        # above) or a genuinely synonymous phrase for the same real signal
+        # belongs here.
     ),
 }
+
+_WIRELESS_SPECIFIC_MARKERS = ("wireless", "wifi", "wi-fi", "radio")
+
+
+def _is_wireless_specific(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _WIRELESS_SPECIFIC_MARKERS)
 
 
 def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     """Maps a casual anomaly-type phrase onto the real, fixed anomaly_reason
     category it almost certainly means. Confirmed as a real gap: asked for
-    'the top device with ethernet flapping' / 'wireless disconnections',
-    the model had no way to know the actual stored category is
-    'interface_flapping' -- a generic, link-layer-agnostic reason that
-    covers wired AND wireless interface up/down flapping, with no separate
-    wireless-specific category -- so it guessed a free-text keyword for
-    search_logs instead, which correctly found nothing since that literal
-    phrase was never stored as message text; it's a category label applied
-    by the ML pipeline, not raw text.
+    'the top device with ethernet flapping', the model had no way to know
+    the actual stored category is 'interface_flapping' -- a category label
+    applied by the ML pipeline, not raw text -- so it guessed a free-text
+    keyword for search_logs instead, which correctly found nothing since
+    that literal phrase was never stored as message text.
+
+    Deliberately does NOT resolve a wireless-specific phrase ('wireless',
+    'wifi', 'radio') to interface_flapping -- see _is_wireless_specific's
+    call site below. interface_flapping's real detector only recognizes
+    RouterOS's Ethernet-only 'ether<N> link up/down' pattern (see
+    ml/interface_flap_anomaly.py); a wireless-specific question is better
+    answered by aggregate_events/count_events with a `program` filter
+    (program values like 'wireless,debug' are real, see
+    _resolve_program_fuzzy), not this fixed anomaly category.
 
     Matches by shared underscore-separated word (so 'flapping' alone
     matches 'interface_flapping') rather than requiring the real value
@@ -1463,12 +1501,24 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
             "ask the user which one is meant, don't guess."
         )
     # Zero word-overlap matches -- try the curated synonym list before
-    # giving up (see _ANOMALY_REASON_SYNONYMS).
-    for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
-        if any(s in lowered for s in synonyms):
-            return _annotate_resolved_reason(
-                reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
-            )
+    # giving up (see _ANOMALY_REASON_SYNONYMS) -- EXCEPT when the text
+    # explicitly names a wireless-specific link (wireless/wifi/radio):
+    # interface_flapping's only real detector is RouterOS's Ethernet-only
+    # 'ether<N> link up/down' (see ml/interface_flap_anomaly.py), so
+    # resolving a wireless-specific question to it via the generic
+    # disconnect-family synonyms would claim coverage that doesn't exist --
+    # confirmed live as actively counterproductive (it hid real wireless
+    # data, findable via aggregate_events/count_events now that
+    # _resolve_program_fuzzy exists, behind an honest-but-unhelpful
+    # Ethernet caveat). A plain 'flapping'/'interface' word-overlap match
+    # above is unaffected by this -- "ethernet flapping" or literally
+    # "interface flapping" still resolves correctly regardless.
+    if not _is_wireless_specific(lowered):
+        for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
+            if any(s in lowered for s in synonyms):
+                return _annotate_resolved_reason(
+                    reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
+                )
     return None, (
         f"'{value}' doesn't match any real anomaly category. The only real values are: "
         f"{', '.join(_VALID_ANOMALY_REASONS)}."
@@ -1629,51 +1679,136 @@ async def _resolve_hostname_fuzzy(ch_client: Client, hostname: str) -> tuple[str
     return None, None
 
 
+async def _resolve_program_fuzzy(ch_client: Client, program: str) -> tuple[str | None, str | None]:
+    """If `program` doesn't exactly match any real value, try a case-
+    insensitive SUBSTRING match against the distinct program values
+    actually in use (log_search_service.get_filter_options' own
+    groupUniqArray(program), already built for the Log Search page's
+    dropdown) before accepting a count_events/search_logs/aggregate_events
+    zero as genuine.
+
+    Confirmed as a real gap, not hypothetical: asked 'top device with
+    wireless disconnections', the real data plainly contains wireless
+    activity (program='wireless,debug', message 'wlan1: failed to select
+    network') -- but `program` is an EXACT-equality filter (see
+    _build_conditions), and RouterOS (and similar vendors) write a
+    comma-separated list of facility/category tags into this field rather
+    than a single clean process name like 'sshd', so neither a human nor
+    the model would ever guess the literal string 'wireless,debug' to
+    query by. A plain 'wireless' query against an exact-match filter
+    silently returns zero, indistinguishable from "no wireless activity at
+    all" -- exactly the failure mode _resolve_hostname_fuzzy already
+    solves for hostnames, applied here to the identical problem for
+    program.
+
+    Deliberately NOT changing log_search_service._build_conditions itself
+    to substring-match program -- that also backs the human-facing Log
+    Search page, where an operator picking an exact value from the filter
+    dropdown should get an exact answer, not a surprise expansion (same
+    reasoning _resolve_hostname_fuzzy's own docstring gives for not
+    changing search_logs/count_events directly for hostname).
+
+    Returns (resolved_program, note) -- resolved_program is the one real
+    value matched (None if zero or multiple matched -- never guess between
+    several plausible values, same policy as every other resolver here)."""
+    options = await asyncio.to_thread(log_search_service.get_filter_options, ch_client)
+    lowered = program.strip().lower()
+    matches = [p for p in options.programs if lowered in p.lower()]
+    if len(matches) == 1:
+        return matches[0], f"'{program}' isn't an exact program value -- matched to the real value '{matches[0]}'."
+    if len(matches) > 1:
+        values = ", ".join(matches)
+        return None, (
+            f"'{program}' isn't an exact program value and matches more than one real value "
+            f"({values}) -- tell the user which matched and ask them to pick one, don't guess."
+        )
+    return None, None
+
+
 async def _count_events_resolving_hostname(
-    ch_client: Client, *, hostname: str | None, **kwargs,
+    ch_client: Client, *, hostname: str | None, program: str | None = None, **kwargs,
 ) -> tuple[int, str | None, str | None]:
-    """log_search_service.count_events with the _resolve_hostname_fuzzy
-    fallback applied -- see its docstring. Returns (count, effective_hostname,
-    note) -- effective_hostname is whichever hostname actually produced
-    `count` (unchanged, or the fuzzy-resolved name), so a caller resolving
-    the SAME hostname across multiple periods (a comparison) can reuse it
-    on subsequent calls instead of re-resolving (and re-querying
-    device_service) every time."""
-    count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=hostname, **kwargs)
-    if count or not hostname:
+    """log_search_service.count_events with the _resolve_hostname_fuzzy AND
+    _resolve_program_fuzzy fallbacks applied -- see their docstrings.
+    Returns (count, effective_hostname, note) -- effective_hostname is
+    whichever hostname actually produced `count` (unchanged, or the
+    fuzzy-resolved name), so a caller resolving the SAME hostname across
+    multiple periods (a comparison) can reuse it on subsequent calls
+    instead of re-resolving (and re-querying device_service) every time.
+    program is resolved too when needed, but only internally (folded into
+    `note`, not returned separately) -- unlike hostname, nothing in ask()
+    currently needs to reuse a resolved program across repeated calls."""
+    count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=hostname, program=program, **kwargs)
+    if count:
         return count, hostname, None
-    resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
-    if resolved:
-        count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=resolved, **kwargs)
-        return count, resolved, note
-    return count, hostname, note
+    notes = []
+    effective_hostname = hostname
+    if hostname:
+        resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
+        if note:
+            notes.append(note)
+        if resolved:
+            effective_hostname = resolved
+            count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=effective_hostname, program=program, **kwargs)
+    if not count and program:
+        resolved, note = await _resolve_program_fuzzy(ch_client, program)
+        if note:
+            notes.append(note)
+        if resolved:
+            count = await asyncio.to_thread(log_search_service.count_events, ch_client, hostname=effective_hostname, program=resolved, **kwargs)
+    return count, effective_hostname, (" ".join(notes) or None)
 
 
-async def _search_logs_resolving_hostname(ch_client: Client, *, hostname: str | None, **kwargs):
-    """log_search_service.search_logs with the _resolve_hostname_fuzzy
-    fallback applied -- see its docstring. Returns (LogSearchResponse, note)."""
-    result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=hostname, **kwargs)
-    if result.items or not hostname:
+async def _search_logs_resolving_hostname(ch_client: Client, *, hostname: str | None, program: str | None = None, **kwargs):
+    """log_search_service.search_logs with the _resolve_hostname_fuzzy AND
+    _resolve_program_fuzzy fallbacks applied -- see their docstrings.
+    Returns (LogSearchResponse, note)."""
+    result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=hostname, program=program, **kwargs)
+    if result.items:
         return result, None
-    resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
-    if resolved:
-        result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=resolved, **kwargs)
-    return result, note
+    notes = []
+    effective_hostname = hostname
+    if hostname:
+        resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
+        if note:
+            notes.append(note)
+        if resolved:
+            effective_hostname = resolved
+            result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=effective_hostname, program=program, **kwargs)
+    if not result.items and program:
+        resolved, note = await _resolve_program_fuzzy(ch_client, program)
+        if note:
+            notes.append(note)
+        if resolved:
+            result = await asyncio.to_thread(log_search_service.search_logs, ch_client, hostname=effective_hostname, program=resolved, **kwargs)
+    return result, (" ".join(notes) or None)
 
 
 async def _aggregate_events_resolving_hostname(
-    ch_client: Client, *, hostname: str | None, **kwargs,
+    ch_client: Client, *, hostname: str | None, program: str | None = None, **kwargs,
 ) -> tuple[list[dict], str | None]:
     """log_search_service.aggregate_events with the _resolve_hostname_fuzzy
-    fallback applied -- see its docstring. Returns (rows, note)."""
-    rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=hostname, **kwargs)
-    if rows or not hostname:
+    AND _resolve_program_fuzzy fallbacks applied -- see their docstrings.
+    Returns (rows, note)."""
+    rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=hostname, program=program, **kwargs)
+    if rows:
         return rows, None
-    resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
-    if resolved:
-        rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=resolved, **kwargs)
-        return rows, note
-    return rows, note
+    notes = []
+    effective_hostname = hostname
+    if hostname:
+        resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
+        if note:
+            notes.append(note)
+        if resolved:
+            effective_hostname = resolved
+            rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=effective_hostname, program=program, **kwargs)
+    if not rows and program:
+        resolved, note = await _resolve_program_fuzzy(ch_client, program)
+        if note:
+            notes.append(note)
+        if resolved:
+            rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=effective_hostname, program=resolved, **kwargs)
+    return rows, (" ".join(notes) or None)
 
 
 async def _execute_tool(
