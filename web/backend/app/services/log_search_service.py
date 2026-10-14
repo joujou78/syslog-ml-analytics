@@ -25,6 +25,25 @@ EXPORT_MAX_ROWS = 50_000
 
 _EQUALITY_FILTERS = ("hostname", "source_ip", "vendor", "program", "severity", "predicted_category")
 
+# Columns aggregate_events (below) is allowed to GROUP BY -- an allowlist,
+# not free text, because ClickHouse column names can't be bound as query
+# parameters the way values can; this is the standard safe substitute for a
+# model/user-controlled identifier, the same role _EQUALITY_FILTERS plays
+# for WHERE clause fields. Public (not _-prefixed): the Log Assistant
+# agent's tool schema (app/services/log_assistant_service.py) reuses this
+# exact list for its `group_by` parameter's enum, so the two can't drift
+# apart. anomaly_reasons is deliberately excluded -- it's an Array column,
+# grouping by it needs arrayJoin (fan-out), which changes what a plain
+# count() means per the same reasoning anomaly_summary_service's own
+# breakdown-by-reason already documents (one event can carry several
+# reasons at once); anomaly_summary already covers that case.
+GROUP_BY_COLUMNS = (
+    "hostname", "source_ip", "vendor", "program", "severity", "predicted_category",
+    "resolution_method", "is_anomaly",
+)
+MAX_GROUP_BY_COLUMNS = 3
+AGGREGATE_MAX_LIMIT = 100
+
 _EXPORT_COLUMNS = [
     "event_time", "source_ip", "hostname", "vendor", "severity", "program", "pid",
     "message", "predicted_category", "predicted_confidence", "is_anomaly",
@@ -206,6 +225,67 @@ def count_events(
         f"SELECT count() FROM syslog_ml.events WHERE {' AND '.join(conditions)}", parameters=params,
     )
     return result.result_rows[0][0]
+
+
+def aggregate_events(
+    client: Client,
+    *,
+    group_by: list[str],
+    start: datetime | None = None,
+    end: datetime | None = None,
+    hostname: str | None = None,
+    source_ip: str | None = None,
+    vendor: str | None = None,
+    program: str | None = None,
+    severity: str | None = None,
+    predicted_category: str | None = None,
+    anomaly_reason: str | None = None,
+    keyword: str | None = None,
+    only_anomalies: bool = False,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Flexible grouped count over syslog_ml.events, same filters as
+    count_events/search_logs plus a GROUP BY -- added for the Log Assistant
+    agent so it isn't limited to the fixed menu of existing tools for every
+    possible "how many X broken down by Y" question. Explicit alternative
+    to exposing raw SQL to the agent (see query_console_service.py,
+    deliberately admin-only UI only -- letting an unreliable small LLM
+    construct and execute arbitrary SQL against a production database,
+    including that console's own ALTER/DELETE/DROP/TRUNCATE access, is a
+    materially different risk than a parameterized query over an
+    allowlisted set of columns like this one).
+
+    `group_by` is validated against GROUP_BY_COLUMNS by the caller (see its
+    own docstring for why this must be an allowlist, not free text) --
+    this function trusts it's already been checked and raises ValueError
+    defensively if not, rather than silently building an invalid query.
+    """
+    if not group_by:
+        raise ValueError("group_by must have at least one column")
+    invalid = [c for c in group_by if c not in GROUP_BY_COLUMNS]
+    if invalid:
+        raise ValueError(f"Invalid group_by column(s): {', '.join(invalid)}. Valid: {', '.join(GROUP_BY_COLUMNS)}.")
+    group_by = group_by[:MAX_GROUP_BY_COLUMNS]
+    limit = max(1, min(limit, AGGREGATE_MAX_LIMIT))
+
+    conditions, params, _, _ = _build_conditions(
+        start=start, end=end, hostname=hostname, source_ip=source_ip, vendor=vendor, program=program,
+        severity=severity, predicted_category=predicted_category, anomaly_reason=anomaly_reason,
+        keyword=keyword, only_anomalies=only_anomalies,
+    )
+    params["fetch_limit"] = limit
+    group_cols = ", ".join(group_by)
+    query = f"""
+        SELECT {group_cols}, count() AS event_count
+        FROM syslog_ml.events
+        WHERE {' AND '.join(conditions)}
+        GROUP BY {group_cols}
+        ORDER BY event_count DESC
+        LIMIT %(fetch_limit)s
+    """
+    result = client.query(query, parameters=params)
+    return [{**dict(zip(group_by, row[:-1])), "event_count": row[-1]} for row in result.result_rows]
 
 
 def get_filter_options(client: Client) -> LogFilterOptions:

@@ -618,7 +618,12 @@ _AGENT_INSTRUCTIONS = (
     "never estimate or reuse a number from a different tool call. Use search_logs only when the "
     "actual log lines themselves are needed (not just a count), for 'show me', 'did X happen', or "
     "exact keyword questions. Use semantic_search only for 'what's going on with/related to <topic>' "
-    "questions where you don't have an exact keyword to filter on. A number in your final answer must "
+    "questions where you don't have an exact keyword to filter on. Use aggregate_events for 'how many "
+    "X broken down by Y' or 'what's the split of Z' questions not covered by a more specific tool -- "
+    "e.g. 'break down today's events by severity' or 'events per program for device X'. It returns "
+    "exact counts already sorted, so its first entry answers a 'which <group> has the most' question "
+    "too -- but prefer anomaly_summary for an anomaly-reason breakdown and list_devices for 'which "
+    "device is busiest' specifically, since those already exist and are more direct. A number in your final answer must "
     "come from a tool result for that SAME device/filter/time period -- never attribute one tool "
     "call's result to a different device or period than what it was actually called with. Once every "
     "number the question needs has been retrieved, give a plain, direct final answer in your own "
@@ -839,6 +844,46 @@ TOOL_DEFINITIONS = [
                     "limit": {"type": "integer", "description": "Default 10"},
                 },
                 "required": ["phrase"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "aggregate_events",
+            "description": (
+                "Flexible grouped count over ALL log events -- use for any 'how many X broken down "
+                "by Y' or 'what's the split of Z' question not covered by a more specific tool. "
+                "Examples: 'break down today's events by severity', 'how many events per program for "
+                "device X', 'what's the split of predicted categories this week', 'count of events by "
+                "vendor'. Returns each group's exact count, already sorted busiest first -- the first "
+                "entry IS the answer to 'which <group> has the most'. Prefer a more specific tool when "
+                "one exists: count_events for a single total with no breakdown, anomaly_summary for "
+                "'which device/vendor has the most anomalies' or a breakdown by anomaly reason, "
+                "list_devices for 'which device is busiest'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_by": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(log_search_service.GROUP_BY_COLUMNS)},
+                        "description": "1-3 columns to break the count down by, e.g. ['severity'] or ['vendor', 'program'].",
+                    },
+                    "hostname": {"type": "string"},
+                    "source_ip": {"type": "string"},
+                    "vendor": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"], "description": "Omit entirely if the question does not ask about a specific severity -- these 8 values are the ONLY valid ones, never 'none' or 'any'."},
+                    "program": {"type": "string", "description": "The syslog process/service name (e.g. 'sshd', 'kernel') -- NEVER a hostname or device name."},
+                    "predicted_category": {"type": "string"},
+                    "reason": {"type": "string", "description": "Optional: restrict to one anomaly type, in your own words ('ethernet flapping') -- matched to the real category for you, same as anomaly_summary's reason parameter."},
+                    "keyword": {"type": "string", "description": "Substring to match in the log message"},
+                    "only_anomalies": {"type": "boolean"},
+                    "start": {"type": "string", "description": "ISO 8601 UTC start"},
+                    "end": {"type": "string", "description": "ISO 8601 UTC end"},
+                    "limit": {"type": "integer", "description": "Max groups to return. Default 20."},
+                },
+                "required": ["group_by"],
             },
         },
     },
@@ -1616,6 +1661,21 @@ async def _search_logs_resolving_hostname(ch_client: Client, *, hostname: str | 
     return result, note
 
 
+async def _aggregate_events_resolving_hostname(
+    ch_client: Client, *, hostname: str | None, **kwargs,
+) -> tuple[list[dict], str | None]:
+    """log_search_service.aggregate_events with the _resolve_hostname_fuzzy
+    fallback applied -- see its docstring. Returns (rows, note)."""
+    rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=hostname, **kwargs)
+    if rows or not hostname:
+        return rows, None
+    resolved, note = await _resolve_hostname_fuzzy(ch_client, hostname)
+    if resolved:
+        rows = await asyncio.to_thread(log_search_service.aggregate_events, ch_client, hostname=resolved, **kwargs)
+        return rows, note
+    return rows, note
+
+
 async def _execute_tool(
     name: str, arguments: dict, os_client: OpenSearch, ch_client: Client, db: AsyncSession,
 ) -> tuple[dict, list[LogHit]]:
@@ -1888,6 +1948,56 @@ async def _execute_tool(
         if hostname_note:
             search_result["note"] = hostname_note
         return search_result, hits
+
+    if name == "aggregate_events":
+        group_by = arguments.get("group_by")
+        if isinstance(group_by, str):
+            # Confirmed-pattern-consistent defensive handling (same class of
+            # issue _parse_tool_bool/_parse_tool_int guard elsewhere): a
+            # model sending a bare string instead of a one-item list for a
+            # schema-typed array argument.
+            group_by = [group_by]
+        group_by = [g for g in (group_by or []) if isinstance(g, str)]
+        if not group_by:
+            return {"error": "group_by is required -- specify 1-3 columns to break the count down by."}, []
+        invalid = [g for g in group_by if g not in log_search_service.GROUP_BY_COLUMNS]
+        if invalid:
+            return {
+                "error": (
+                    f"Invalid group_by column(s): {', '.join(invalid)}. Valid columns: "
+                    f"{', '.join(log_search_service.GROUP_BY_COLUMNS)}."
+                ),
+            }, []
+        reason_filter = arguments.get("reason") or arguments.get("anomaly_reason")
+        resolved_reason = None
+        if _is_real_filter_value(reason_filter):
+            resolved_reason, reason_note = _resolve_anomaly_reason(reason_filter)
+            if not resolved_reason:
+                return {"error": reason_note}, []
+        rows, hostname_note = await _aggregate_events_resolving_hostname(
+            ch_client,
+            group_by=group_by,
+            hostname=arguments.get("hostname"),
+            source_ip=arguments.get("source_ip"),
+            vendor=arguments.get("vendor"),
+            severity=arguments.get("severity"),
+            program=arguments.get("program"),
+            predicted_category=arguments.get("predicted_category"),
+            anomaly_reason=resolved_reason,
+            keyword=arguments.get("keyword"),
+            only_anomalies=_parse_tool_bool(arguments.get("only_anomalies")),
+            start=_parse_tool_datetime(arguments.get("start")),
+            end=_parse_tool_datetime(arguments.get("end")),
+            limit=min(_parse_tool_int(arguments.get("limit"), 20), log_search_service.AGGREGATE_MAX_LIMIT),
+        )
+        agg_result = {
+            "breakdown_sorted_busiest_first": rows,
+            "grouped_by": group_by,
+            "note": "Already sorted by event_count descending -- the first entry IS the answer to 'which <group> has the most'.",
+        }
+        if hostname_note:
+            agg_result["note"] += f" {hostname_note}"
+        return agg_result, []
 
     if name == "semantic_search":
         phrase = arguments.get("phrase") or ""
