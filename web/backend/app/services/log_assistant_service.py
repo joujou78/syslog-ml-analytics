@@ -397,18 +397,37 @@ def _wants_vendor_grouping(question: str) -> bool:
     return "vendor" in question.lower()
 
 
-def _detect_anomaly_reason(question: str) -> str | None:
+def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | None = None) -> str | None:
     """Resolves a 'which device/vendor has the most <anomaly type>' question
     to a real anomaly_reason category, or None if this isn't that kind of
     question. Gated on ranking language (top/most/which device/which
     vendor) on top of _resolve_anomaly_reason's own word-overlap/synonym
     matching -- a plain 'which device is busiest' (no anomaly type
     mentioned at all) correctly resolves to nothing here and is left alone
-    for list_devices, which is the right tool for that question."""
-    if not _wants_ranking(question):
-        return None
-    resolved, _note = _resolve_anomaly_reason(question)
-    return resolved
+    for list_devices, which is the right tool for that question.
+
+    Also recognizes a bare follow-up that corrects/refines the anomaly type
+    of the immediately preceding turn (e.g. "wireless not ethernet" right
+    after "...with ethernet flapping") -- confirmed live on net-flow as a
+    real gap: such a correction doesn't repeat ranking language itself, so
+    without this it fell straight through to the old, unprotected bare-
+    followup path (_primary_identifier_from_last_turn), which assumes the
+    carried-over entity is a DEVICE and just re-ran list_devices for
+    whichever device the PREVIOUS turn's reason had resolved to -- a real,
+    executable call, but one that answers "how many total events for that
+    device" instead of "which device has the most <the corrected reason>".
+    Only looks at the immediately preceding turn, same "last turn only, not
+    the whole thread" scoping as _primary_identifier_from_last_turn, and
+    prefers whatever the CURRENT bare text itself resolves to (a correction
+    usually names a new value) over blindly reusing the previous reason."""
+    if _wants_ranking(question):
+        resolved, _note = _resolve_anomaly_reason(question)
+        if resolved:
+            return resolved
+    if history and _is_bare_followup(question) and _detect_anomaly_reason(history[-1].question) is not None:
+        resolved, _note = _resolve_anomaly_reason(question)
+        return resolved or _detect_anomaly_reason(history[-1].question)
+    return None
 
 
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
@@ -1267,6 +1286,15 @@ _ANOMALY_REASON_SYNONYMS: dict[str, tuple[str, ...]] = {
     "interface_flapping": (
         "disconnect", "disconnects", "disconnection", "disconnections",
         "dropout", "dropouts", "drop", "drops", "link down", "goes down", "going down",
+        # Confirmed as a real gap, live: a follow-up correction "wireless not
+        # ethernet" (no "disconnect"-type word at all) still needs to resolve
+        # to this category -- interface_flapping's own docstring
+        # (ml/interface_flap_anomaly.py) is explicit that it's link-layer-
+        # agnostic, covering wired AND wireless interfaces equally, and it's
+        # the only one of the 8 real categories that has anything to do with
+        # a wireless/radio link at all, so this carries low collision risk
+        # with the other 7 (none of which mention anything wireless-related).
+        "wireless", "wifi", "wi-fi", "radio",
     ),
 }
 
@@ -1864,7 +1892,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # Same idea as enforce_count_tool, for "which device/vendor has the most
     # <anomaly type>" questions -- see _detect_anomaly_reason's docstring
     # for the confirmed net-flow incident this closes.
-    forced_anomaly_reason = _detect_anomaly_reason(query.question)
+    forced_anomaly_reason = _detect_anomaly_reason(query.question, query.history)
     anomaly_reason_resolved = False
     periods_resolved = False
     data_tool_calls = 0
