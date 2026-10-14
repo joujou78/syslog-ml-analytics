@@ -1282,6 +1282,36 @@ _VALID_ANOMALY_REASONS = (
 # broad guessing risks matching an unrelated question that happens to share
 # a word with a category by coincidence, so this stays narrow and only
 # covers phrasing confirmed to mean the same real signal.
+# Confirmed live, directly in ml/interface_flap_anomaly.py: despite that
+# module's own docstring describing interface_flapping as link-layer-
+# agnostic ("covers wired AND wireless interface up/down flapping"), its
+# ACTUAL detector (_INTERFACE_SIGNATURES) recognizes exactly one pattern --
+# RouterOS's `ether<N> link up/down` -- and nothing wireless at all. So a
+# "wireless disconnections" question correctly resolves to this category
+# (the right category NAME, per its own stated design intent), but the
+# real data behind it is 100% Ethernet flapping, never actual wireless
+# events, because nothing currently detects those. Silently answering a
+# wireless question with Ethernet-only data would overstate what's really
+# known -- this caveat is appended to every resolution so the model (and
+# the answer it gives) discloses this rather than implying false
+# precision. Not fixed by guessing a wireless regex here: this project's
+# own stated methodology (see that module's docstring) is evidence-based
+# pattern matching against real traffic, and no confirmed wireless
+# up/down message format exists in this deployment yet to match against.
+_INTERFACE_FLAPPING_CAVEAT = (
+    "Note: in this deployment, interface_flapping is currently only detected for RouterOS "
+    "Ethernet interfaces (the literal 'ether<N> link up/down' message) -- no wireless-specific "
+    "up/down signature is implemented yet, so this reflects Ethernet flapping, not a verified "
+    "wireless-specific count, regardless of how the question was phrased."
+)
+
+
+def _annotate_resolved_reason(reason: str, note: str | None) -> tuple[str, str | None]:
+    if reason == "interface_flapping":
+        note = f"{note} {_INTERFACE_FLAPPING_CAVEAT}" if note else _INTERFACE_FLAPPING_CAVEAT
+    return reason, note
+
+
 _ANOMALY_REASON_SYNONYMS: dict[str, tuple[str, ...]] = {
     "interface_flapping": (
         "disconnect", "disconnects", "disconnection", "disconnections",
@@ -1323,7 +1353,7 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     """
     lowered = value.strip().lower()
     if lowered in _VALID_ANOMALY_REASONS:
-        return lowered, None
+        return _annotate_resolved_reason(lowered, None)
     words = set(re.findall(r"[a-z]+", lowered))
     # Scored by NUMBER of shared words, not just "any shared word" --
     # confirmed as a real precision gap: 'volume spike' shares the word
@@ -1337,7 +1367,9 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     best = max((score for _, score in scored), default=0)
     matches = [r for r, score in scored if score == best]
     if len(matches) == 1:
-        return matches[0], f"'{value}' isn't an exact anomaly category -- matched to the real category '{matches[0]}'."
+        return _annotate_resolved_reason(
+            matches[0], f"'{value}' isn't an exact anomaly category -- matched to the real category '{matches[0]}'."
+        )
     if len(matches) > 1:
         return None, (
             f"'{value}' could mean more than one real anomaly category ({', '.join(matches)}) -- "
@@ -1347,7 +1379,9 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     # giving up (see _ANOMALY_REASON_SYNONYMS).
     for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
         if any(s in lowered for s in synonyms):
-            return reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
+            return _annotate_resolved_reason(
+                reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
+            )
     return None, (
         f"'{value}' doesn't match any real anomaly category. The only real values are: "
         f"{', '.join(_VALID_ANOMALY_REASONS)}."
