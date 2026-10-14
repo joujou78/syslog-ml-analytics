@@ -430,35 +430,46 @@ def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | No
     return None
 
 
-def _anomaly_summary_restate_instruction(result: dict) -> str:
-    """A 'state this exactly, don't call again' instruction for the model to
-    restate an anomaly_summary ranking result, the same pattern
-    count_events's deterministic overrides already use instead of trusting
-    the model's own free-form phrasing of a raw tool result.
-
-    Confirmed as a real, reproduced gap: on a normal (not force-resolved)
-    anomaly_summary call -- the model called the right tool with the right
-    reason, got the real top entry (74,933 events) handed back as plain
-    tool-result JSON -- the final answer still stated a DIFFERENT, stale
-    number (74,872, from an earlier turn's answer still sitting in this
-    conversation's history) instead of the one it was just given. The
-    existing count-claim grounding check caught this after the fact (same
-    safety net count_events relies on), but it's better not needed at all
-    here: handing the model an explicit restate instruction, the same as
-    every deterministic override in this file already does, closes the gap
-    at the source instead of only catching it downstream."""
+def _anomaly_summary_ranked_rows(result: dict) -> tuple[str | None, list[dict]]:
     key = next((k for k in ("devices_ranked_by_reason_count", "vendors_ranked_by_reason_count") if k in result), None)
-    rows = result.get(key, []) if key else []
+    return key, (result.get(key, []) if key else [])
+
+
+def _anomaly_summary_plain_answer(result: dict) -> str:
+    """Builds the final answer directly from a resolved anomaly_summary
+    result, bypassing any further model call entirely -- no restate
+    instruction asking the model to phrase it, however simple.
+
+    An earlier version of this fix (since replaced) handed the model a
+    'state this exactly, don't call again' instruction instead, the same
+    pattern count_events's deterministic overrides use. That still wasn't
+    enough: on a normal (not force-resolved) anomaly_summary call, the
+    model called the right tool with the right reason, got the real top
+    entry (74,933 events) handed back, and the final answer still stated a
+    DIFFERENT, stale number from an earlier turn's history instead of the
+    one it was just given -- the existing count-claim grounding check
+    caught the mismatch, but only after the fact. Simplifying the
+    instruction to a single pre-extracted sentence didn't fully fix it
+    either: in a live sequence right after that change, the model still
+    took a FURTHER ~3 minutes to respond to the simplified instruction, and
+    that response was yet another (correctly refused) tool call rather than
+    the requested restatement -- pushing the whole request past the UI's
+    timeout. Every extra round-trip to this CPU-only model costs tens of
+    seconds to minutes (confirmed repeatedly on the same live question:
+    14:49:16 -> 14:50:06 -> 14:53:04). Once the real answer is already
+    known with certainty, asking the model to merely restate it in English
+    adds no information and is pure latency/reliability risk -- so this
+    skips that step entirely instead of hoping a better-worded instruction
+    lands before the client gives up waiting."""
+    key, rows = _anomaly_summary_ranked_rows(result)
+    reason = result.get("reason", "this anomaly type")
     if not rows:
-        return "No devices/vendors matched this anomaly reason -- say so plainly, do not invent one."
+        return f"No devices/vendors have any anomalies for reason '{reason}'."
     top = rows[0]
     label = top.get("hostname") or top.get("vendor")
     count = top.get("event_count")
-    return (
-        f"State the answer using EXACTLY these values -- '{label}' with {count} events for "
-        f"anomaly_reason='{result.get('reason')}' -- do not use a number from memory or an earlier "
-        "turn, even if it looks similar, and do not call any tool again."
-    )
+    kind = "vendor" if key == "vendors_ranked_by_reason_count" else "device"
+    return f"The top {kind} for anomaly_reason='{reason}' is {label}, with {count} events (cumulative, all-time)."
 
 
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
@@ -2050,21 +2061,16 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 anomaly_summary_executed_this_turn = True
                 grounded_counts |= _grounded_counts_from_result("anomaly_summary", result)
                 known_identifiers |= _identifiers_from_result("anomaly_summary", result)
-                if result.get("reason") == "interface_flapping":
-                    interface_flapping_caveat_needed = True
-                messages.append(message)
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You answered without calling anomaly_summary for this question. "
-                        f"{_anomaly_summary_restate_instruction(result)}"
-                    ),
-                })
                 log.info(
-                    "Log Assistant FORCE-RESOLVED anomaly reason ranking after a tool-less answer: "
-                    "reason=%s -> %s", forced_anomaly_reason, _truncate(json.dumps(result), 1000),
+                    "Log Assistant FORCE-RESOLVED anomaly reason ranking after a tool-less answer "
+                    "(answering directly, skipping a further model round-trip given this question "
+                    "shape's confirmed latency/timeout cost): reason=%s -> %s",
+                    forced_anomaly_reason, _truncate(json.dumps(result), 1000),
                 )
-                continue
+                answer = _anomaly_summary_plain_answer(result)
+                if result.get("reason") == "interface_flapping":
+                    answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
+                return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
             # Confirmed on net-flow: the wrong-tool redirect above works,
             # but only AS FAR AS forcing a retry -- if the model, instead of
             # retrying with count_events, just gives a tool-less final
@@ -2523,7 +2529,18 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             sources.extend(hits)
             messages.append({"role": "tool", "content": json.dumps(result)})
             if fn["name"] == "anomaly_summary" and forced_anomaly_reason:
-                messages.append({"role": "user", "content": _anomaly_summary_restate_instruction(result)})
+                # Same reasoning as the tool-less force-resolve path above
+                # (see _anomaly_summary_plain_answer's docstring): the model
+                # called the right tool itself here, so the real answer is
+                # already known with certainty -- asking it for one more
+                # round-trip to phrase it in English is pure latency risk on
+                # this CPU-only model, confirmed repeatedly to sometimes cost
+                # minutes and push the request past the UI's timeout, for a
+                # step that adds no information.
+                answer = _anomaly_summary_plain_answer(result)
+                if result.get("reason") == "interface_flapping":
+                    answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
+                return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
     # Exhausted MAX_TOOL_ITERATIONS without a plain-text final answer --
     # say so rather than silently dropping the question or looping forever
