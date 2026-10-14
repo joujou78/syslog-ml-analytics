@@ -2056,10 +2056,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 messages.append({
                     "role": "user",
                     "content": (
-                        "You answered without calling anomaly_summary for this question. Here is the "
-                        f"exact, already-verified result instead: {json.dumps(result)}. State this "
-                        "exactly as given -- do not call any tool again, and do not state a different "
-                        "device, vendor, or number than what's in this result."
+                        "You answered without calling anomaly_summary for this question. "
+                        f"{_anomaly_summary_restate_instruction(result)}"
                     ),
                 })
                 log.info(
