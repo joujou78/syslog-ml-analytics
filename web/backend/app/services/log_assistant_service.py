@@ -1519,12 +1519,30 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     # Ethernet caveat). A plain 'flapping'/'interface' word-overlap match
     # above is unaffected by this -- "ethernet flapping" or literally
     # "interface flapping" still resolves correctly regardless.
-    if not _is_wireless_specific(lowered):
-        for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
-            if any(s in lowered for s in synonyms):
-                return _annotate_resolved_reason(
-                    reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
-                )
+    if _is_wireless_specific(lowered):
+        # Confirmed live as a real gap: this error message alone, just
+        # listing the 8 valid categories, led the model to conclude it
+        # simply couldn't answer the question and stop -- rather than
+        # realizing a DIFFERENT tool (not anomaly_summary at all) could.
+        # Pointing directly at the real alternative, right at the point of
+        # failure, is far more likely to be followed than a general
+        # instruction stated once, earlier, in a long system prompt (the
+        # same lesson every deterministic override in this file is built
+        # on -- but this is a case the deterministic override deliberately
+        # does NOT intercept, see _is_wireless_specific's other call site,
+        # so the model has to get there on its own with this nudge).
+        return None, (
+            f"'{value}' isn't a real anomaly category -- there is no wireless-specific category. "
+            "Do not retry anomaly_summary with a different wireless-related guess. Instead, use "
+            "aggregate_events or count_events with program='wireless' -- real wireless-tagged log "
+            "data exists under the `program` field (it will be matched for you even though the real "
+            "value is a longer tag like 'wireless,debug')."
+        )
+    for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
+        if any(s in lowered for s in synonyms):
+            return _annotate_resolved_reason(
+                reason, f"'{value}' isn't an exact anomaly category -- matched to the real category '{reason}' via a known synonym for it."
+            )
     return None, (
         f"'{value}' doesn't match any real anomaly category. The only real values are: "
         f"{', '.join(_VALID_ANOMALY_REASONS)}."
