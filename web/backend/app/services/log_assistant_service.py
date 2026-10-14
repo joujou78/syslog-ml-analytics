@@ -430,6 +430,37 @@ def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | No
     return None
 
 
+def _anomaly_summary_restate_instruction(result: dict) -> str:
+    """A 'state this exactly, don't call again' instruction for the model to
+    restate an anomaly_summary ranking result, the same pattern
+    count_events's deterministic overrides already use instead of trusting
+    the model's own free-form phrasing of a raw tool result.
+
+    Confirmed as a real, reproduced gap: on a normal (not force-resolved)
+    anomaly_summary call -- the model called the right tool with the right
+    reason, got the real top entry (74,933 events) handed back as plain
+    tool-result JSON -- the final answer still stated a DIFFERENT, stale
+    number (74,872, from an earlier turn's answer still sitting in this
+    conversation's history) instead of the one it was just given. The
+    existing count-claim grounding check caught this after the fact (same
+    safety net count_events relies on), but it's better not needed at all
+    here: handing the model an explicit restate instruction, the same as
+    every deterministic override in this file already does, closes the gap
+    at the source instead of only catching it downstream."""
+    key = next((k for k in ("devices_ranked_by_reason_count", "vendors_ranked_by_reason_count") if k in result), None)
+    rows = result.get(key, []) if key else []
+    if not rows:
+        return "No devices/vendors matched this anomaly reason -- say so plainly, do not invent one."
+    top = rows[0]
+    label = top.get("hostname") or top.get("vendor")
+    count = top.get("event_count")
+    return (
+        f"State the answer using EXACTLY these values -- '{label}' with {count} events for "
+        f"anomaly_reason='{result.get('reason')}' -- do not use a number from memory or an earlier "
+        "turn, even if it looks similar, and do not call any tool again."
+    )
+
+
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
     """Exact numeric counts a tool call actually returned, for cross-checking
     against what the model later claims in its final answer -- deliberately
@@ -2493,6 +2524,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             }
             sources.extend(hits)
             messages.append({"role": "tool", "content": json.dumps(result)})
+            if fn["name"] == "anomaly_summary" and forced_anomaly_reason:
+                messages.append({"role": "user", "content": _anomaly_summary_restate_instruction(result)})
 
     # Exhausted MAX_TOOL_ITERATIONS without a plain-text final answer --
     # say so rather than silently dropping the question or looping forever
