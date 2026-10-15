@@ -1603,11 +1603,25 @@ _WIRELESS_DISCONNECT_PROGRAM = "wireless,info"
 _ALL_TIME_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def _wants_wireless_disconnect_ranking(question: str) -> bool:
-    if not (_wants_ranking(question) and _is_wireless_specific(question)):
-        return False
-    lowered = question.lower()
-    return any(marker in lowered for marker in _WIRELESS_DISCONNECT_QUESTION_MARKERS)
+def _wants_wireless_disconnect_ranking(question: str, history: list["ConversationTurn"] | None = None) -> bool:
+    """... Also recognizes a bare follow-up to an immediately preceding
+    wireless-disconnect-ranking turn (e.g. "is that the top" / "ist the
+    top" right after "...wireless disconnections") -- confirmed live on
+    net-flow as the identical bare-followup gap already fixed for
+    _detect_anomaly_reason above: such a follow-up doesn't repeat
+    "wireless" itself, so without this it fell straight through to the
+    general agent loop's own ranking handling (list_devices by total event
+    count across ALL programs) -- a plausible-looking but topically wrong
+    answer (busiest device overall, not busiest for wireless disconnects).
+    Only looks at the immediately preceding turn, same "last turn only"
+    scoping as _detect_anomaly_reason's own bare-followup handling."""
+    if _wants_ranking(question) and _is_wireless_specific(question):
+        lowered = question.lower()
+        if any(marker in lowered for marker in _WIRELESS_DISCONNECT_QUESTION_MARKERS):
+            return True
+    if history and _is_bare_followup(question):
+        return _wants_wireless_disconnect_ranking(history[-1].question)
+    return False
 
 
 def _wireless_disconnect_ranking_plain_answer(rows: list[dict], is_vendor: bool) -> str:
@@ -2277,7 +2291,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # See _wants_wireless_disconnect_ranking's docstring/comment for why this
     # question shape alone skips the model round-trip entirely rather than
     # going through the usual tool-calling loop below.
-    if _wants_wireless_disconnect_ranking(query.question):
+    if _wants_wireless_disconnect_ranking(query.question, query.history):
         is_vendor = _wants_vendor_grouping(query.question)
         rows = await asyncio.to_thread(
             log_search_service.aggregate_events,
