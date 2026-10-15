@@ -1549,6 +1549,69 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     )
 
 
+# "Top device with wireless disconnections" -- confirmed live on net-flow as
+# the single most-tested, least-resolved question shape in this whole file:
+# ten separate rounds of fixes, each one closing a distinct model failure
+# mode (a stale carried-over device, a wrong-tool call, a fully fabricated
+# tool-call narration complete with a fake result, an honest rejection, then
+# a SECOND, differently-fabricated narration with no tool call at all -- see
+# this file's git history for each), without the model ever once producing
+# a correct answer on its own, even after _resolve_anomaly_reason's own
+# wireless nudge told it exactly which real tool/filter to use instead.
+# By the time of the last failure, real example messages were pulled
+# directly from net-flow confirming the actual wireless disconnect format:
+# "<mac>@wlan1: disconnected, <reason>" under program='wireless,info'.
+# Unlike interface_flapping (ml/interface_flap_anomaly.py, computed at
+# ingest time into a real anomaly_reason), there is no live detector for
+# this, and building one would only cover FUTURE events -- every
+# already-ingested wireless disconnect would stay unanswerable until it
+# backfilled, which it never does. A keyword search over the already-
+# indexed message column answers it immediately against ALL existing data,
+# so this resolves the question directly via aggregate_events's own keyword
+# filter (ask()'s very first step, below) instead of ever routing it
+# through the model -- a deliberate departure from every other override in
+# this file (enforce_count_tool, forced_anomaly_reason), which still let a
+# correct first attempt through un-intercepted and only corrected a wrong
+# one. Those questions DO sometimes get answered correctly by the model;
+# this one has a confirmed 0/10 success rate at every interception point
+# already tried, so there is nothing left to lose by skipping it entirely.
+_WIRELESS_DISCONNECT_QUESTION_MARKERS = (
+    "disconnect", "disconnection", "disconnections", "disconnects",
+    "dropout", "dropouts", "drop", "drops",
+)
+# The literal, confirmed substring real wireless disconnect messages
+# contain -- deliberately NOT the same list as the question markers above.
+# A user can ask about "wireless drops" or "wifi dropouts" in plenty of
+# different words; the actual log line only ever says "disconnected".
+_WIRELESS_DISCONNECT_MESSAGE_KEYWORD = "disconnected"
+# All-time cumulative, matching anomaly_summary_service's own "no time
+# filter, by design" convention (see its module docstring) -- aggregate_events
+# otherwise defaults to log_search_service.DEFAULT_LOOKBACK (24h), which
+# would silently turn "which device has the most wireless disconnections"
+# into "...in the last day", a materially different question.
+_ALL_TIME_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _wants_wireless_disconnect_ranking(question: str) -> bool:
+    if not (_wants_ranking(question) and _is_wireless_specific(question)):
+        return False
+    lowered = question.lower()
+    return any(marker in lowered for marker in _WIRELESS_DISCONNECT_QUESTION_MARKERS)
+
+
+def _wireless_disconnect_ranking_plain_answer(rows: list[dict], is_vendor: bool) -> str:
+    kind = "vendor" if is_vendor else "device"
+    if not rows:
+        return f"No {kind} has any confirmed wireless disconnect events."
+    top = rows[0]
+    label = top.get("vendor") if is_vendor else top.get("hostname")
+    count = top.get("event_count")
+    return (
+        f"The top {kind} for wireless disconnections is {label}, with {count} confirmed wireless "
+        f"disconnect events (cumulative, all-time)."
+    )
+
+
 # Loose enough to catch a real dotted-quad before it's used as a literal
 # `hostname =` equality match (which is all this guards against -- an
 # actual malformed IP still fails at the database as "no such value",
@@ -2199,6 +2262,29 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # device has dominated event counts across the whole guessed range --
     # a time-relative question is not safe to trust without this anchor.
     now = datetime.now(timezone.utc)
+
+    # See _wants_wireless_disconnect_ranking's docstring/comment for why this
+    # question shape alone skips the model round-trip entirely rather than
+    # going through the usual tool-calling loop below.
+    if _wants_wireless_disconnect_ranking(query.question):
+        is_vendor = _wants_vendor_grouping(query.question)
+        rows = await asyncio.to_thread(
+            log_search_service.aggregate_events,
+            ch_client,
+            group_by=["vendor" if is_vendor else "hostname"],
+            keyword=_WIRELESS_DISCONNECT_MESSAGE_KEYWORD,
+            start=_ALL_TIME_START,
+            end=now,
+            limit=10,
+        )
+        answer = _wireless_disconnect_ranking_plain_answer(rows, is_vendor)
+        log.info(
+            "Log Assistant FORCE-RESOLVED wireless-disconnect ranking with no model round-trip "
+            "at all (confirmed 0/10 reliable via the model for this exact question shape): %s",
+            _truncate(json.dumps(rows), 1000),
+        )
+        return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+
     history_block = _format_history(query.history)
     opening = (
         f"{_SYSTEM_PROMPT}\n\n{_AGENT_INSTRUCTIONS}\n\nThe current date/time is "
