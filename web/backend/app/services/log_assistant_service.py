@@ -1584,6 +1584,17 @@ _WIRELESS_DISCONNECT_QUESTION_MARKERS = (
 # A user can ask about "wireless drops" or "wifi dropouts" in plenty of
 # different words; the actual log line only ever says "disconnected".
 _WIRELESS_DISCONNECT_MESSAGE_KEYWORD = "disconnected"
+# Confirmed on net-flow as a real gap in the first version of this fix: a
+# bare keyword="disconnected" search with no program filter pulled in EVERY
+# "disconnected" event in the whole database (PPPoE/VPN/container churn
+# included), not just real wireless client disconnects -- surfaced as a
+# single unresolved-hostname IP (172.23.0.66) with 112,182 events, more
+# than 18x the real top device, the exact same "huge outlier number = noise,
+# not signal" shape already seen once before with the raw wireless,debug
+# volume count. Scoping to this confirmed program tag reproduces the
+# manually-verified, correct result (ND_SAIDA1-LGB[SAIDA] | IBL[SAIDA],
+# 6,178) exactly.
+_WIRELESS_DISCONNECT_PROGRAM = "wireless,info"
 # All-time cumulative, matching anomaly_summary_service's own "no time
 # filter, by design" convention (see its module docstring) -- aggregate_events
 # otherwise defaults to log_search_service.DEFAULT_LOOKBACK (24h), which
@@ -2273,6 +2284,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             ch_client,
             group_by=["vendor" if is_vendor else "hostname"],
             keyword=_WIRELESS_DISCONNECT_MESSAGE_KEYWORD,
+            program=_WIRELESS_DISCONNECT_PROGRAM,
             start=_ALL_TIME_START,
             end=now,
             limit=10,
