@@ -1681,21 +1681,55 @@ def _majority_program(hits: list[LogHit]) -> str | None:
     return value if count / len(programs) > 0.5 else None
 
 
-_KEYWORD_EXTRACTION_MAX_LEN = 40
+# Generic log-message scaffolding -- shared by almost every wireless/network
+# message regardless of its actual event type, so none of these identify a
+# CONCEPT on their own and would only dilute the candidate list below.
+_GENERIC_MESSAGE_WORDS = frozenset({
+    "wlan", "wlan1", "wlan2", "info", "debug", "warning", "error", "notice", "the", "and",
+    "for", "with", "from", "data", "device", "unknown", "that", "this", "received", "link",
+    "sent", "send", "message", "event",
+})
 
 
-async def _extract_grounded_keyword(concept_question: str, sample_messages: list[str]) -> str | None:
-    """The one, narrow, heavily-grounded model call this mechanism makes --
-    deliberately NOT a tool-routing decision (this model's confirmed
-    failure mode all session), just "copy the matching substring from the
-    examples below". Small prompt, small num_predict: this should be fast
-    relative to a full tool-calling round-trip."""
+def _candidate_concept_tokens(messages: list[str], min_count: int) -> list[str]:
+    """Literal words shared across at least `min_count` of the sample
+    messages -- deterministic, no model involved. This is what actually
+    distinguishes the DOMINANT event type in the sample from a rare one:
+    confirmed live, a free-form extraction validated against just ONE
+    sample message picked 'disabling' -- a real but minority message buried
+    among mostly '...disconnected...' hits -- over the actual dominant
+    pattern, undercounting the real answer by roughly 700x (9 vs. the real
+    6,178). Restricting the model's later choice to only words already
+    cross-confirmed across several real messages (not letting it freely
+    generate/copy from any single one) closes that gap by construction.
+    MAC addresses, IPs, and pure numbers are naturally excluded by the
+    length->=4-letters-only pattern, not because they're explicitly
+    blocked."""
+    counts: Counter = Counter()
+    for message in messages:
+        words = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z']{3,}", message)}
+        for w in words - _GENERIC_MESSAGE_WORDS:
+            counts[w] += 1
+    return [w for w, c in counts.most_common() if c >= min_count]
+
+
+async def _choose_concept_keyword(concept_question: str, candidates: list[str], sample_messages: list[str]) -> str | None:
+    """The one, narrow, heavily-constrained model call this mechanism makes
+    -- deliberately NOT a tool-routing decision (this model's confirmed
+    failure mode all session) and NOT open-ended free-text extraction
+    either (see _candidate_concept_tokens' docstring for why that alone
+    once picked a rare, wrong word). The model's only job here is to pick
+    the best-fitting entry from a short list of words ALREADY confirmed to
+    recur across multiple real messages -- a much narrower, easier task,
+    and the validation below rejects anything that isn't literally one of
+    those pre-vetted candidates."""
     prompt = (
-        "Real log messages related to a question are listed below. Reply with ONLY the single short "
-        "literal substring (copied EXACTLY, character-for-character, from one of the messages below) "
-        "that best identifies this type of event -- no quotes, no explanation, no extra words. If no "
-        "single substring clearly identifies it, reply with exactly: NONE\n\n"
-        f"Question: {concept_question}\n\nMessages:\n"
+        "A question about network log events, and a list of CANDIDATE words that each appear "
+        "repeatedly across real log messages related to it, are below. Reply with ONLY the single "
+        "candidate word that best identifies this type of event -- copy it EXACTLY as listed, no "
+        "other text. If none of the candidates fit the question, reply with exactly: NONE\n\n"
+        f"Question: {concept_question}\n\nCandidates: {', '.join(candidates)}\n\n"
+        "Example messages, for context only:\n"
         + "\n".join(f"- {_truncate(m, 200)}" for m in sample_messages)
     )
     try:
@@ -1706,23 +1740,22 @@ async def _extract_grounded_keyword(concept_question: str, sample_messages: list
                 "model": settings.ollama_chat_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
-                "options": {"num_predict": 24, "num_thread": settings.ollama_chat_num_thread},
+                "options": {"num_predict": 16, "num_thread": settings.ollama_chat_num_thread},
             },
             settings.ollama_timeout_seconds,
         )
     except Exception:
-        log.exception("Concept-ranking keyword extraction call failed -- falling back to the normal agent loop")
+        log.exception("Concept-ranking keyword choice call failed -- falling back to the normal agent loop")
         return None
-    raw = (body.get("message", {}).get("content") or "").strip().strip("'\"").strip()
-    if not raw or raw.upper() == "NONE" or len(raw) > _KEYWORD_EXTRACTION_MAX_LEN or "\n" in raw:
+    raw = (body.get("message", {}).get("content") or "").strip().strip("'\"").strip().lower()
+    if not raw or raw == "none":
         return None
-    # Never trust the extraction un-verified -- same grounding discipline as
-    # every other model-derived value in this file. An 8B model asked to
-    # copy exact text can still paraphrase or invent one instead.
-    lowered_raw = raw.lower()
-    if not any(lowered_raw in m.lower() for m in sample_messages):
-        return None
-    return raw
+    # Never trust the choice un-verified -- same grounding discipline as
+    # every other model-derived value in this file. Only an EXACT match to
+    # one of the pre-vetted candidates is accepted, not a substring/fuzzy
+    # match -- a model padding its answer with extra words should fail
+    # closed (fall through to the normal loop), not be guessed at.
+    return raw if raw in candidates else None
 
 
 async def _resolve_concept_ranking(
@@ -1736,11 +1769,22 @@ async def _resolve_concept_ranking(
     if not hits:
         return None
 
-    sample_messages = [h.message for h in hits if h.message][:8]
+    sample_messages = [h.message for h in hits if h.message][:15]
     if not sample_messages:
         return None
 
-    keyword = await _extract_grounded_keyword(concept_question, sample_messages)
+    # Requires a word to recur across roughly a third of the sample (at
+    # least 2 either way) before it's even offered as a candidate -- a
+    # word seen only once is exactly the "rare minority message" failure
+    # this whole mechanism exists to avoid trusting.
+    min_count = max(2, (len(sample_messages) + 2) // 3)
+    candidates = _candidate_concept_tokens(sample_messages, min_count)
+    if not candidates:
+        return None
+    # A single clearly-dominant candidate needs no model call at all --
+    # faster and strictly more reliable than asking the model to confirm
+    # the only option.
+    keyword = candidates[0] if len(candidates) == 1 else await _choose_concept_keyword(concept_question, candidates, sample_messages)
     if not keyword:
         return None
 
