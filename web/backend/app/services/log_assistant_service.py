@@ -1760,12 +1760,30 @@ def _unresolved_count_concept(question: str, history: list["ConversationTurn"] |
     return None
 
 
-def _majority_program(hits: list[LogHit]) -> str | None:
+def _significant_programs(hits: list[LogHit], min_fraction: float = 0.2, max_programs: int = 3) -> list[str]:
+    """Programs the retrieved hits meaningfully agree the concept lives
+    under -- deliberately not just the single top ("majority") one.
+    Confirmed live as a real, not theoretical, gap: for the IDENTICAL
+    concept ("wireless disconnections"), a strict majority-of-hits program
+    picked 'wireless,info' on one call and an unrelated-looking
+    'Mimosa_C5x' on the very next -- ordinary variance in which hits a
+    hybrid/embedding search happens to retrieve, not a code bug -- and
+    whichever program lost out was silently discarded even though its
+    events were just as real, producing a confidently wrong zero count the
+    second time. Real wireless hardware from different vendors can
+    legitimately tag the same kind of event under different `program`
+    values (this deployment alone has at least 'wireless,info' and
+    apparently 'Mimosa_C5x'), so querying every program the sample
+    meaningfully supports -- not betting everything on a single plurality
+    -- is the correct fix, not a tighter threshold on the same flawed
+    single-value approach. Returns [] (meaning "don't filter by program at
+    all") only when hits carry no program info whatsoever."""
     programs = [h.program for h in hits if h.program]
     if not programs:
-        return None
-    value, count = Counter(programs).most_common(1)[0]
-    return value if count / len(programs) > 0.5 else None
+        return []
+    counts = Counter(programs)
+    total = len(programs)
+    return [p for p, c in counts.most_common(max_programs) if c / total >= min_fraction]
 
 
 # Generic log-message scaffolding -- shared by almost every wireless/network
@@ -1852,12 +1870,13 @@ async def _choose_concept_keyword(concept_question: str, candidates: list[str], 
     return raw if raw in candidates else None
 
 
-async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str) -> tuple[str, str | None] | None:
+async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str) -> tuple[str, list[str]] | None:
     """The shared discovery step behind both _resolve_concept_ranking and
     _resolve_concept_count: semantic_search for real examples, reduce to
     candidates that actually recur, then a narrow constrained choice if
-    there's more than one. Returns (keyword, majority_program_or_None), or
-    None if any step fails to produce a verified result.
+    there's more than one. Returns (keyword, significant_programs -- see
+    _significant_programs, [] meaning "no program filter"), or None if any
+    step fails to produce a verified result.
 
     Searches with the EXTRACTED concept (_extract_concept), not the raw
     question text -- confirmed live as a real, serious gap: semantic_search
@@ -1897,7 +1916,15 @@ async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str
     keyword = candidates[0] if len(candidates) == 1 else await _choose_concept_keyword(concept_question, candidates, sample_messages)
     if not keyword:
         return None
-    return keyword, _majority_program(hits)
+    return keyword, _significant_programs(hits)
+
+
+def _program_qualifier(programs: list[str]) -> str:
+    if not programs:
+        return ""
+    if len(programs) == 1:
+        return f" (program='{programs[0]}')"
+    return f" (program in {', '.join(repr(p) for p in programs)})"
 
 
 async def _resolve_concept_ranking(
@@ -1906,23 +1933,38 @@ async def _resolve_concept_ranking(
     discovered = await _discover_concept_keyword(os_client, concept_question)
     if not discovered:
         return None
-    keyword, program = discovered
-    rows = await asyncio.to_thread(
-        log_search_service.aggregate_events,
-        ch_client,
-        group_by=["vendor" if is_vendor else "hostname"],
-        keyword=keyword,
-        program=program,
-        start=_ALL_TIME_START,
-        end=now,
-        limit=10,
-    )
-    return {"rows": rows, "keyword": keyword, "program": program}
+    keyword, programs = discovered
+    group_key = "vendor" if is_vendor else "hostname"
+    # One call PER significant program (never a single filtered call) --
+    # see _significant_programs' docstring for the confirmed live incident
+    # this closes: discarding every program but one real contributor
+    # silently loses real events, not just a formatting nicety. A wide
+    # per-call limit (the service's own max) means merging afterward
+    # doesn't lose a group that would only rank highly once its counts
+    # across programs are combined; final truncation happens after the
+    # merge, not before it.
+    per_program_rows = await asyncio.gather(*[
+        asyncio.to_thread(
+            log_search_service.aggregate_events, ch_client, group_by=[group_key], keyword=keyword,
+            program=p, start=_ALL_TIME_START, end=now, limit=log_search_service.AGGREGATE_MAX_LIMIT,
+        )
+        for p in (programs or [None])
+    ])
+    totals: dict[str, int] = {}
+    for rows in per_program_rows:
+        for row in rows:
+            key = row.get(group_key)
+            totals[key] = totals.get(key, 0) + row.get("event_count", 0)
+    merged = sorted(
+        ({group_key: k, "event_count": v} for k, v in totals.items()),
+        key=lambda r: r["event_count"], reverse=True,
+    )[:10]
+    return {"rows": merged, "keyword": keyword, "programs": programs}
 
 
-def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, program: str | None) -> str:
+def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, programs: list[str]) -> str:
     kind = "vendor" if is_vendor else "device"
-    qualifier = f"messages containing '{keyword}'" + (f" (program='{program}')" if program else "")
+    qualifier = f"messages containing '{keyword}'" + _program_qualifier(programs)
     if not rows:
         return f"No {kind} has any events matching {qualifier}."
     top = rows[0]
@@ -1937,15 +1979,19 @@ async def _resolve_concept_count(
     discovered = await _discover_concept_keyword(os_client, concept_question)
     if not discovered:
         return None
-    keyword, program = discovered
-    count = await asyncio.to_thread(
-        log_search_service.count_events, ch_client, keyword=keyword, program=program, start=start, end=end,
-    )
-    return {"count": count, "keyword": keyword, "program": program}
+    keyword, programs = discovered
+    # Sum across every significant program, same reasoning as
+    # _resolve_concept_ranking -- never settle for a single program's
+    # count when more than one real contributor was found.
+    counts = await asyncio.gather(*[
+        asyncio.to_thread(log_search_service.count_events, ch_client, keyword=keyword, program=p, start=start, end=end)
+        for p in (programs or [None])
+    ])
+    return {"count": sum(counts), "keyword": keyword, "programs": programs}
 
 
-def _concept_count_plain_answer(count: int, keyword: str, program: str | None, period_label: str | None) -> str:
-    qualifier = f"messages containing '{keyword}'" + (f" (program='{program}')" if program else "")
+def _concept_count_plain_answer(count: int, keyword: str, programs: list[str], period_label: str | None) -> str:
+    qualifier = f"messages containing '{keyword}'" + _program_qualifier(programs)
     period = f" {period_label}" if period_label else " (cumulative, all-time)"
     return f"There have been {count} events matching {qualifier}{period}."
 
@@ -2614,11 +2660,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         is_vendor = _wants_vendor_grouping(query.question)
         resolved = await _resolve_concept_ranking(os_client, ch_client, concept_question, is_vendor, now)
         if resolved:
-            answer = _concept_ranking_plain_answer(resolved["rows"], is_vendor, resolved["keyword"], resolved["program"])
+            answer = _concept_ranking_plain_answer(resolved["rows"], is_vendor, resolved["keyword"], resolved["programs"])
             log.info(
                 "Log Assistant FORCE-RESOLVED a concept ranking via semantic-search discovery + a "
-                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r program=%r -> %s",
-                concept_question, resolved["keyword"], resolved["program"], _truncate(json.dumps(resolved["rows"]), 1000),
+                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r -> %s",
+                concept_question, resolved["keyword"], resolved["programs"], _truncate(json.dumps(resolved["rows"]), 1000),
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
@@ -2639,12 +2685,12 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         )
         resolved = await _resolve_concept_count(os_client, ch_client, count_concept_question, concept_start, concept_end)
         if resolved:
-            answer = _concept_count_plain_answer(resolved["count"], resolved["keyword"], resolved["program"], period_label)
+            answer = _concept_count_plain_answer(resolved["count"], resolved["keyword"], resolved["programs"], period_label)
             log.info(
                 "Log Assistant FORCE-RESOLVED a concept count via semantic-search discovery + a "
-                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r program=%r "
+                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r "
                 "period=%r -> %s",
-                count_concept_question, resolved["keyword"], resolved["program"], period_label, resolved["count"],
+                count_concept_question, resolved["keyword"], resolved["programs"], period_label, resolved["count"],
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
