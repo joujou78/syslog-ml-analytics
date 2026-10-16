@@ -1513,7 +1513,27 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     # unambiguously also shares 'volume' with only one of the two. Only
     # candidates tied at the single highest overlap count are kept, so a
     # clearly-stronger match always wins over a weaker, coincidental one.
-    scored = [(r, len(words & set(r.split("_")))) for r in _VALID_ANOMALY_REASONS]
+    #
+    # A shared word is exact OR a >=4-char prefix either direction (plural/
+    # verb-form tolerant, e.g. 'flap' <-> 'flapping', 'templates' <->
+    # 'template') -- confirmed needed live: 'ethernet flap' (no 'ping')
+    # matched NOTHING under exact-only matching and fell through to a
+    # generic keyword search for the single word 'down', which -- with no
+    # category and no program to scope it -- matched 85,092 unrelated
+    # events fleet-wide instead of the real, evidence-based
+    # interface_flapping definition (RouterOS's specific 3-downs-in-15-
+    # minutes window). The 4-char floor keeps this from over-matching on
+    # short, generic word fragments.
+    def _word_overlap(category: str) -> int:
+        return sum(
+            1 for cw in category.split("_")
+            if any(
+                qw == cw or (len(qw) >= 4 and len(cw) >= 4 and (cw.startswith(qw) or qw.startswith(cw)))
+                for qw in words
+            )
+        )
+
+    scored = [(r, _word_overlap(r)) for r in _VALID_ANOMALY_REASONS]
     scored = [(r, score) for r, score in scored if score > 0]
     best = max((score for _, score in scored), default=0)
     matches = [r for r, score in scored if score == best]
@@ -1675,14 +1695,28 @@ def _unresolved_ranking_concept(question: str, history: list["ConversationTurn"]
     language itself (confirmed needed too: "nd the vendor" carries no
     ranking marker of its own, only "which vendor has the most wireless
     disconnections" two turns back does). Only looks at the immediately
-    preceding turn, same "last turn only" scoping throughout this file."""
+    preceding turn, same "last turn only" scoping throughout this file.
+
+    Inheritance additionally requires _extract_concept(question) to be
+    EMPTY, not just _is_bare_followup -- confirmed live as a second,
+    distinct regression from the same root cause: "how many wireless
+    disconnections happened" is also exactly 5 words (so _is_bare_followup
+    alone would call it a follow-up), isn't ranking-shaped itself
+    (_wants_ranking is False, so the branch above never matches), and so
+    was falling straight into blind inheritance -- answering a plain COUNT
+    question with the unrelated PREVIOUS turn's ranking result entirely.
+    Word count alone was never a reliable signal that a question has "no
+    content of its own"; requiring its own concept-extraction to also come
+    up empty is what actually distinguishes a true contentless follow-up
+    ("ist the top", "nd the vendor") from a short but fully self-contained
+    question that simply isn't shaped like a ranking."""
     if (
         _wants_ranking(question)
         and _detect_anomaly_reason(question, history) is None
         and _extract_concept(question)
     ):
         return question
-    if history and _is_bare_followup(question):
+    if history and _is_bare_followup(question) and not _extract_concept(question):
         return _unresolved_ranking_concept(history[-1].question)
     return None
 
@@ -1707,7 +1741,13 @@ def _unresolved_count_concept(question: str, history: list["ConversationTurn"] |
     anomaly_reason-tagged one -- a materially different, and likely wrong,
     number for a category with a real evidence-based detector (e.g.
     interface_flapping's 3-down-transitions-in-15-minutes window, which a
-    plain 'link'/'flapping' keyword match would not reproduce)."""
+    plain 'link'/'flapping' keyword match would not reproduce).
+
+    Inheritance additionally requires _extract_concept(question) to be
+    EMPTY, not just _is_bare_followup -- see _unresolved_ranking_concept's
+    docstring for the confirmed live regression this closes (a 5-word,
+    fully self-contained question is not "contentless" just because it's
+    short)."""
     if (
         _wants_count(question)
         and not _wants_ranking(question)
@@ -1715,7 +1755,7 @@ def _unresolved_count_concept(question: str, history: list["ConversationTurn"] |
         and _extract_concept(question)
     ):
         return question
-    if history and _is_bare_followup(question):
+    if history and _is_bare_followup(question) and not _extract_concept(question):
         return _unresolved_count_concept(history[-1].question)
     return None
 
@@ -1735,6 +1775,13 @@ _GENERIC_MESSAGE_WORDS = frozenset({
     "wlan", "wlan1", "wlan2", "info", "debug", "warning", "error", "notice", "the", "and",
     "for", "with", "from", "data", "device", "unknown", "that", "this", "received", "link",
     "sent", "send", "message", "event",
+    # Schema/metadata field names -- defense in depth alongside searching
+    # with the extracted concept (_discover_concept_keyword) rather than
+    # the raw question: confirmed live that "vendor" won as the sole
+    # candidate for a "which vendor..." question when a few retrieved
+    # messages happened to contain it literally (e.g. real device/vendor
+    # description text), even though it identifies no event type at all.
+    "vendor", "hostname", "severity", "program", "category", "source", "anomaly",
 })
 
 
@@ -1810,9 +1857,22 @@ async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str
     _resolve_concept_count: semantic_search for real examples, reduce to
     candidates that actually recur, then a narrow constrained choice if
     there's more than one. Returns (keyword, majority_program_or_None), or
-    None if any step fails to produce a verified result."""
+    None if any step fails to produce a verified result.
+
+    Searches with the EXTRACTED concept (_extract_concept), not the raw
+    question text -- confirmed live as a real, serious gap: semantic_search
+    is a HYBRID query (see its own docstring/_build_query), so its BM25
+    clause literally matches the full question text against the message
+    field, not just its embedding. Passing "which vendor has the most
+    deauth attacks" verbatim let messages that merely contain the generic
+    scaffolding word "vendor" outscore genuinely relevant ones, and
+    "vendor" then won as the sole dominant candidate -- answering with a
+    nonsense keyword scored by its own search prompt's wording, not the
+    actual concept asked about. Stripping to "deauth attacks" first keeps
+    both the embedding and the BM25 clause focused on the real topic."""
+    search_phrase = _extract_concept(concept_question) or concept_question
     try:
-        hits = await semantic_search(os_client, LogAssistantQuery(question=concept_question[:1000], limit=15))
+        hits = await semantic_search(os_client, LogAssistantQuery(question=search_phrase[:1000], limit=15))
     except Exception:
         log.exception("Concept discovery semantic_search failed -- falling back to the normal agent loop")
         return None
