@@ -1609,20 +1609,30 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
 # mechanism didn't exist for this question.
 _ALL_TIME_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-# Generic ranking scaffolding words -- stripped before checking whether a
-# ranking question names an actual CONCEPT beyond "which device/vendor is
-# most/top/highest/worst" (which already has a correct, working answer path
-# via list_devices/forced_anomaly_reason and needs no semantic discovery at
-# all). Deliberately just scaffolding words, not any topic -- adding a new
-# topic/concept to the database never requires touching this list.
-_GENERIC_RANKING_WORDS = frozenset({
+# Generic question scaffolding words -- stripped before checking whether a
+# ranking OR count question names an actual CONCEPT beyond its own
+# scaffolding ("which device is most/top/highest/worst", "how many events
+# happened" -- both already have correct, working answer paths for the
+# no-concept case and need no semantic discovery at all). Deliberately just
+# scaffolding words, not any topic -- adding a new topic/concept to the
+# database never requires touching this list.
+_GENERIC_QUESTION_WORDS = frozenset({
     "most", "top", "which", "who", "whose", "device", "devices", "vendor", "vendors",
     "highest", "worst", "busiest", "active", "noisiest", "the", "a", "an", "is", "for",
     "with", "by", "of", "has", "have", "give", "me", "what", "show", "and", "to", "in", "that",
+    "how", "many", "much", "count", "number", "total", "events", "happened", "occur",
+    "occurred", "there", "were", "was", "did", "logs",
+    # Time-phrase words -- a time reference alone is never the CONCEPT a
+    # count/ranking question is about (see _detect_single_period/
+    # _detect_comparison_periods, which already handle the time dimension
+    # separately); confirmed needed: "how many events happened today"
+    # otherwise left "today" as the only remaining word and was wrongly
+    # treated as naming a real concept to run semantic discovery for.
+    "today", "yesterday", "tomorrow", "week", "month", "year", "this", "last", "next", "ago",
 })
 
 
-def _extract_ranking_concept(question: str) -> str | None:
+def _extract_concept(question: str) -> str | None:
     # len(w) >= 4 excludes short filler/typos ("ist", "any", "did") from
     # counting as a concept -- confirmed needed: a garbled bare follow-up
     # like "ist the top" after an UNRELATED prior turn would otherwise still
@@ -1632,7 +1642,7 @@ def _extract_ranking_concept(question: str) -> str | None:
     # (wireless, disconnections, deauth, attacks, volume) is comfortably
     # longer than this.
     words = re.findall(r"[a-z']+", question.lower())
-    remaining = [w for w in words if w not in _GENERIC_RANKING_WORDS and len(w) >= 4]
+    remaining = [w for w in words if w not in _GENERIC_QUESTION_WORDS and len(w) >= 4]
     return " ".join(remaining) if remaining else None
 
 
@@ -1642,34 +1652,71 @@ def _unresolved_ranking_concept(question: str, history: list["ConversationTurn"]
     it -- either because it isn't a ranking question, because
     _detect_anomaly_reason already resolved it to one of the 8 fixed
     categories (that path is already correct and doesn't need semantic
-    discovery), or because stripping generic ranking scaffolding words
-    leaves nothing (a plain "which device is busiest" with no concept of
-    its own, correctly left to list_devices).
+    discovery), or because stripping generic scaffolding words leaves
+    nothing (a plain "which device is busiest" with no concept of its own,
+    correctly left to list_devices).
 
-    Checks bare-follow-up inheritance BEFORE the current question's own
-    text (the reverse order from _detect_anomaly_reason, which can trust
-    its own resolver -- _resolve_anomaly_reason -- not to fire on noise,
-    since it requires real overlap with an actual category name. This
-    function's own word-stripping has no such protection: a short,
-    garbled follow-up like "ist the top" right after "...wireless
-    disconnections" leaves the stray non-dictionary word "ist" behind,
-    which would otherwise look like a (nonsense) concept of its own. Since
-    _is_bare_followup already means "this text has no topical content of
-    its own" throughout this file, preferring the previous turn's content
-    for a bare follow-up is the safer default; only a longer, clearly
-    deliberate question gets its own text evaluated. Only looks at the
-    immediately preceding turn, same "last turn only" scoping as
-    _detect_anomaly_reason's own bare-followup handling."""
-    if history and _is_bare_followup(question) and _wants_ranking(question):
-        inherited = _unresolved_ranking_concept(history[-1].question)
-        if inherited:
-            return inherited
+    The CURRENT question's own text is checked FIRST, before any
+    bare-follow-up inheritance -- confirmed live as necessary, not just
+    theoretical: "top device with ethernet flap" is a genuine, substantive,
+    self-contained question, but it happens to be exactly 5 words, which
+    satisfies _is_bare_followup's own word-count threshold. Checking
+    inheritance first would have let a real question's own topic
+    ("ethernet flap") be silently discarded in favor of stale context from
+    an unrelated earlier turn (confirmed live: it answered with the
+    PREVIOUS turn's wireless-disconnections ranking instead). A real
+    concept extracted from the current text always wins; only when the
+    current text yields NOTHING on its own (see _extract_concept's own
+    len>=4 filter, which is what actually keeps a garbled follow-up like
+    "ist the top" from wrongly counting as having a concept of its own) does
+    this fall back to the previous turn -- same as _detect_anomaly_reason's
+    own bare-followup handling, which also inherits unconditionally rather
+    than requiring the short follow-up text to re-state the ranking/count
+    language itself (confirmed needed too: "nd the vendor" carries no
+    ranking marker of its own, only "which vendor has the most wireless
+    disconnections" two turns back does). Only looks at the immediately
+    preceding turn, same "last turn only" scoping throughout this file."""
     if (
         _wants_ranking(question)
         and _detect_anomaly_reason(question, history) is None
-        and _extract_ranking_concept(question)
+        and _extract_concept(question)
     ):
         return question
+    if history and _is_bare_followup(question):
+        return _unresolved_ranking_concept(history[-1].question)
+    return None
+
+
+def _unresolved_count_concept(question: str, history: list["ConversationTurn"] | None = None) -> str | None:
+    """Same idea as _unresolved_ranking_concept (see its docstring for why
+    the current question's own text is checked before any bare-follow-up
+    inheritance), generalized to a plain 'how many <concept> happened'
+    question instead of a ranking one -- covers the next most common
+    question shape this Log Assistant gets after ranking, reusing the
+    identical discovery machinery (_resolve_concept_count below) rather
+    than a new bypass. Mutually exclusive with the ranking path by
+    construction (requires _wants_count and NOT _wants_ranking) -- a
+    question combining both language forms is rare and, if it happens, is
+    better served by the ranking path, which runs first in ask().
+
+    Checks _resolve_anomaly_reason directly rather than going through
+    _detect_anomaly_reason -- that helper only ever resolves a RANKING-
+    shaped question (it's gated on _wants_ranking internally), so "how many
+    events for interface flapping" would otherwise slip past it undetected
+    and get a keyword-search count instead of the real
+    anomaly_reason-tagged one -- a materially different, and likely wrong,
+    number for a category with a real evidence-based detector (e.g.
+    interface_flapping's 3-down-transitions-in-15-minutes window, which a
+    plain 'link'/'flapping' keyword match would not reproduce)."""
+    if (
+        _wants_count(question)
+        and not _wants_ranking(question)
+        and _resolve_anomaly_reason(question)[0] is None
+        and _extract_concept(question)
+    ):
+        return question
+    if history and _is_bare_followup(question):
+        return _unresolved_count_concept(history[-1].question)
     return None
 
 
@@ -1758,13 +1805,16 @@ async def _choose_concept_keyword(concept_question: str, candidates: list[str], 
     return raw if raw in candidates else None
 
 
-async def _resolve_concept_ranking(
-    os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
-) -> dict | None:
+async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str) -> tuple[str, str | None] | None:
+    """The shared discovery step behind both _resolve_concept_ranking and
+    _resolve_concept_count: semantic_search for real examples, reduce to
+    candidates that actually recur, then a narrow constrained choice if
+    there's more than one. Returns (keyword, majority_program_or_None), or
+    None if any step fails to produce a verified result."""
     try:
         hits = await semantic_search(os_client, LogAssistantQuery(question=concept_question[:1000], limit=15))
     except Exception:
-        log.exception("Concept-ranking semantic_search failed -- falling back to the normal agent loop")
+        log.exception("Concept discovery semantic_search failed -- falling back to the normal agent loop")
         return None
     if not hits:
         return None
@@ -1787,8 +1837,16 @@ async def _resolve_concept_ranking(
     keyword = candidates[0] if len(candidates) == 1 else await _choose_concept_keyword(concept_question, candidates, sample_messages)
     if not keyword:
         return None
+    return keyword, _majority_program(hits)
 
-    program = _majority_program(hits)
+
+async def _resolve_concept_ranking(
+    os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
+) -> dict | None:
+    discovered = await _discover_concept_keyword(os_client, concept_question)
+    if not discovered:
+        return None
+    keyword, program = discovered
     rows = await asyncio.to_thread(
         log_search_service.aggregate_events,
         ch_client,
@@ -1811,6 +1869,25 @@ def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: st
     label = top.get("vendor") if is_vendor else top.get("hostname")
     count = top.get("event_count")
     return f"The top {kind} for {qualifier} is {label}, with {count} matching events (cumulative, all-time)."
+
+
+async def _resolve_concept_count(
+    os_client: OpenSearch, ch_client, concept_question: str, start: datetime, end: datetime,
+) -> dict | None:
+    discovered = await _discover_concept_keyword(os_client, concept_question)
+    if not discovered:
+        return None
+    keyword, program = discovered
+    count = await asyncio.to_thread(
+        log_search_service.count_events, ch_client, keyword=keyword, program=program, start=start, end=end,
+    )
+    return {"count": count, "keyword": keyword, "program": program}
+
+
+def _concept_count_plain_answer(count: int, keyword: str, program: str | None, period_label: str | None) -> str:
+    qualifier = f"messages containing '{keyword}'" + (f" (program='{program}')" if program else "")
+    period = f" {period_label}" if period_label else " (cumulative, all-time)"
+    return f"There have been {count} events matching {qualifier}{period}."
 
 
 # Loose enough to catch a real dotted-quad before it's used as a literal
@@ -2482,6 +2559,32 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 "Log Assistant FORCE-RESOLVED a concept ranking via semantic-search discovery + a "
                 "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r program=%r -> %s",
                 concept_question, resolved["keyword"], resolved["program"], _truncate(json.dumps(resolved["rows"]), 1000),
+            )
+            return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+
+    # Same mechanism, generalized to a plain "how many <concept> happened"
+    # question -- see _unresolved_count_concept's docstring. Scoped to at
+    # most ONE named time period (or none, meaning all-time): a
+    # two-period COMPARISON of a novel concept would need two separate
+    # count_events calls, which the existing comparison-period machinery
+    # further down already handles once a tool/keyword is known -- adding
+    # that here too is unnecessary complexity for a case the normal loop,
+    # now instructed to use semantic_search first (see _AGENT_INSTRUCTIONS),
+    # can already attempt reasonably.
+    count_concept_question = _unresolved_count_concept(query.question, query.history)
+    if count_concept_question and not _detect_comparison_periods(query.question, now):
+        single_period_for_concept = _detect_single_period(query.question, now)
+        period_label, concept_start, concept_end = (
+            single_period_for_concept if single_period_for_concept else (None, _ALL_TIME_START, now)
+        )
+        resolved = await _resolve_concept_count(os_client, ch_client, count_concept_question, concept_start, concept_end)
+        if resolved:
+            answer = _concept_count_plain_answer(resolved["count"], resolved["keyword"], resolved["program"], period_label)
+            log.info(
+                "Log Assistant FORCE-RESOLVED a concept count via semantic-search discovery + a "
+                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r program=%r "
+                "period=%r -> %s",
+                count_concept_question, resolved["keyword"], resolved["program"], period_label, resolved["count"],
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
