@@ -23,6 +23,7 @@ import json
 import logging
 import pathlib
 import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -645,6 +646,17 @@ _AGENT_INSTRUCTIONS = (
     "number the question needs has been retrieved, give a plain, direct final answer in your own "
     "words -- do not call another tool after that, and do not call the same tool twice with the same "
     "arguments.\n\n"
+    "If a question's topic doesn't match any tool's fixed options (not a real severity/program/vendor "
+    "value, not one of anomaly_summary's 8 real reason categories), do NOT guess a filter value and do "
+    "NOT give up and say it can't be answered. Call semantic_search FIRST with the question's own "
+    "wording to find real example log lines about that topic -- it matches by MEANING, not exact "
+    "words, so it works even when nothing in the database literally says what the question says. Then "
+    "look at the real `program` and `message` text those hits actually contain, and make a SECOND call "
+    "-- count_events/search_logs/aggregate_events with a `keyword` copied from what those real messages "
+    "actually say (and `program` set to what they actually show, if consistent) -- to get an exact, "
+    "authoritative count or row set. Never answer a count/ranking for this kind of question from the "
+    "semantic_search hits alone (a short top-K sample is not a real total); it only exists to tell you "
+    "what real keyword/program to filter on next.\n\n"
     "Time ranges: below is a list of exact start/end values already computed for you, one per common "
     "phrase -- COPY the pair matching the question's time period character-for-character into a "
     "tool's start/end arguments. Do NOT compute a date yourself by adding/subtracting days -- "
@@ -695,15 +707,17 @@ TOOL_DEFINITIONS = [
                 "search_logs -- an anomaly type is a fixed CATEGORY label applied by the ML pipeline, "
                 "not necessarily a phrase that appears in the raw log message, so search_logs will "
                 "usually find nothing even when the real data has plenty of matching anomalies. Do NOT "
-                "use this tool for a wireless-specific question (e.g. 'wireless disconnections') -- "
-                "there is no wireless-specific anomaly category; use aggregate_events or count_events "
-                "with program='wireless' instead, which finds the real wireless-tagged log data."
+                "use this tool, or guess a `reason`, for a concept that isn't one of the 8 real "
+                "categories (e.g. 'wireless disconnections', 'deauth attacks') -- there is no category "
+                "for everything; use semantic_search first to find real example messages about it, then "
+                "aggregate_events or count_events with a keyword/program copied from what those real "
+                "messages actually say instead."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default) or 'vendor'."},
-                    "reason": {"type": "string", "description": "Optional: restrict to one anomaly type -- pass it in your own words ('ethernet flapping', 'volume spike'), it will be matched to the real category for you. When set, the result is already filtered AND sorted for just this type, so its first entry is the answer to 'which has the most'. NEVER pass a wireless-specific phrase here -- there is no wireless-specific category (see this tool's own description)."},
+                    "reason": {"type": "string", "description": "Optional: restrict to one anomaly type -- pass it in your own words ('ethernet flapping', 'volume spike'), it will be matched to the real category for you. When set, the result is already filtered AND sorted for just this type, so its first entry is the answer to 'which has the most'. If the concept isn't one of the 8 real categories, do NOT guess/pass it here (see this tool's own description for the real alternative)."},
                     "limit": {"type": "integer", "description": "Max rows to return per list. Default 10."},
                 },
             },
@@ -849,8 +863,14 @@ TOOL_DEFINITIONS = [
             "name": "semantic_search",
             "description": (
                 "Finds log lines similar in MEANING to a short phrase, even without shared words -- "
-                "e.g. 'authentication failures' can match a line that says 'login rejected'. Use "
-                "only when there's no exact keyword/field to filter on with search_logs."
+                "e.g. 'authentication failures' can match a line that says 'login rejected'. This is "
+                "the GENERAL fallback for any topic that doesn't match an exact field/category/keyword "
+                "you already know -- use it FIRST, before concluding a topic 'isn't in the database' or "
+                "guessing a filter value. Its hits are a small relevance-ranked SAMPLE, not a real "
+                "count -- never answer a count/ranking question from these hits alone. Instead, read "
+                "the real `program` and `message` text the hits actually contain, then make a SECOND "
+                "call (count_events/search_logs/aggregate_events) with a `keyword`/`program` copied "
+                "from what those real messages say, to get an exact, authoritative total."
             ),
             "parameters": {
                 "type": "object",
@@ -1533,10 +1553,11 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
         # so the model has to get there on its own with this nudge).
         return None, (
             f"'{value}' isn't a real anomaly category -- there is no wireless-specific category. "
-            "Do not retry anomaly_summary with a different wireless-related guess. Instead, use "
-            "aggregate_events or count_events with program='wireless' -- real wireless-tagged log "
-            "data exists under the `program` field (it will be matched for you even though the real "
-            "value is a longer tag like 'wireless,debug')."
+            "Do not retry anomaly_summary with a different wireless-related guess. Instead, call "
+            "semantic_search with the original question's wording to find real example wireless log "
+            "messages, then use the real `program`/message text those hits contain with "
+            "aggregate_events or count_events to get an exact count -- real wireless-tagged log data "
+            "exists under the `program` field even though you don't know its exact value yet."
         )
     for reason, synonyms in _ANOMALY_REASON_SYNONYMS.items():
         if any(s in lowered for s in synonyms):
@@ -1549,92 +1570,203 @@ def _resolve_anomaly_reason(value: str) -> tuple[str | None, str | None]:
     )
 
 
-# "Top device with wireless disconnections" -- confirmed live on net-flow as
-# the single most-tested, least-resolved question shape in this whole file:
-# ten separate rounds of fixes, each one closing a distinct model failure
-# mode (a stale carried-over device, a wrong-tool call, a fully fabricated
-# tool-call narration complete with a fake result, an honest rejection, then
-# a SECOND, differently-fabricated narration with no tool call at all -- see
-# this file's git history for each), without the model ever once producing
-# a correct answer on its own, even after _resolve_anomaly_reason's own
-# wireless nudge told it exactly which real tool/filter to use instead.
-# By the time of the last failure, real example messages were pulled
-# directly from net-flow confirming the actual wireless disconnect format:
-# "<mac>@wlan1: disconnected, <reason>" under program='wireless,info'.
-# Unlike interface_flapping (ml/interface_flap_anomaly.py, computed at
-# ingest time into a real anomaly_reason), there is no live detector for
-# this, and building one would only cover FUTURE events -- every
-# already-ingested wireless disconnect would stay unanswerable until it
-# backfilled, which it never does. A keyword search over the already-
-# indexed message column answers it immediately against ALL existing data,
-# so this resolves the question directly via aggregate_events's own keyword
-# filter (ask()'s very first step, below) instead of ever routing it
-# through the model -- a deliberate departure from every other override in
-# this file (enforce_count_tool, forced_anomaly_reason), which still let a
-# correct first attempt through un-intercepted and only corrected a wrong
-# one. Those questions DO sometimes get answered correctly by the model;
-# this one has a confirmed 0/10 success rate at every interception point
-# already tried, so there is nothing left to lose by skipping it entirely.
-_WIRELESS_DISCONNECT_QUESTION_MARKERS = (
-    "disconnect", "disconnection", "disconnections", "disconnects",
-    "dropout", "dropouts", "drop", "drops",
-)
-# The literal, confirmed substring real wireless disconnect messages
-# contain -- deliberately NOT the same list as the question markers above.
-# A user can ask about "wireless drops" or "wifi dropouts" in plenty of
-# different words; the actual log line only ever says "disconnected".
-_WIRELESS_DISCONNECT_MESSAGE_KEYWORD = "disconnected"
-# Confirmed on net-flow as a real gap in the first version of this fix: a
-# bare keyword="disconnected" search with no program filter pulled in EVERY
-# "disconnected" event in the whole database (PPPoE/VPN/container churn
-# included), not just real wireless client disconnects -- surfaced as a
-# single unresolved-hostname IP (172.23.0.66) with 112,182 events, more
-# than 18x the real top device, the exact same "huge outlier number = noise,
-# not signal" shape already seen once before with the raw wireless,debug
-# volume count. Scoping to this confirmed program tag reproduces the
-# manually-verified, correct result (ND_SAIDA1-LGB[SAIDA] | IBL[SAIDA],
-# 6,178) exactly.
-_WIRELESS_DISCONNECT_PROGRAM = "wireless,info"
-# All-time cumulative, matching anomaly_summary_service's own "no time
-# filter, by design" convention (see its module docstring) -- aggregate_events
-# otherwise defaults to log_search_service.DEFAULT_LOOKBACK (24h), which
-# would silently turn "which device has the most wireless disconnections"
-# into "...in the last day", a materially different question.
+# GENERAL "which device/vendor has the most <concept>" resolver, for any
+# <concept> that ISN'T one of the 8 fixed anomaly_reason categories --
+# superseding an earlier version of this fix that hardcoded exactly one
+# such concept (wireless disconnections). That version worked, but only
+# for that one exact phrase -- confirmed, live, as not what was actually
+# wanted: the whole point was a Log Assistant that can answer "any question
+# that can be found in the database" without a new hardcoded bypass for
+# every new phrase that trips up the model. "Wireless disconnections" was
+# simply the first one found this way; "deauth attacks", "SSL certificate
+# errors", or anything else not yet asked are exactly as unresolvable via
+# the fixed 8 categories, and none of them should need their own dedicated
+# function the way wireless disconnections first did.
+#
+# This mirrors, in code, the exact manual process used to find the real
+# answer for wireless disconnections by hand: (1) find real example
+# messages about the concept via semantic_search (embedding similarity, so
+# it works even when the question's own wording never appears verbatim in
+# any message -- unlike a keyword guess); (2) ask the model ONE short,
+# heavily-grounded question -- naming the literal substring real retrieved
+# messages share -- not an open-ended tool-routing decision, since this
+# model has repeatedly proven unreliable at the latter but a narrow,
+# example-grounded extraction is a much easier task; (3) verify that
+# substring actually appears in the real messages before trusting it (same
+# grounding-check discipline as every other model-derived value in this
+# file -- never trusted un-verified); (4) run an authoritative
+# aggregate_events COUNT over ALL matching data using that verified
+# keyword, plus the hits' majority `program` if one exists (confirmed
+# necessary on net-flow: a bare keyword search with no program filter once
+# pulled in unrelated non-wireless "disconnected" events from an
+# unresolved-hostname IP with 112,182 events, more than 18x the real
+# answer -- the same cross-contamination risk applies to any keyword, not
+# just that one).
+#
+# Falls through to the normal tool-calling loop (returns None) at any step
+# that doesn't produce a verified result, rather than ever answering with
+# an unverified guess -- the caller treats that exactly as if this
+# mechanism didn't exist for this question.
 _ALL_TIME_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-
-def _wants_wireless_disconnect_ranking(question: str, history: list["ConversationTurn"] | None = None) -> bool:
-    """... Also recognizes a bare follow-up to an immediately preceding
-    wireless-disconnect-ranking turn (e.g. "is that the top" / "ist the
-    top" right after "...wireless disconnections") -- confirmed live on
-    net-flow as the identical bare-followup gap already fixed for
-    _detect_anomaly_reason above: such a follow-up doesn't repeat
-    "wireless" itself, so without this it fell straight through to the
-    general agent loop's own ranking handling (list_devices by total event
-    count across ALL programs) -- a plausible-looking but topically wrong
-    answer (busiest device overall, not busiest for wireless disconnects).
-    Only looks at the immediately preceding turn, same "last turn only"
-    scoping as _detect_anomaly_reason's own bare-followup handling."""
-    if _wants_ranking(question) and _is_wireless_specific(question):
-        lowered = question.lower()
-        if any(marker in lowered for marker in _WIRELESS_DISCONNECT_QUESTION_MARKERS):
-            return True
-    if history and _is_bare_followup(question):
-        return _wants_wireless_disconnect_ranking(history[-1].question)
-    return False
+# Generic ranking scaffolding words -- stripped before checking whether a
+# ranking question names an actual CONCEPT beyond "which device/vendor is
+# most/top/highest/worst" (which already has a correct, working answer path
+# via list_devices/forced_anomaly_reason and needs no semantic discovery at
+# all). Deliberately just scaffolding words, not any topic -- adding a new
+# topic/concept to the database never requires touching this list.
+_GENERIC_RANKING_WORDS = frozenset({
+    "most", "top", "which", "who", "whose", "device", "devices", "vendor", "vendors",
+    "highest", "worst", "busiest", "active", "noisiest", "the", "a", "an", "is", "for",
+    "with", "by", "of", "has", "have", "give", "me", "what", "show", "and", "to", "in", "that",
+})
 
 
-def _wireless_disconnect_ranking_plain_answer(rows: list[dict], is_vendor: bool) -> str:
+def _extract_ranking_concept(question: str) -> str | None:
+    # len(w) >= 4 excludes short filler/typos ("ist", "any", "did") from
+    # counting as a concept -- confirmed needed: a garbled bare follow-up
+    # like "ist the top" after an UNRELATED prior turn would otherwise still
+    # look like it names a (nonsense) concept of its own, triggering a
+    # wasted semantic_search + extraction round-trip before falling through
+    # to the normal loop anyway. Every real concept word seen so far
+    # (wireless, disconnections, deauth, attacks, volume) is comfortably
+    # longer than this.
+    words = re.findall(r"[a-z']+", question.lower())
+    remaining = [w for w in words if w not in _GENERIC_RANKING_WORDS and len(w) >= 4]
+    return " ".join(remaining) if remaining else None
+
+
+def _unresolved_ranking_concept(question: str, history: list["ConversationTurn"] | None = None) -> str | None:
+    """Returns the effective question text to run concept discovery against
+    (see _resolve_concept_ranking), or None if this question doesn't need
+    it -- either because it isn't a ranking question, because
+    _detect_anomaly_reason already resolved it to one of the 8 fixed
+    categories (that path is already correct and doesn't need semantic
+    discovery), or because stripping generic ranking scaffolding words
+    leaves nothing (a plain "which device is busiest" with no concept of
+    its own, correctly left to list_devices).
+
+    Checks bare-follow-up inheritance BEFORE the current question's own
+    text (the reverse order from _detect_anomaly_reason, which can trust
+    its own resolver -- _resolve_anomaly_reason -- not to fire on noise,
+    since it requires real overlap with an actual category name. This
+    function's own word-stripping has no such protection: a short,
+    garbled follow-up like "ist the top" right after "...wireless
+    disconnections" leaves the stray non-dictionary word "ist" behind,
+    which would otherwise look like a (nonsense) concept of its own. Since
+    _is_bare_followup already means "this text has no topical content of
+    its own" throughout this file, preferring the previous turn's content
+    for a bare follow-up is the safer default; only a longer, clearly
+    deliberate question gets its own text evaluated. Only looks at the
+    immediately preceding turn, same "last turn only" scoping as
+    _detect_anomaly_reason's own bare-followup handling."""
+    if history and _is_bare_followup(question) and _wants_ranking(question):
+        inherited = _unresolved_ranking_concept(history[-1].question)
+        if inherited:
+            return inherited
+    if (
+        _wants_ranking(question)
+        and _detect_anomaly_reason(question, history) is None
+        and _extract_ranking_concept(question)
+    ):
+        return question
+    return None
+
+
+def _majority_program(hits: list[LogHit]) -> str | None:
+    programs = [h.program for h in hits if h.program]
+    if not programs:
+        return None
+    value, count = Counter(programs).most_common(1)[0]
+    return value if count / len(programs) > 0.5 else None
+
+
+_KEYWORD_EXTRACTION_MAX_LEN = 40
+
+
+async def _extract_grounded_keyword(concept_question: str, sample_messages: list[str]) -> str | None:
+    """The one, narrow, heavily-grounded model call this mechanism makes --
+    deliberately NOT a tool-routing decision (this model's confirmed
+    failure mode all session), just "copy the matching substring from the
+    examples below". Small prompt, small num_predict: this should be fast
+    relative to a full tool-calling round-trip."""
+    prompt = (
+        "Real log messages related to a question are listed below. Reply with ONLY the single short "
+        "literal substring (copied EXACTLY, character-for-character, from one of the messages below) "
+        "that best identifies this type of event -- no quotes, no explanation, no extra words. If no "
+        "single substring clearly identifies it, reply with exactly: NONE\n\n"
+        f"Question: {concept_question}\n\nMessages:\n"
+        + "\n".join(f"- {_truncate(m, 200)}" for m in sample_messages)
+    )
+    try:
+        body = await asyncio.to_thread(
+            _post_chat_sync,
+            f"{settings.ollama_url}/api/chat",
+            {
+                "model": settings.ollama_chat_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"num_predict": 24, "num_thread": settings.ollama_chat_num_thread},
+            },
+            settings.ollama_timeout_seconds,
+        )
+    except Exception:
+        log.exception("Concept-ranking keyword extraction call failed -- falling back to the normal agent loop")
+        return None
+    raw = (body.get("message", {}).get("content") or "").strip().strip("'\"").strip()
+    if not raw or raw.upper() == "NONE" or len(raw) > _KEYWORD_EXTRACTION_MAX_LEN or "\n" in raw:
+        return None
+    # Never trust the extraction un-verified -- same grounding discipline as
+    # every other model-derived value in this file. An 8B model asked to
+    # copy exact text can still paraphrase or invent one instead.
+    lowered_raw = raw.lower()
+    if not any(lowered_raw in m.lower() for m in sample_messages):
+        return None
+    return raw
+
+
+async def _resolve_concept_ranking(
+    os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
+) -> dict | None:
+    try:
+        hits = await semantic_search(os_client, LogAssistantQuery(question=concept_question[:1000], limit=15))
+    except Exception:
+        log.exception("Concept-ranking semantic_search failed -- falling back to the normal agent loop")
+        return None
+    if not hits:
+        return None
+
+    sample_messages = [h.message for h in hits if h.message][:8]
+    if not sample_messages:
+        return None
+
+    keyword = await _extract_grounded_keyword(concept_question, sample_messages)
+    if not keyword:
+        return None
+
+    program = _majority_program(hits)
+    rows = await asyncio.to_thread(
+        log_search_service.aggregate_events,
+        ch_client,
+        group_by=["vendor" if is_vendor else "hostname"],
+        keyword=keyword,
+        program=program,
+        start=_ALL_TIME_START,
+        end=now,
+        limit=10,
+    )
+    return {"rows": rows, "keyword": keyword, "program": program}
+
+
+def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, program: str | None) -> str:
     kind = "vendor" if is_vendor else "device"
+    qualifier = f"messages containing '{keyword}'" + (f" (program='{program}')" if program else "")
     if not rows:
-        return f"No {kind} has any confirmed wireless disconnect events."
+        return f"No {kind} has any events matching {qualifier}."
     top = rows[0]
     label = top.get("vendor") if is_vendor else top.get("hostname")
     count = top.get("event_count")
-    return (
-        f"The top {kind} for wireless disconnections is {label}, with {count} confirmed wireless "
-        f"disconnect events (cumulative, all-time)."
-    )
+    return f"The top {kind} for {qualifier} is {label}, with {count} matching events (cumulative, all-time)."
 
 
 # Loose enough to catch a real dotted-quad before it's used as a literal
@@ -2288,28 +2420,26 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # a time-relative question is not safe to trust without this anchor.
     now = datetime.now(timezone.utc)
 
-    # See _wants_wireless_disconnect_ranking's docstring/comment for why this
-    # question shape alone skips the model round-trip entirely rather than
-    # going through the usual tool-calling loop below.
-    if _wants_wireless_disconnect_ranking(query.question, query.history):
+    # See _unresolved_ranking_concept's docstring for what this covers: ANY
+    # "which device/vendor has the most <concept>" question not already
+    # handled by one of the 8 fixed anomaly_reason categories -- general by
+    # construction, not a bypass tailored to one specific phrase. Only
+    # commits to this path's answer once _resolve_concept_ranking has
+    # actually verified a real, grounded keyword against real retrieved
+    # messages; otherwise (None) this falls through to the normal
+    # tool-calling loop below exactly as if it had never run.
+    concept_question = _unresolved_ranking_concept(query.question, query.history)
+    if concept_question:
         is_vendor = _wants_vendor_grouping(query.question)
-        rows = await asyncio.to_thread(
-            log_search_service.aggregate_events,
-            ch_client,
-            group_by=["vendor" if is_vendor else "hostname"],
-            keyword=_WIRELESS_DISCONNECT_MESSAGE_KEYWORD,
-            program=_WIRELESS_DISCONNECT_PROGRAM,
-            start=_ALL_TIME_START,
-            end=now,
-            limit=10,
-        )
-        answer = _wireless_disconnect_ranking_plain_answer(rows, is_vendor)
-        log.info(
-            "Log Assistant FORCE-RESOLVED wireless-disconnect ranking with no model round-trip "
-            "at all (confirmed 0/10 reliable via the model for this exact question shape): %s",
-            _truncate(json.dumps(rows), 1000),
-        )
-        return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+        resolved = await _resolve_concept_ranking(os_client, ch_client, concept_question, is_vendor, now)
+        if resolved:
+            answer = _concept_ranking_plain_answer(resolved["rows"], is_vendor, resolved["keyword"], resolved["program"])
+            log.info(
+                "Log Assistant FORCE-RESOLVED a concept ranking via semantic-search discovery + a "
+                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r program=%r -> %s",
+                concept_question, resolved["keyword"], resolved["program"], _truncate(json.dumps(resolved["rows"]), 1000),
+            )
+            return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
     history_block = _format_history(query.history)
     opening = (
