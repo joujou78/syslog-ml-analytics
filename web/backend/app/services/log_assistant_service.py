@@ -1919,14 +1919,6 @@ async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str
     return keyword, _significant_programs(hits)
 
 
-def _program_qualifier(programs: list[str]) -> str:
-    if not programs:
-        return ""
-    if len(programs) == 1:
-        return f" (program='{programs[0]}')"
-    return f" (program in {', '.join(repr(p) for p in programs)})"
-
-
 async def _resolve_concept_ranking(
     os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
 ) -> dict | None:
@@ -1972,8 +1964,14 @@ async def _resolve_concept_ranking(
 
 
 def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, programs: list[str]) -> str:
+    # `programs` (the internal syslog `program` field value(s) actually
+    # queried, e.g. 'wireless,info') is deliberately NOT shown here --
+    # confirmed live as genuinely confusing to a user asking a plain
+    # question ("why is there 'wireless,info'... it is not
+    # comprehensible"). It's still logged (see the FORCE-RESOLVED log line
+    # in ask()) for anyone auditing what was actually matched.
     kind = "vendor" if is_vendor else "device"
-    qualifier = f"messages containing '{keyword}'" + _program_qualifier(programs)
+    qualifier = f"messages containing '{keyword}'"
     if not rows:
         return f"No {kind} has any events matching {qualifier}."
     top = rows[0]
@@ -2002,7 +2000,10 @@ async def _resolve_concept_count(
 
 
 def _concept_count_plain_answer(count: int, keyword: str, programs: list[str], period_label: str | None) -> str:
-    qualifier = f"messages containing '{keyword}'" + _program_qualifier(programs)
+    # See _concept_ranking_plain_answer's comment -- `programs` is kept as
+    # a parameter (logged by the caller) but deliberately left out of the
+    # user-facing text.
+    qualifier = f"messages containing '{keyword}'"
     period = f" {period_label}" if period_label else " (cumulative, all-time)"
     return f"There have been {count} events matching {qualifier}{period}."
 
