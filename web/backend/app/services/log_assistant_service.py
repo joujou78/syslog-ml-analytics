@@ -1211,6 +1211,36 @@ def _format_history(history: list[ConversationTurn]) -> str:
 # hostname validation.
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,}")
 
+# Confirmed as a real, reproduced bug on net-flow: "top n for today with
+# ethernet flapping" is answered via _anomaly_summary_plain_answer, whose
+# own template literally writes "anomaly_reason='interface_flapping'" into
+# the answer text (see that function below). That answer then sits in
+# conversation history like any other turn -- and the underscore in
+# "anomaly_reason" is exactly the separator _looks_like_identifier_token
+# was widened to accept for real hostnames like 'PTP_Ksara_to_Chams_Anjar'.
+# A later bare follow-up ("what about last month") swept that schema field
+# name up as if it were the device the previous turn was about, and
+# count_events was then called with hostname='anomaly_reason' -- a
+# deterministically-computed but nonsense answer (0 events), not even a
+# model hallucination. These are our own internal field names, not
+# anything a real hostname/IP could ever collide with, so they're excluded
+# outright rather than patching each template that might echo one.
+#
+# Excluding just "anomaly_reason" isn't enough on its own: with that token
+# gone, the SAME text's next identifier-shaped token is the quoted VALUE
+# right after it ("interface_flapping", an anomaly CATEGORY, not a
+# hostname either) -- confirmed by re-running the reproduction after the
+# first fix attempt. _VALID_ANOMALY_REASONS (defined below) is excluded
+# for the same reason: every one of its values is exactly the kind of
+# underscore-separated, 4+ char token this check exists to accept for real
+# hostnames, and every one of them routinely appears in our own answer/note
+# text precisely because that's what this feature discloses anomaly
+# categories by.
+_SCHEMA_FIELD_TOKENS = frozenset({
+    "anomaly_reason", "anomaly_reasons", "anomaly_event_count",
+    "event_count", "device_count",
+})
+
 
 def _looks_like_identifier_token(tok: str) -> bool:
     """A hostname/IP/device-id token, as opposed to an ordinary English word
@@ -1223,10 +1253,17 @@ def _looks_like_identifier_token(tok: str) -> bool:
     uses this check, including the one meant to carry it across a
     follow-up turn. A token now also qualifies via a separator character
     (_, -, .) instead of a digit -- still excludes plain prose words like
-    'today'/'events', which have neither digits nor separators.
+    'today'/'events', which have neither digits nor separators. Also
+    excludes _SCHEMA_FIELD_TOKENS and _VALID_ANOMALY_REASONS (forward
+    reference -- defined later in this module, but only looked up when this
+    function is actually called, by which point the module is fully
+    loaded) -- see _SCHEMA_FIELD_TOKENS's comment for the live bug this
+    closes.
     """
     return (
         len(tok) >= 4
+        and tok.lower() not in _SCHEMA_FIELD_TOKENS
+        and tok.lower() not in _VALID_ANOMALY_REASONS
         and any(c.isalpha() for c in tok)
         and (any(c.isdigit() for c in tok) or any(c in "_-." for c in tok))
     )
