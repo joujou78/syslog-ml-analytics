@@ -237,6 +237,16 @@ export function LogAssistant() {
   }
 
   function send(kind: 'ask' | 'search', questionText: string) {
+    // Guards here, not just via the buttons' `disabled={pending !== null}` --
+    // confirmed as a real gap: the textarea's Enter-to-send handler below
+    // calls send() directly, bypassing the buttons' disabled state entirely.
+    // Two Log Assistant requests overlapping on this CPU-only, no-GPU host
+    // isn't just wasteful -- a stress test confirmed it's actively harmful:
+    // two concurrent real model calls each took 400+ seconds and one 502'd,
+    // worse than either would have taken run one after the other. A fast
+    // double-Enter (or hitting Enter again before the pending state has
+    // visually propagated) is exactly the kind of overlap this prevents.
+    if (pending !== null) return
     const trimmed = questionText.trim()
     if (!trimmed) return
     const rangeError = invalidRange()
