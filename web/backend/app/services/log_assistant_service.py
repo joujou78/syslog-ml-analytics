@@ -1943,13 +1943,22 @@ async def _resolve_concept_ranking(
     # doesn't lose a group that would only rank highly once its counts
     # across programs are combined; final truncation happens after the
     # merge, not before it.
-    per_program_rows = await asyncio.gather(*[
-        asyncio.to_thread(
+    #
+    # Sequential, not asyncio.gather -- confirmed live (500, "Attempt to
+    # execute concurrent queries within the same session"): clickhouse_
+    # connect's Client raises a ProgrammingError when two queries run
+    # concurrently on the SAME client instance, even each wrapped in its
+    # own to_thread (see the identical, pre-existing lesson at this same
+    # ch_client's other concurrent-use site in _execute_tool). Every
+    # program here shares this one ch_client, so they must run one at a
+    # time regardless of how harmless concurrent reads might look.
+    per_program_rows = [
+        await asyncio.to_thread(
             log_search_service.aggregate_events, ch_client, group_by=[group_key], keyword=keyword,
             program=p, start=_ALL_TIME_START, end=now, limit=log_search_service.AGGREGATE_MAX_LIMIT,
         )
         for p in (programs or [None])
-    ])
+    ]
     totals: dict[str, int] = {}
     for rows in per_program_rows:
         for row in rows:
@@ -1981,12 +1990,14 @@ async def _resolve_concept_count(
         return None
     keyword, programs = discovered
     # Sum across every significant program, same reasoning as
-    # _resolve_concept_ranking -- never settle for a single program's
-    # count when more than one real contributor was found.
-    counts = await asyncio.gather(*[
-        asyncio.to_thread(log_search_service.count_events, ch_client, keyword=keyword, program=p, start=start, end=end)
+    # _resolve_concept_ranking. Sequential, not asyncio.gather -- same
+    # confirmed-live ch_client concurrency restriction as there (this was
+    # in fact the exact call that raised the 500 in production the one
+    # time this ran concurrently).
+    counts = [
+        await asyncio.to_thread(log_search_service.count_events, ch_client, keyword=keyword, program=p, start=start, end=end)
         for p in (programs or [None])
-    ])
+    ]
     return {"count": sum(counts), "keyword": keyword, "programs": programs}
 
 
