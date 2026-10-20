@@ -970,11 +970,28 @@ def _relative_time_bounds(now: datetime) -> dict[str, tuple[datetime, datetime]]
     yesterday_start = today_start - timedelta(days=1)
     week_start = now - timedelta(days=7)
     last_week_start = now - timedelta(days=14)
+    # "this month"/"last month" and "this hour"/"last hour" -- confirmed
+    # live as a real gap: neither granularity was covered at all, so a
+    # question naming either fell through to the model's own date
+    # arithmetic with no precomputed hint and no deterministic comparison
+    # detection, the exact failure mode ("this week vs last week" getting
+    # the subtraction backwards) this whole mechanism exists to prevent.
+    # Trailing windows, same semantics as this week/last week above (NOT
+    # calendar-month/hour-aligned) -- "this month" is the last 30 days, not
+    # the 1st of the current calendar month.
+    month_start = now - timedelta(days=30)
+    last_month_start = now - timedelta(days=60)
+    hour_start = now - timedelta(hours=1)
+    last_hour_start = now - timedelta(hours=2)
     return {
         "today": (today_start, now),
         "yesterday": (yesterday_start, today_start),
         "this week": (week_start, now),
         "last week": (last_week_start, week_start),
+        "this month": (month_start, now),
+        "last month": (last_month_start, month_start),
+        "this hour": (hour_start, now),
+        "last hour": (last_hour_start, hour_start),
     }
 
 
@@ -1013,6 +1030,10 @@ _PERIOD_PHRASE_ALIASES: list[tuple[str, tuple[str, ...]]] = [
     ("yesterday", ("yesterday",)),
     ("this week", ("this week", "past week")),
     ("last week", ("last week",)),
+    ("this month", ("this month", "past month")),
+    ("last month", ("last month",)),
+    ("this hour", ("this hour", "past hour")),
+    ("last hour", ("last hour",)),
 ]
 
 _NUMBER_WORDS = {
