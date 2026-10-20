@@ -2242,17 +2242,33 @@ async def _resolve_hostname_fuzzy(ch_client: Client, hostname: str) -> tuple[str
     with unrelated words in the same casual phrase.
 
     Returns (resolved_hostname, note): resolved_hostname is the real
-    hostname when EXACTLY one real device matched, across the whole-string
-    search or any word search (None otherwise -- zero matches means
-    genuinely no such device even loosely; more than one DISTINCT device is
-    ambiguous and must not be guessed at). note is non-None whenever this
-    is worth relaying to the model (a resolution happened, or the match
-    was ambiguous), so the final answer can say so instead of silently
-    substituting or silently staying at an unexplained zero.
+    hostname when EXACTLY one real device matched (None otherwise -- zero
+    matches means genuinely no such device even loosely; more than one
+    DISTINCT device is ambiguous and must not be guessed at). note is
+    non-None whenever this is worth relaying to the model (a resolution
+    happened, or the match was ambiguous), so the final answer can say so
+    instead of silently substituting or silently staying at an unexplained
+    zero.
+
+    The whole-string search is resolved FIRST, on its own, before ever
+    trying the word-split fallback -- confirmed as a real, reproduced bug
+    on net-flow: a bare follow-up truncated the real hostname
+    'MKT_SOC-MUTUELLE_link2[SNFL]_TO_SNFL' to 'MKT_SOC-MUTUELLE_link2' (the
+    identifier regex stops at '['), and the whole-string search alone
+    correctly, UNAMBIGUOUSLY matched that one real device -- but the
+    original code went on to ALSO search every split word unconditionally
+    and merged everything into one pool, and the generic word 'MKT' (a
+    vendor-name fragment shared with the unrelated real device
+    'MKT-NETPRO[ZAHLE]-MGMT') joined the pool too, turning an already-
+    resolved single match into a false "ambiguous, matches 2 devices"
+    verdict -- which silently left the caller's count at the real zero
+    from the ORIGINAL (unresolved, truncated) query, with no visible
+    explanation. Splitting into words is now tried only when the whole
+    string itself matched nothing at all, preserving the original
+    motivating case ('anjar MKT' doesn't substring-match the real device
+    name as a whole phrase, so word-splitting is still what finds it).
     """
-    search_terms = [hostname] + [w for w in re.split(r"[\s_-]+", hostname) if len(w) >= 3]
-    matches: dict[str, object] = {}
-    for term in search_terms:
+    async def _search(term: str) -> dict[str, object]:
         candidates = await asyncio.to_thread(
             device_service.list_devices,
             ch_client,
@@ -2260,22 +2276,32 @@ async def _resolve_hostname_fuzzy(ch_client: Client, hostname: str) -> tuple[str
             start=datetime.now(timezone.utc) - timedelta(days=365),
             limit=5,
         )
-        for d in candidates.items:
-            matches[d.hostname] = d
+        return {d.hostname: d for d in candidates.items}
+
+    def _verdict(matches: dict[str, object]) -> tuple[str | None, str | None] | None:
+        if len(matches) == 1:
+            resolved = next(iter(matches))
+            return resolved, f"'{hostname}' isn't an exact device name -- resolved to the real device '{resolved}'."
+        if len(matches) > 1:
+            names = ", ".join(matches)
+            return None, (
+                f"'{hostname}' isn't an exact device name and matches more than one real device "
+                f"({names}) -- tell the user which devices matched and ask them to pick one, don't guess."
+            )
+        return None
+
+    whole_string_verdict = _verdict(await _search(hostname))
+    if whole_string_verdict is not None:
+        return whole_string_verdict
+
+    matches: dict[str, object] = {}
+    for word in (w for w in re.split(r"[\s_-]+", hostname) if len(w) >= 3):
+        matches.update(await _search(word))
         if len(matches) > 4:
             # Already clearly too broad to narrow down further (e.g. a
             # short, common word) -- stop early rather than keep searching.
             break
-    if len(matches) == 1:
-        resolved = next(iter(matches))
-        return resolved, f"'{hostname}' isn't an exact device name -- resolved to the real device '{resolved}'."
-    if len(matches) > 1:
-        names = ", ".join(matches)
-        return None, (
-            f"'{hostname}' isn't an exact device name and matches more than one real device "
-            f"({names}) -- tell the user which devices matched and ask them to pick one, don't guess."
-        )
-    return None, None
+    return _verdict(matches) or (None, None)
 
 
 async def _resolve_program_fuzzy(ch_client: Client, program: str) -> tuple[str | None, str | None]:
