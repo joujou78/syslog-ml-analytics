@@ -1649,6 +1649,16 @@ _GENERIC_QUESTION_WORDS = frozenset({
     # otherwise left "today" as the only remaining word and was wrongly
     # treated as naming a real concept to run semantic discovery for.
     "today", "yesterday", "tomorrow", "week", "month", "year", "this", "last", "next", "ago",
+    # Filler/intensifier words -- confirmed live as a real, user-facing
+    # regression: "which device is busiest right now" left "right" as the
+    # only remaining word after stripping ranking scaffolding (it's 5
+    # letters, over the len>=4 floor, and names no real concept at all),
+    # wrongly routing an everyday, already-correctly-handled question
+    # ("which device is busiest" -> list_devices) into the slow
+    # semantic-search discovery path instead -- the request timed out.
+    # These words pad a question without ever naming its actual topic.
+    "right", "now", "currently", "presently", "actually", "really", "just",
+    "simply", "basically", "immediately", "still", "please", "overall",
 })
 
 
