@@ -485,8 +485,19 @@ def _anomaly_summary_plain_answer(result: dict) -> str:
     top = rows[0]
     label = top.get("hostname") or top.get("vendor")
     count = top.get("event_count")
-    kind = "vendor" if key == "vendors_ranked_by_reason_count" else "device"
-    return f"The top {kind} for anomaly_reason='{reason}' is {label}, with {count} events (cumulative, all-time)."
+    is_vendor = key == "vendors_ranked_by_reason_count"
+    kind = "vendor" if is_vendor else "device"
+    # Same "top 10" breakdown treatment as _concept_ranking_plain_answer --
+    # confirmed live as a real inconsistency: identical phrasing ("top 10
+    # devices with X") returned a full 10-entry breakdown when X resolved
+    # to a general concept, but only the single top entry when X resolved
+    # to one of the 8 fixed anomaly categories (e.g. "ethernet flapping").
+    # rows already reflects whatever limit the tool call itself used.
+    breakdown = "; ".join(f"{(r.get('vendor') if is_vendor else r.get('hostname'))}: {r.get('event_count')}" for r in rows)
+    return (
+        f"The top {kind} for anomaly_reason='{reason}' is {label}, with {count} events (cumulative, all-time). "
+        f"Full breakdown by {kind} (busiest first): {breakdown}."
+    )
 
 
 def _grounded_counts_from_result(tool_name: str, result: dict) -> set[int]:
