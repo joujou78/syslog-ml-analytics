@@ -428,6 +428,7 @@ def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | No
     if (
         history and _is_bare_followup(question)
         and not _is_wireless_specific(question)
+        and not _needs_multiple_data_points(question)
         and _detect_anomaly_reason(history[-1].question) is not None
     ):
         # The wireless-specific exclusion applies here too: inheriting the
@@ -442,6 +443,18 @@ def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | No
         # wireless-specific question -- the general agent loop (now able to
         # fuzzy-resolve `program` for a question like this) is a better fit
         # than a fixed anomaly category that doesn't cover it.
+        #
+        # The comparison exclusion (_needs_multiple_data_points) is the same
+        # idea for a different kind of new information: confirmed live,
+        # "compare yesterday and today" right after "...with ethernet
+        # flapping" inherited interface_flapping (it's bare and not
+        # wireless-specific) and answered with the SAME all-time cumulative
+        # number as before, silently ignoring the comparison entirely --
+        # anomaly_summary has no time-scoping at all, so it can never
+        # actually honor a comparison request regardless of which reason is
+        # in play. A question that clearly wants two data points compared
+        # is adding new information just as much as a correction does, so
+        # it's excluded here the same way, left for the general loop.
         resolved, _note = _resolve_anomaly_reason(question)
         return resolved or _detect_anomaly_reason(history[-1].question)
     return None
