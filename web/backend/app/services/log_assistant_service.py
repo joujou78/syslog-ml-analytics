@@ -2517,7 +2517,17 @@ async def _execute_tool(
         }, []
 
     if name == "count_events":
-        count, hostname_note = await _count_events_resolving_hostname(
+        # _count_events_resolving_hostname always returns a 3-tuple
+        # (count, effective_hostname, note) -- confirmed live as a severe,
+        # pre-existing bug: unpacking into only 2 names here raised
+        # "ValueError: too many values to unpack" on EVERY count_events
+        # tool call, unconditionally, regardless of arguments. The
+        # resolved hostname itself isn't needed again after this one-off
+        # call (unlike the period-comparison call sites elsewhere in this
+        # file, which reuse it across repeated calls for the same
+        # hostname), so it's discarded here, same as before this fix in
+        # effect -- only the unpacking arity was wrong.
+        count, _resolved_hostname, hostname_note = await _count_events_resolving_hostname(
             ch_client,
             hostname=arguments.get("hostname"),
             source_ip=arguments.get("source_ip"),
