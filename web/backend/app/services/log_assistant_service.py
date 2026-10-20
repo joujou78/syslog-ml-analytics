@@ -1446,6 +1446,19 @@ _INTERFACE_FLAPPING_CAVEAT = (
     "wireless-specific count, regardless of how the question was phrased."
 )
 
+# Confirmed live: "top n for today with ethernet flapping" silently answered
+# with the all-time cumulative total, completely ignoring "today" -- not a
+# bug in the force-resolve logic, but an undisclosed one: anomaly_summary
+# has no time-range parameter at all (by design, matching the Anomaly
+# Summary page's own semantics -- see its module docstring), so a named
+# time period in the question can never actually be honored by this tool,
+# whichever path reaches it. Silently answering a DIFFERENT question than
+# the one asked is worse than answering the real one with a clear caveat.
+_ANOMALY_SUMMARY_ALL_TIME_CAVEAT = (
+    "Note: anomaly_summary has no time-scoping -- the number above is a cumulative, all-time "
+    "total, not limited to the time period named in the question."
+)
+
 
 def _annotate_resolved_reason(reason: str, note: str | None) -> tuple[str, str | None]:
     if reason == "interface_flapping":
@@ -2915,6 +2928,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 answer = _anomaly_summary_plain_answer(result)
                 if result.get("reason") == "interface_flapping":
                     answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
+                if single_period or comparison_periods:
+                    answer += f"\n\n({_ANOMALY_SUMMARY_ALL_TIME_CAVEAT})"
                 return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
             # Confirmed on net-flow: the wrong-tool redirect above works,
             # but only AS FAR AS forcing a retry -- if the model, instead of
@@ -3444,6 +3459,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 answer = _anomaly_summary_plain_answer(result)
                 if result.get("reason") == "interface_flapping":
                     answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
+                if single_period or comparison_periods:
+                    answer += f"\n\n({_ANOMALY_SUMMARY_ALL_TIME_CAVEAT})"
                 return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
     # Exhausted MAX_TOOL_ITERATIONS without a plain-text final answer --
