@@ -1977,7 +1977,18 @@ def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: st
     top = rows[0]
     label = top.get("vendor") if is_vendor else top.get("hostname")
     count = top.get("event_count")
-    return f"The top {kind} for {qualifier} is {label}, with {count} matching events (cumulative, all-time)."
+    # The single top entry answers "which X has the MOST" but not "what
+    # X's are affected at all" -- confirmed live as a real, distinct
+    # question ("if i want to know the type of devices that has this
+    # disconnections"). `rows` already holds the full merged-and-sorted
+    # breakdown (see _resolve_concept_ranking), so showing all of it costs
+    # nothing extra and answers both questions in one response instead of
+    # requiring a second, differently-phrased round trip.
+    breakdown = "; ".join(f"{(r.get('vendor') if is_vendor else r.get('hostname'))}: {r.get('event_count')}" for r in rows)
+    return (
+        f"The top {kind} for {qualifier} is {label}, with {count} matching events (cumulative, all-time). "
+        f"Full breakdown by {kind} (busiest first): {breakdown}."
+    )
 
 
 async def _resolve_concept_count(
