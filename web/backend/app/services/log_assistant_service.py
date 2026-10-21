@@ -2888,9 +2888,26 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # own -- rather than just the absence of a "wants rows" phrase; see
     # _is_bare_followup's docstring for why a negative-only exclusion list
     # already proved insufficient once.
+    #
+    # A third instance of that exact lesson, confirmed live on net-flow:
+    # "top noisiest device today" is 4 words, so _is_bare_followup's
+    # word-count heuristic calls it bare -- but it has real, standalone
+    # ranking intent of its own ('top'/'noisiest'), not a topic-free
+    # continuation like "and yesterday?". enforce_count_tool fired anyway,
+    # and the force-resolve backstop below answered with "the hostname
+    # ...today is 0" -- a device carried over from unrelated earlier
+    # conversation history, not even a ranking result, for a question that
+    # should have gone to list_devices/anomaly_summary entirely. Excluded
+    # unconditionally, the same way _wants_log_rows already is: a ranking
+    # question is never this gate's job, regardless of which positive
+    # signal (count language, comparison, or bare word count) would
+    # otherwise have triggered it -- see _wants_ranking and the
+    # _detect_anomaly_reason-based forcing mechanism below, which is the
+    # actual right place for ranking intent to be handled.
     enforce_count_tool = bool(
         (comparison_periods or single_period)
         and not _wants_log_rows(query.question)
+        and not _wants_ranking(query.question)
         and (needs_multiple or _wants_count(query.question) or _is_bare_followup(query.question))
     )
     # Same idea as enforce_count_tool, for "which device/vendor has the most
