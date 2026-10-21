@@ -3177,7 +3177,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 continue
             if (
                 successful_tool_calls == 0 and not zero_tool_nudged
-                and (_wants_ranking(query.question) or _wants_count(query.question) or _wants_log_rows(query.question))
+                and (
+                    _wants_ranking(query.question) or _wants_count(query.question)
+                    or _wants_log_rows(query.question)
+                    or single_period or comparison_periods or needs_multiple
+                )
             ):
                 # Gated on the question's own shape actually needing real
                 # data (same ranking/count/rows markers used elsewhere in
@@ -3185,6 +3189,28 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 # genuinely needs no tool must not pay for an extra,
                 # expensive round-trip on this CPU-only model just because
                 # it happened not to call one.
+                #
+                # single_period/comparison_periods/needs_multiple added as
+                # their own, independent positive signals -- confirmed live
+                # on net-flow as a real gap, not hypothetical: "what about
+                # the devices that showed wireless disconnections today" has
+                # none of the three marker-based signals above (no
+                # "most"/"top", no "how many", no "show me"), so this nudge
+                # never fired when the model skipped tool-calling entirely
+                # and answered with two fully invented per-device counts
+                # (123, 456) -- no tool call at all, so grounded_counts was
+                # empty and the count-claim grounding check below never even
+                # ran (its own condition requires grounded_counts to be
+                # non-empty, same gap _TOOL_NAMES/claimed_identifiers exists
+                # to cover for a narrated-fake-trace answer, but that check
+                # only fires when the answer names an identifier-shaped
+                # token, not a bare number). single_period/comparison_periods
+                # are already deterministic, general evidence this question
+                # concerns real, time-scoped log data -- not another narrow
+                # per-phrase marker list, which this file has already had to
+                # extend three times over for the same underlying reason
+                # (_wants_log_rows, then the topical/semantic_search
+                # exclusion, then _wants_ranking in enforce_count_tool).
                 zero_tool_nudged = True
                 messages.append(message)
                 messages.append({
