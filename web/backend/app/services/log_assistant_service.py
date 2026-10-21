@@ -1330,26 +1330,88 @@ def _describe_trend(
 
 
 def _describe_filter_scope(filter_args: dict) -> str | None:
-    """Human-readable summary of which device/vendor a deterministic
-    override's count is actually scoped to, for folding into the
-    instruction the override hands back to the model. Confirmed as a real
-    gap: scoped to source_ip=172.20.17.68 via an explicit UI filter (a
-    real, grounded, correctly-filtered count), the model's own final
-    answer still phrased it as "events on the network today" -- implying
-    unfiltered -- because nothing in the override's result told it this
-    was scoped to one device rather than the whole network. Returns None
-    when nothing scopes the query (a genuine network-wide count), so the
-    caller can state that plainly instead of naming an empty scope."""
+    """Human-readable summary of which device/vendor/keyword/etc. a
+    deterministic override's count is actually scoped to, for folding into
+    the instruction the override hands back to the model (or, for
+    _period_override_plain_answer below, directly into the final answer
+    text itself). Confirmed as a real gap: scoped to source_ip=
+    172.20.17.68 via an explicit UI filter (a real, grounded, correctly-
+    filtered count), the model's own final answer still phrased it as
+    "events on the network today" -- implying unfiltered -- because
+    nothing in the override's result told it this was scoped to one
+    device rather than the whole network. Returns None when nothing
+    scopes the query (a genuine network-wide count), so the caller can
+    state that plainly instead of naming an empty scope.
+
+    keyword/program/severity were added alongside the original hostname/
+    source_ip/vendor fields after a second, distinct confirmed incident:
+    "what about the devices today" (a bare follow-up) correctly inherited
+    only the device identity from the prior turn -- by design, a bare
+    follow-up's filter is replaced ENTIRELY with just that one identity,
+    see _filter_args_for_period_override -- so the real count_events call
+    behind it carried no keyword filter at all. But the model's own final
+    restatement invented "with the keyword 'disconnected'" anyway, drawn
+    from earlier conversation context rather than this call's actual
+    arguments -- a technically real, grounded number (it IS in
+    grounded_counts) described as measuring something it never actually
+    filtered by, which the existing count-claim grounding check cannot
+    catch (it only verifies a claimed NUMBER appears somewhere in
+    grounded_counts, not what that number is claimed to represent).
+    Covering keyword/program/severity here means a deterministic override
+    that MEANT to disclose "keyword=X" now does so accurately -- but the
+    real, structural fix for the case where the override carried NO
+    keyword at all is _period_override_plain_answer bypassing the model's
+    own restatement entirely, the same lesson _anomaly_summary_plain_answer
+    already drew for a different tool."""
     parts = [
         f"{field}={value}"
         for field, value in (
             ("hostname", filter_args.get("hostname")),
             ("source_ip", filter_args.get("source_ip")),
             ("vendor", filter_args.get("vendor")),
+            ("keyword", filter_args.get("keyword")),
+            ("program", filter_args.get("program")),
+            ("severity", filter_args.get("severity")),
         )
         if value
     ]
     return ", ".join(parts) if parts else None
+
+
+def _period_override_plain_answer(
+    filter_args: dict,
+    labeled_counts: list[dict],
+    comparison_periods: list[tuple[str, datetime, datetime]] | None,
+    hostname_resolution_note: str | None,
+) -> str:
+    """Builds the final answer directly from a resolved count_events period
+    override (a single named period, or a comparison of several),
+    bypassing any further model call entirely -- same rationale, and
+    closing the same class of bug, as _anomaly_summary_plain_answer:
+    asking the model to merely restate an already-known, exact number
+    adds no information and is pure latency/reliability risk, but here
+    confirmed live as actively MISLEADING, not just slow -- see
+    _describe_filter_scope's docstring for the exact incident this
+    closes ("what about the devices today" answered a real, correctly-
+    scoped-to-hostname-only count as if it were also keyword-scoped,
+    which it never was). Building the text ourselves from filter_args/
+    labeled_counts means it can never claim a scope broader than what
+    was actually queried -- there's no model restatement step left in
+    which to invent one."""
+    scope = _describe_filter_scope(filter_args)
+    scope_text = f"scoped to {scope}" if scope else "for the whole network (no device/vendor/keyword filter applied)"
+    if len(labeled_counts) == 1:
+        text = f"The count of events {scope_text}, for {labeled_counts[0]['period']}, is {labeled_counts[0]['count']}."
+    else:
+        breakdown = "; ".join(f"{lc['period']}: {lc['count']}" for lc in labeled_counts)
+        text = f"The counts of events {scope_text}, for each period compared: {breakdown}."
+    if hostname_resolution_note:
+        text += f" ({hostname_resolution_note})"
+    if comparison_periods:
+        trend = _describe_trend(labeled_counts, comparison_periods)
+        if trend:
+            text += f" {trend}"
+    return text
 
 
 def _filter_args_for_period_override(
@@ -3121,29 +3183,20 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 if hostname_hint:
                     known_identifiers.add(hostname_hint)
                     filter_args["hostname"] = hostname_hint
-                messages.append(message)
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You answered without calling count_events for this question. Here are the "
-                        f"exact, already-verified counts instead: {json.dumps(labeled_counts)}"
-                        + (
-                            f" -- scoped to {_describe_filter_scope(filter_args)}, say so explicitly, "
-                            "not the whole network, and do not mention any OTHER device, IP, or filter"
-                            if _describe_filter_scope(filter_args) else
-                            " -- for the WHOLE NETWORK (no device/vendor filter applied), say so "
-                            "explicitly, do not attribute it to any single device"
-                        )
-                        + (f" {hostname_resolution_note}" if hostname_resolution_note else "")
-                        + ". State these exactly as given -- do not call any tool again, and do not "
-                        "state a different number."
-                        + (
-                            f" For any increase/decrease/trend claim, use ONLY this pre-computed figure, "
-                            f"stated exactly: {_describe_trend(labeled_counts, comparison_periods)}"
-                            if comparison_periods and _describe_trend(labeled_counts, comparison_periods) else ""
-                        )
-                    ),
-                })
+                # Answered directly, bypassing a further model round-trip
+                # entirely -- see _period_override_plain_answer's docstring
+                # for the confirmed live incident this closes: handing this
+                # back to the model as a "state this exactly, don't call
+                # again" instruction (the previous approach) still let it
+                # invent an untrue keyword scope on top of an otherwise
+                # real, grounded number, the same "prompting alone isn't
+                # enough" lesson _anomaly_summary_plain_answer already drew
+                # for a different tool -- and here the false claim was about
+                # the number's SCOPE, not its value, so the existing count-
+                # claim grounding check (which only verifies a claimed
+                # NUMBER appears in grounded_counts) could never have caught
+                # it either way.
+                answer = _period_override_plain_answer(filter_args, labeled_counts, comparison_periods, hostname_resolution_note)
                 # Logs the actual filter_args/hostname_hint used, same reasoning
                 # as the other two overrides' logging fix -- this exact gap made
                 # Test 12 unverifiable from the log alone (no way to tell whether
@@ -3154,7 +3207,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     "filter=%s hostname_hint=%s -> %s",
                     filter_args, hostname_hint, labeled_counts,
                 )
-                continue
+                return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
             # Confirmed on net-flow: a comparison question got "answered"
             # after a single tool call, with the second data point invented
             # out of nothing. Rather than trust the model's own judgment
@@ -3425,29 +3478,20 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     grounded_counts.add(count)
                     data_tool_calls += 1
                     successful_tool_calls += 1
-                scope = _describe_filter_scope(filter_args)
-                trend = _describe_trend(labeled_counts, comparison_periods)
-                result = {
-                    "note": (
-                        "These are the exact, already-verified counts for every period being compared, "
-                        f"scoped to {scope} -- say explicitly that they're for {scope}, not the whole "
-                        "network, and do not mention any OTHER device, IP, or filter. "
-                        if scope else
-                        "These are the exact, already-verified counts for every period being compared, "
-                        "for the WHOLE NETWORK (no device/vendor filter applied) -- say so explicitly, "
-                        "do not attribute them to any single device. "
-                    ) + (f"{hostname_resolution_note} " if hostname_resolution_note else "") + (
-                        "State them exactly as labeled -- do not call count_events again for this "
-                        "comparison, and do not swap or relabel which number belongs to which period."
-                        + (f" For any increase/decrease/trend claim, use ONLY this pre-computed figure, "
-                           f"stated exactly: {trend}" if trend else "")
-                    ),
-                    "results": labeled_counts,
-                }
-                hits: list[LogHit] = []
                 known_identifiers |= {
                     v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
                 }
+                # Answered directly, bypassing a further model round-trip --
+                # see _period_override_plain_answer's docstring (the
+                # identical lesson applied to the single-period override
+                # below, and to _anomaly_summary_plain_answer for a
+                # different tool entirely): handing this back to the model
+                # as a "state this exactly" instruction leaves room for it
+                # to invent a scope claim (e.g. a keyword) beyond what was
+                # actually queried, which the count-claim grounding check
+                # can't catch since it only verifies the NUMBER, not what
+                # the number is claimed to represent.
+                answer = _period_override_plain_answer(filter_args, labeled_counts, comparison_periods, hostname_resolution_note)
                 # Logs the ACTUAL filter/windows used (filter_args + comparison_periods),
                 # not just the model's raw, now-discarded `arguments` -- confirmed on
                 # net-flow that logging only `arguments` here was actively misleading
@@ -3458,10 +3502,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 log.info(
                     "Log Assistant tool call OVERRIDDEN (deterministic period comparison): "
                     "model_args=%s -> filter=%s periods=%s -> %s",
-                    arguments, filter_args, comparison_periods, result,
+                    arguments, filter_args, comparison_periods, labeled_counts,
                 )
-                messages.append({"role": "tool", "content": json.dumps(result)})
-                continue
+                return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
             if fn["name"] == "count_events" and single_period and not periods_resolved:
                 # Same idea as the comparison override above, for a question
@@ -3496,69 +3539,37 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 grounded_counts.add(count)
                 data_tool_calls += 1
                 successful_tool_calls += 1
-                scope = _describe_filter_scope(filter_args)
-                result = {
-                    "note": (
-                        "This is the exact, already-verified count for the period asked about, "
-                        f"scoped to {scope}. Say explicitly that it's for {scope}, not the whole "
-                        "network, and do not mention any OTHER device, IP, or filter. "
-                        + (f"{hostname_note} " if hostname_note else "")
-                        + "State the number exactly as given."
-                        if scope else
-                        "This is the exact, already-verified count for the period asked about, "
-                        "for the WHOLE NETWORK (no device/vendor filter applied). Say so explicitly "
-                        "-- do not attribute it to any single device. State the number exactly as given."
-                    ),
-                    "period": label,
-                    "count": count,
-                }
-                hits = []
                 known_identifiers |= {
                     v for v in (filter_args.get("hostname"), filter_args.get("source_ip")) if isinstance(v, str) and len(v) >= 3
                 }
+                # Answered directly, bypassing a further model round-trip --
+                # see _period_override_plain_answer's docstring for the
+                # confirmed live incident this closes ("what about the
+                # devices today" restated a real, hostname-only-scoped
+                # count as if it were also keyword-scoped, which it never
+                # was -- the same "state this exactly" instruction left
+                # room to invent a scope claim the count-claim grounding
+                # check can't catch, since it only verifies the number).
+                labeled_counts = [{"period": label, "count": count}]
+                answer = _period_override_plain_answer(filter_args, labeled_counts, None, hostname_note)
                 # See the comparison override above for why this logs the actual
                 # filter_args/period_start/period_end used, not just the model's
                 # raw (discarded) `arguments`.
                 log.info(
                     "Log Assistant tool call OVERRIDDEN (deterministic single period): "
                     "model_args=%s -> filter=%s period=%s(%s to %s) -> %s",
-                    arguments, filter_args, label, period_start, period_end, result,
+                    arguments, filter_args, label, period_start, period_end, labeled_counts,
                 )
-                messages.append({"role": "tool", "content": json.dumps(result)})
-                continue
+                return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
-            if fn["name"] == "count_events" and periods_resolved:
-                # Confirmed on net-flow that the "do not call again" note above
-                # isn't always enough: the model called count_events a THIRD
-                # time anyway (with no hostname filter at all -- a network-wide
-                # total over an unrelated window) and then substituted THAT
-                # number in place of the correct, already-labeled "today" value
-                # in its final answer. Refusing to execute any further
-                # count_events call removes this path entirely rather than
-                # trying to catch a bad substitution after the fact in the
-                # final answer's text.
-                # Re-states the scope description here too, not just where periods
-                # were first resolved -- confirmed on net-flow that it doesn't
-                # survive the model making further (refused) tool-call attempts
-                # afterward: a comparison scoped to vendor=mikrotik still said "on
-                # the network" in its FINAL answer once this refusal fired in
-                # between, because the original scope instruction was by then
-                # several messages back. Repeating it right before the model's
-                # last chance to answer keeps it close enough to actually stick.
-                resolved_scope = _describe_filter_scope(filter_args)
-                result = {
-                    "error": (
-                        "Already answered -- use the labeled today/yesterday/this-week results already "
-                        "given above"
-                        + (f" (scoped to {resolved_scope}, say so explicitly)" if resolved_scope else
-                           " (for the WHOLE NETWORK, say so explicitly)")
-                        + ". Do not call count_events again for this question."
-                    ),
-                }
-                hits = []
-                log.info("Log Assistant tool call REFUSED (periods already resolved): %s(%s)", fn["name"], arguments)
-                messages.append({"role": "tool", "content": json.dumps(result)})
-                continue
+            # A "count_events called again after periods_resolved" refusal
+            # branch used to live here. It's gone, not just moved: all
+            # three places that set periods_resolved = True (above, and the
+            # comparison/single-period overrides below) now `return` the
+            # final answer directly instead of `continue`-ing the loop (see
+            # _period_override_plain_answer) -- so a retry within the SAME
+            # ask() call can no longer happen at all, and the refusal branch
+            # had become unreachable dead code once that change landed.
 
             if fn["name"] == "anomaly_summary" and anomaly_summary_executed_this_turn:
                 result = {
