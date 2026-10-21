@@ -2182,9 +2182,25 @@ def _sanitize_equality_filters(args: dict) -> dict:
     non-zero count silently came back 0. Moved to `source_ip` instead
     whenever `hostname` is IP-shaped and `source_ip` isn't already set to
     something else (never overwrites a source_ip the model separately,
-    correctly provided). Returns a copy with any such field moved or
-    cleared to None; everything else passes through unchanged."""
+    correctly provided). (5) the model names the argument `device` instead
+    of the tool schema's actual parameter name `hostname` -- confirmed:
+    asked "what about the devices that showed wireless disconnections
+    today" (a question whose own text says "devices"), the model's
+    count_events call carried `device='ND_SAIDA1-LGB[SAIDA] | IBL[SAIDA]'`.
+    `device` isn't a real parameter (see the count_events tool schema --
+    only `hostname` exists), so it was silently ignored entirely: the call
+    executed completely UNSCOPED, returning a whole-network count instead
+    of the one real per-device count that was actually available, and nothing
+    downstream had any way to tell the model's filter intent had been lost.
+    Promoted into `hostname` whenever `hostname` isn't already set to a
+    real value of its own (never overwrites a correctly-named hostname the
+    model also provided). Returns a copy with any such field moved,
+    promoted, or cleared to None; everything else passes through
+    unchanged."""
     out = dict(args)
+    device_alias = out.pop("device", None)
+    if _is_real_filter_value(device_alias) and not _is_real_filter_value(out.get("hostname")):
+        out["hostname"] = device_alias
     hostname = out.get("hostname")
     if isinstance(hostname, str) and _IPV4_SHAPE_RE.match(hostname.strip()):
         # Always cleared -- an IP-shaped value is never a valid `hostname`
