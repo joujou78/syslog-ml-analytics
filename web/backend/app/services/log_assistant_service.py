@@ -1565,6 +1565,26 @@ def _parse_tool_bool(value) -> bool:
 # other), not a reason to skip validating against it.
 _VALID_SEVERITIES = frozenset({"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"})
 
+# Used by _sanitize_equality_filters to ground a model-supplied severity
+# filter against the actual question text -- confirmed live as a real
+# fabrication, not a hypothetical one: "for mikrotik only" (no severity
+# word anywhere in it) still produced a count_events call with
+# severity='crit'. Covers the short syslog-standard spellings and their
+# plain-English equivalents someone might actually type ("critical" for
+# 'crit', "warn"/"warnings" for 'warning', etc.) -- not every conceivable
+# phrasing, just enough that a real, intentional severity mention in the
+# question is recognized as grounding its own value.
+_SEVERITY_QUESTION_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "emerg": ("emerg", "emergency"),
+    "alert": ("alert",),
+    "crit": ("crit",),
+    "err": ("err", "error"),
+    "warning": ("warn",),
+    "notice": ("notice",),
+    "info": ("info",),
+    "debug": ("debug",),
+}
+
 # Mirrors web/frontend/src/pages/Logs.tsx's ANOMALY_REASON_OPTIONS -- the
 # real, fixed set of values the `anomaly_reasons` array column actually
 # holds (see ml/anomaly_signals.py). Same duplication trade-off as
@@ -2272,7 +2292,7 @@ def _is_real_filter_value(value) -> bool:
     return isinstance(value, str) and value.strip().lower() not in _PLACEHOLDER_STRINGS
 
 
-def _sanitize_equality_filters(args: dict) -> dict:
+def _sanitize_equality_filters(args: dict, question: str | None = None) -> dict:
     """Guards confirmed net-flow failure modes in the model's own tool-call
     arguments, none caught by _parse_tool_bool/_parse_tool_int since all
     are valid-shaped strings, not an obviously-wrong type:
@@ -2316,9 +2336,21 @@ def _sanitize_equality_filters(args: dict) -> dict:
     downstream had any way to tell the model's filter intent had been lost.
     Promoted into `hostname` whenever `hostname` isn't already set to a
     real value of its own (never overwrites a correctly-named hostname the
-    model also provided). Returns a copy with any such field moved,
-    promoted, or cleared to None; everything else passes through
-    unchanged."""
+    model also provided). (6) a severity filter the question never asked
+    for at all -- confirmed: asked "for mikrotik only" (no severity word
+    anywhere in the question, and nothing in this codebase ever legitimately
+    carries a severity filter across turns the way hostname/anomaly-reason
+    do), the model's count_events call carried severity='crit' out of
+    nowhere, silently narrowing an otherwise-answerable question down to
+    critical-only events and all but guaranteeing a false/incomplete zero
+    on top of this same incident's other problems. Unlike (1) above (an
+    invalid severity VALUE), this is a valid value with no basis in the
+    actual question -- grounded against `question` (only when given; a
+    caller that can't supply one keeps the pre-existing, ungrounded
+    behavior rather than being forced to guess) via a small word/synonym
+    list, since there's no way to infer "the user meant this severity"
+    from nothing. Returns a copy with any such field moved, promoted, or
+    cleared to None; everything else passes through unchanged."""
     out = dict(args)
     device_alias = out.pop("device", None)
     if _is_real_filter_value(device_alias) and not _is_real_filter_value(out.get("hostname")):
@@ -2336,6 +2368,11 @@ def _sanitize_equality_filters(args: dict) -> dict:
     severity = out.get("severity")
     if isinstance(severity, str) and severity.strip().lower() not in _VALID_SEVERITIES:
         out["severity"] = None
+    severity = out.get("severity")
+    if isinstance(severity, str) and severity.strip() and question is not None:
+        synonyms = _SEVERITY_QUESTION_SYNONYMS.get(severity.strip().lower(), ())
+        if not any(s in question.lower() for s in synonyms):
+            out["severity"] = None
     for field in ("hostname", "source_ip", "vendor", "program", "keyword"):
         value = out.get(field)
         if isinstance(value, str) and value.strip().lower() in _PLACEHOLDER_STRINGS:
@@ -2575,11 +2612,15 @@ async def _aggregate_events_resolving_hostname(
 
 
 async def _execute_tool(
-    name: str, arguments: dict, os_client: OpenSearch, ch_client: Client, db: AsyncSession,
+    name: str, arguments: dict, os_client: OpenSearch, ch_client: Client, db: AsyncSession, question: str | None = None,
 ) -> tuple[dict, list[LogHit]]:
     """Returns (JSON-able result for the model, LogHits to surface as this
-    response's cited sources -- only semantic_search produces any)."""
-    arguments = _sanitize_equality_filters(arguments)
+    response's cited sources -- only semantic_search produces any). question
+    is the user's current-turn question text, passed through to
+    _sanitize_equality_filters so it can ground a model-supplied severity
+    filter against it -- optional (defaults to None, pre-existing
+    ungrounded behavior) since not every caller has it on hand."""
+    arguments = _sanitize_equality_filters(arguments, question)
     if name == "list_devices":
         hostname_filter = arguments.get("hostname")
         if not _is_real_filter_value(hostname_filter):
@@ -3164,7 +3205,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 result, _ = await _execute_tool(
                     "anomaly_summary",
                     {"reason": forced_anomaly_reason, "group_by": "vendor" if is_vendor else "device"},
-                    os_client, ch_client, db,
+                    os_client, ch_client, db, query.question,
                 )
                 data_tool_calls += 1
                 successful_tool_calls += 1
@@ -3203,7 +3244,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             if enforce_count_tool and not periods_resolved:
                 periods_resolved = True
                 filter_args = _sanitize_equality_filters(
-                    _filter_args_for_period_override(query, attempted_filter_args)
+                    _filter_args_for_period_override(query, attempted_filter_args), query.question,
                 )
                 # The known_identifiers sweep is a last resort, deliberately NOT
                 # consulted when source_ip/vendor already scope this query: the
@@ -3516,7 +3557,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
                     query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
-                ))
+                ), query.question)
                 labeled_counts = []
                 hostname_resolution_note = None
                 for label, period_start, period_end in comparison_periods:
@@ -3582,7 +3623,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
                     query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
-                ))
+                ), query.question)
                 count, resolved_hostname, hostname_note = await _count_events_resolving_hostname(
                     ch_client,
                     hostname=filter_args.get("hostname"),
@@ -3643,7 +3684,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 messages.append({"role": "tool", "content": json.dumps(result)})
                 continue
 
-            result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client, db)
+            result, hits = await _execute_tool(fn["name"], arguments, os_client, ch_client, db, query.question)
             # Temporary diagnostic: the only way to see what the model actually
             # asked for and what came back, since the old plain access-log line
             # (POST /api/log-assistant/ask 200) hides both -- a 200 here says
