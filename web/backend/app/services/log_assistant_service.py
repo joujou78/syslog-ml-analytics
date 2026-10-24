@@ -394,8 +394,35 @@ def _wants_ranking(question: str) -> bool:
     return any(marker in lowered for marker in _RANKING_MARKERS)
 
 
+# Confirmed as a real, reproduced bug on net-flow: "top n devices with
+# wireless disconnections vendor mikrotik and mimosa" explicitly asks for
+# a per-DEVICE ranking ("devices"), but a bare "vendor" IN question was
+# the entire check before this fix -- "vendor" here names a FILTER clause
+# ("vendor mikrotik and mimosa"), not a request to group by vendor at
+# all, and a naive substring check can't tell the two apart. The answer
+# wrongly grouped by vendor instead of device, and showed only a single
+# vendor entry instead of the per-device breakdown actually asked for.
+#
+# An explicit "device"/"devices" mention is treated as a stronger,
+# unambiguous signal than a bare "vendor" substring: a question naming
+# BOTH is overwhelmingly more likely to mean "devices, filtered/scoped by
+# a named vendor" than "group by vendor" -- the genuine group-by-vendor
+# phrasing is covered by _VENDOR_GROUPING_MARKERS below regardless of
+# whether "device" also incidentally appears, so this doesn't trade one
+# false positive for another.
+_VENDOR_GROUPING_MARKERS = (
+    "which vendor", "top vendor", "per vendor", "each vendor",
+    "busiest vendor", "vendor has the most", "vendor with the most",
+)
+
+
 def _wants_vendor_grouping(question: str) -> bool:
-    return "vendor" in question.lower()
+    lowered = question.lower()
+    if any(marker in lowered for marker in _VENDOR_GROUPING_MARKERS):
+        return True
+    if "device" in lowered:
+        return False
+    return "vendor" in lowered
 
 
 def _detect_anomaly_reason(question: str, history: list["ConversationTurn"] | None = None) -> str | None:
