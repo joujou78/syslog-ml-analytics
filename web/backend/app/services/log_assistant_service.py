@@ -2037,7 +2037,7 @@ async def _choose_concept_keyword(concept_question: str, candidates: list[str], 
     return raw if raw in candidates else None
 
 
-async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str) -> tuple[str, list[str]] | None:
+async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_question: str) -> tuple[str, list[str]] | None:
     """The shared discovery step behind both _resolve_concept_ranking and
     _resolve_concept_count: semantic_search for real examples, reduce to
     candidates that actually recur, then a narrow constrained choice if
@@ -2055,8 +2055,41 @@ async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str
     "vendor" then won as the sole dominant candidate -- answering with a
     nonsense keyword scored by its own search prompt's wording, not the
     actual concept asked about. Stripping to "deauth attacks" first keeps
-    both the embedding and the BM25 clause focused on the real topic."""
-    search_phrase = _extract_concept(concept_question) or concept_question
+    both the embedding and the BM25 clause focused on the real topic.
+
+    Also strips any REAL vendor NAME mentioned in the question (fetched
+    dynamically from log_search_service.get_filter_options, the same
+    "no hardcoded enum" approach _resolve_program_fuzzy already uses for
+    program values -- there's no fixed list of vendors to hardcode
+    against) before extracting the concept. Confirmed live as a second,
+    distinct instance of the exact same gap the paragraph above already
+    closed for the generic word "vendor" itself: "top n devices with
+    wireless disconnections vendor mikrotik and mimosa" discovered
+    keyword='wireless' (zero real matches, a dead end) where the
+    otherwise-identical "top device with wireless disconnections" (no
+    vendor clause) reliably discovers keyword='disconnected' (real,
+    substantial data). _GENERIC_QUESTION_WORDS already strips "vendor"
+    itself, but "mikrotik"/"mimosa" are real words in this dataset's own
+    vocabulary, not generic scaffolding -- they survived into the BM25
+    search phrase and skewed retrieval toward a narrower, differently-
+    worded sample, changing which candidate looked dominant. Note this
+    does NOT make the ranking/count itself vendor-scoped -- neither
+    _resolve_concept_ranking nor _resolve_concept_count take a vendor
+    filter at all, so "vendor mikrotik and mimosa" is only prevented
+    from corrupting keyword discovery here, not actually honored as a
+    filter; that's a separate, not-yet-built capability."""
+    vendor_words: set[str] = set()
+    try:
+        options = await asyncio.to_thread(log_search_service.get_filter_options, ch_client)
+        vendor_words = {v.lower() for v in options.vendors if v}
+    except Exception:
+        log.exception("Concept discovery vendor lookup failed -- continuing without vendor-name stripping")
+    question_for_search = concept_question
+    if vendor_words:
+        kept = [w for w in concept_question.split() if w.strip(".,!?;:").lower() not in vendor_words]
+        if kept:
+            question_for_search = " ".join(kept)
+    search_phrase = _extract_concept(question_for_search) or _extract_concept(concept_question) or concept_question
     try:
         hits = await semantic_search(os_client, LogAssistantQuery(question=search_phrase[:1000], limit=15))
     except Exception:
@@ -2089,7 +2122,7 @@ async def _discover_concept_keyword(os_client: OpenSearch, concept_question: str
 async def _resolve_concept_ranking(
     os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
 ) -> dict | None:
-    discovered = await _discover_concept_keyword(os_client, concept_question)
+    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question)
     if not discovered:
         return None
     keyword, programs = discovered
@@ -2161,7 +2194,7 @@ def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: st
 async def _resolve_concept_count(
     os_client: OpenSearch, ch_client, concept_question: str, start: datetime, end: datetime,
 ) -> dict | None:
-    discovered = await _discover_concept_keyword(os_client, concept_question)
+    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question)
     if not discovered:
         return None
     keyword, programs = discovered
