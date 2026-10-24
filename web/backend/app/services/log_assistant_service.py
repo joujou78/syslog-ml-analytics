@@ -3715,7 +3715,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             }
             sources.extend(hits)
             messages.append({"role": "tool", "content": json.dumps(result)})
-            if fn["name"] == "anomaly_summary" and forced_anomaly_reason:
+            if fn["name"] == "anomaly_summary" and "error" not in result:
                 # Same reasoning as the tool-less force-resolve path above
                 # (see _anomaly_summary_plain_answer's docstring): the model
                 # called the right tool itself here, so the real answer is
@@ -3724,6 +3724,25 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 # this CPU-only model, confirmed repeatedly to sometimes cost
                 # minutes and push the request past the UI's timeout, for a
                 # step that adds no information.
+                #
+                # No longer gated on forced_anomaly_reason -- confirmed live
+                # as a real, reproduced bug once it was: "ethernet flapping"
+                # (not forced -- it's neither a ranking question nor a
+                # bare follow-up inheriting one, so forced_anomaly_reason
+                # was None) still had the model call anomaly_summary
+                # correctly ON ITS OWN, get back the real, correct
+                # breakdown -- and the model's EVENTUAL final answer was
+                # "It seems you've already received the answer through a
+                # previous call to anomaly_summary... feel free to ask!",
+                # essentially paraphrasing the SEPARATE "already answered"
+                # refusal message (from a second, redundant call the model
+                # also made) instead of ever restating the real data from
+                # its first, successful call. The exact "prompting alone
+                # isn't reliable" lesson this bypass exists for applies
+                # identically whether the right tool call was forced or
+                # the model's own correct choice -- there's no reason to
+                # trust the model's restatement in one case and not the
+                # other once the real data is already in hand either way.
                 answer = _anomaly_summary_plain_answer(result)
                 if result.get("reason") == "interface_flapping":
                     answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
