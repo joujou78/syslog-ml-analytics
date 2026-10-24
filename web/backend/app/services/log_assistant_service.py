@@ -2347,7 +2347,7 @@ def _is_real_filter_value(value) -> bool:
     return isinstance(value, str) and value.strip().lower() not in _PLACEHOLDER_STRINGS
 
 
-def _sanitize_equality_filters(args: dict, question: str | None = None) -> dict:
+async def _sanitize_equality_filters(args: dict, question: str | None = None, ch_client=None) -> dict:
     """Guards confirmed net-flow failure modes in the model's own tool-call
     arguments, none caught by _parse_tool_bool/_parse_tool_int since all
     are valid-shaped strings, not an obviously-wrong type:
@@ -2404,12 +2404,35 @@ def _sanitize_equality_filters(args: dict, question: str | None = None) -> dict:
     caller that can't supply one keeps the pre-existing, ungrounded
     behavior rather than being forced to guess) via a small word/synonym
     list, since there's no way to infer "the user meant this severity"
-    from nothing. Returns a copy with any such field moved, promoted, or
-    cleared to None; everything else passes through unchanged."""
+    from nothing. (7) a real VENDOR name put in `hostname`/`device`
+    instead of `vendor` -- confirmed: "for mikrotik only" (mikrotik is a
+    vendor, established throughout the whole conversation, never a real
+    device name in this dataset) had the model's count_events call carry
+    `device='MikroTik'`. (6)'s fix had already promoted that into
+    `hostname`, which then made _resolve_hostname_fuzzy's substring
+    search actually find and "resolve" it to some real but almost
+    certainly unrelated device whose hostname happens to literally
+    contain 'MikroTik' -- a confidently wrong scope, not an honest zero.
+    Checked against the real, current vendor list (ch_client, via
+    _real_vendor_names -- the same "no hardcoded enum" approach already
+    used for program values and for concept-keyword discovery) whenever
+    the resulting `hostname` exactly matches one (case-insensitive);
+    moved to `vendor` instead, clearing `hostname`, unless `vendor` is
+    already set to something else. Only runs when ch_client is given (a
+    caller that can't supply one keeps the pre-existing behavior rather
+    than being forced to guess). Returns a copy with any such field
+    moved, promoted, or cleared to None; everything else passes through
+    unchanged."""
     out = dict(args)
     device_alias = out.pop("device", None)
     if _is_real_filter_value(device_alias) and not _is_real_filter_value(out.get("hostname")):
         out["hostname"] = device_alias
+    hostname = out.get("hostname")
+    if ch_client is not None and isinstance(hostname, str) and hostname.strip() and not _is_real_filter_value(out.get("vendor")):
+        known_vendors = {v.lower() for v in await _real_vendor_names(ch_client)}
+        if hostname.strip().lower() in known_vendors:
+            out["vendor"] = hostname.strip()
+            out["hostname"] = None
     hostname = out.get("hostname")
     if isinstance(hostname, str) and _IPV4_SHAPE_RE.match(hostname.strip()):
         # Always cleared -- an IP-shaped value is never a valid `hostname`
@@ -2675,7 +2698,7 @@ async def _execute_tool(
     _sanitize_equality_filters so it can ground a model-supplied severity
     filter against it -- optional (defaults to None, pre-existing
     ungrounded behavior) since not every caller has it on hand."""
-    arguments = _sanitize_equality_filters(arguments, question)
+    arguments = await _sanitize_equality_filters(arguments, question, ch_client)
     if name == "list_devices":
         hostname_filter = arguments.get("hostname")
         if not _is_real_filter_value(hostname_filter):
@@ -3300,8 +3323,8 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # and require it to just restate them.
             if enforce_count_tool and not periods_resolved:
                 periods_resolved = True
-                filter_args = _sanitize_equality_filters(
-                    _filter_args_for_period_override(query, attempted_filter_args), query.question,
+                filter_args = await _sanitize_equality_filters(
+                    _filter_args_for_period_override(query, attempted_filter_args), query.question, ch_client,
                 )
                 # The known_identifiers sweep is a last resort, deliberately NOT
                 # consulted when source_ip/vendor already scope this query: the
@@ -3611,10 +3634,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 # that -- both numbers were individually real, from actual
                 # tool calls, so the grounding check alone didn't catch it).
                 periods_resolved = True
-                filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
+                filter_args = await _sanitize_equality_filters(_filter_args_for_period_override(
                     query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
-                ), query.question)
+                ), query.question, ch_client)
                 labeled_counts = []
                 hostname_resolution_note = None
                 for label, period_start, period_end in comparison_periods:
@@ -3677,10 +3700,10 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 # _detect_single_period's docstring for the full incident.
                 periods_resolved = True
                 label, period_start, period_end = single_period
-                filter_args = _sanitize_equality_filters(_filter_args_for_period_override(
+                filter_args = await _sanitize_equality_filters(_filter_args_for_period_override(
                     query,
                     {k: v for k, v in arguments.items() if k not in ("start", "end")},
-                ), query.question)
+                ), query.question, ch_client)
                 count, resolved_hostname, hostname_note = await _count_events_resolving_hostname(
                     ch_client,
                     hostname=filter_args.get("hostname"),
