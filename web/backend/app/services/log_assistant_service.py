@@ -2166,6 +2166,38 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
     return keyword, _significant_programs(hits)
 
 
+async def _real_vendor_names(ch_client) -> list[str]:
+    """The real, current vendor list (log_search_service.get_filter_options)
+    -- fetched dynamically rather than hardcoded, the same "no fixed enum"
+    approach already used for program values (_resolve_program_fuzzy) and
+    for stripping vendor names out of concept-keyword discovery
+    (_discover_concept_keyword). Returns [] on failure (logged) rather than
+    raising, so a transient ClickHouse hiccup degrades callers to "no
+    vendor filter" instead of breaking the whole request."""
+    try:
+        options = await asyncio.to_thread(log_search_service.get_filter_options, ch_client)
+        return [v for v in options.vendors if v]
+    except Exception:
+        log.exception("Vendor lookup failed -- continuing with no vendor filter")
+        return []
+
+
+def _vendors_mentioned_in(question: str, known_vendors: list[str]) -> list[str]:
+    """Which of the REAL, current vendor names (see _real_vendor_names) are
+    actually named in this question -- e.g. "...vendor mikrotik and
+    mimosa" -> ['mikrotik', 'mimosa']. Word-based (not substring), so a
+    vendor name that happens to be a substring of an unrelated word in the
+    question doesn't false-positive. Excludes _PLACEHOLDER_STRINGS even
+    though "unknown" is itself a real, stored vendor value in this
+    dataset (the fallback for an unidentified device) -- nobody types
+    "unknown" INTENDING to filter by that vendor, so treating a question
+    that happens to contain the word "unknown" for some unrelated reason
+    as a vendor filter would be a false positive, the same reasoning
+    _PLACEHOLDER_STRINGS already encodes everywhere else it's used."""
+    words = {w.strip(".,!?;:").lower() for w in question.split()}
+    return [v for v in known_vendors if v.lower() not in _PLACEHOLDER_STRINGS and v.lower() in words]
+
+
 async def _resolve_concept_ranking(
     os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
 ) -> dict | None:
@@ -2173,6 +2205,18 @@ async def _resolve_concept_ranking(
     if not discovered:
         return None
     keyword, programs = discovered
+    # Confirmed live: "top n devices with wireless disconnections vendor
+    # mikrotik and mimosa" previously had no way to actually SCOPE the
+    # ranking to those vendors at all -- b96f7af only stopped their names
+    # from corrupting keyword discovery, it never turned them into a
+    # filter. A real vendor named in the question is now applied as one,
+    # the same per-dimension-value, sequential-calls-then-merge pattern
+    # _significant_programs already uses for programs (one call per
+    # (program, vendor) pair rather than a single filtered call, so a
+    # program/vendor combination that only ranks highly once ITS OWN
+    # events are counted isn't silently lost the way a single combined
+    # query with the wrong assumptions could lose it).
+    vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
     group_key = "vendor" if is_vendor else "hostname"
     # One call PER significant program (never a single filtered call) --
     # see _significant_programs' docstring for the confirmed live incident
@@ -2191,15 +2235,16 @@ async def _resolve_concept_ranking(
     # ch_client's other concurrent-use site in _execute_tool). Every
     # program here shares this one ch_client, so they must run one at a
     # time regardless of how harmless concurrent reads might look.
-    per_program_rows = [
+    per_call_rows = [
         await asyncio.to_thread(
             log_search_service.aggregate_events, ch_client, group_by=[group_key], keyword=keyword,
-            program=p, start=_ALL_TIME_START, end=now, limit=log_search_service.AGGREGATE_MAX_LIMIT,
+            program=p, vendor=v, start=_ALL_TIME_START, end=now, limit=log_search_service.AGGREGATE_MAX_LIMIT,
         )
         for p in (programs or [None])
+        for v in (vendors or [None])
     ]
     totals: dict[str, int] = {}
-    for rows in per_program_rows:
+    for rows in per_call_rows:
         for row in rows:
             key = row.get(group_key)
             totals[key] = totals.get(key, 0) + row.get("event_count", 0)
@@ -2207,18 +2252,22 @@ async def _resolve_concept_ranking(
         ({group_key: k, "event_count": v} for k, v in totals.items()),
         key=lambda r: r["event_count"], reverse=True,
     )[:10]
-    return {"rows": merged, "keyword": keyword, "programs": programs}
+    return {"rows": merged, "keyword": keyword, "programs": programs, "vendors": vendors}
 
 
-def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, programs: list[str]) -> str:
+def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, programs: list[str], vendors: list[str] | None = None) -> str:
     # `programs` (the internal syslog `program` field value(s) actually
     # queried, e.g. 'wireless,info') is deliberately NOT shown here --
     # confirmed live as genuinely confusing to a user asking a plain
     # question ("why is there 'wireless,info'... it is not
     # comprehensible"). It's still logged (see the FORCE-RESOLVED log line
-    # in ask()) for anyone auditing what was actually matched.
+    # in ask()) for anyone auditing what was actually matched. `vendors`
+    # is the opposite case -- the user named it explicitly, so confirming
+    # the scope they asked for is expected, not confusing.
     kind = "vendor" if is_vendor else "device"
     qualifier = f"messages containing '{keyword}'"
+    if vendors:
+        qualifier += f" (vendor: {', '.join(vendors)})"
     if not rows:
         return f"No {kind} has any events matching {qualifier}."
     top = rows[0]
@@ -2245,23 +2294,29 @@ async def _resolve_concept_count(
     if not discovered:
         return None
     keyword, programs = discovered
+    # Same vendor-filter reasoning as _resolve_concept_ranking.
+    vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
     # Sum across every significant program, same reasoning as
     # _resolve_concept_ranking. Sequential, not asyncio.gather -- same
     # confirmed-live ch_client concurrency restriction as there (this was
     # in fact the exact call that raised the 500 in production the one
     # time this ran concurrently).
     counts = [
-        await asyncio.to_thread(log_search_service.count_events, ch_client, keyword=keyword, program=p, start=start, end=end)
+        await asyncio.to_thread(log_search_service.count_events, ch_client, keyword=keyword, program=p, vendor=v, start=start, end=end)
         for p in (programs or [None])
+        for v in (vendors or [None])
     ]
-    return {"count": sum(counts), "keyword": keyword, "programs": programs}
+    return {"count": sum(counts), "keyword": keyword, "programs": programs, "vendors": vendors}
 
 
-def _concept_count_plain_answer(count: int, keyword: str, programs: list[str], period_label: str | None) -> str:
+def _concept_count_plain_answer(count: int, keyword: str, programs: list[str], period_label: str | None, vendors: list[str] | None = None) -> str:
     # See _concept_ranking_plain_answer's comment -- `programs` is kept as
     # a parameter (logged by the caller) but deliberately left out of the
-    # user-facing text.
+    # user-facing text; `vendors` is shown since the user named it
+    # explicitly.
     qualifier = f"messages containing '{keyword}'"
+    if vendors:
+        qualifier += f" (vendor: {', '.join(vendors)})"
     period = f" {period_label}" if period_label else " (cumulative, all-time)"
     return f"There have been {count} events matching {qualifier}{period}."
 
@@ -3003,11 +3058,13 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         is_vendor = _wants_vendor_grouping(query.question)
         resolved = await _resolve_concept_ranking(os_client, ch_client, concept_question, is_vendor, now)
         if resolved:
-            answer = _concept_ranking_plain_answer(resolved["rows"], is_vendor, resolved["keyword"], resolved["programs"])
+            answer = _concept_ranking_plain_answer(resolved["rows"], is_vendor, resolved["keyword"], resolved["programs"], resolved["vendors"])
             log.info(
                 "Log Assistant FORCE-RESOLVED a concept ranking via semantic-search discovery + a "
-                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r -> %s",
-                concept_question, resolved["keyword"], resolved["programs"], _truncate(json.dumps(resolved["rows"]), 1000),
+                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r "
+                "vendors=%r -> %s",
+                concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"],
+                _truncate(json.dumps(resolved["rows"]), 1000),
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
@@ -3028,12 +3085,12 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         )
         resolved = await _resolve_concept_count(os_client, ch_client, count_concept_question, concept_start, concept_end)
         if resolved:
-            answer = _concept_count_plain_answer(resolved["count"], resolved["keyword"], resolved["programs"], period_label)
+            answer = _concept_count_plain_answer(resolved["count"], resolved["keyword"], resolved["programs"], period_label, resolved["vendors"])
             log.info(
                 "Log Assistant FORCE-RESOLVED a concept count via semantic-search discovery + a "
                 "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r "
-                "period=%r -> %s",
-                count_concept_question, resolved["keyword"], resolved["programs"], period_label, resolved["count"],
+                "vendors=%r period=%r -> %s",
+                count_concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"], period_label, resolved["count"],
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
