@@ -2120,17 +2120,47 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
     vocabulary, not generic scaffolding -- they survived into the BM25
     search phrase and skewed retrieval toward a narrower, differently-
     worded sample, changing which candidate looked dominant. Note this
-    does NOT make the ranking/count itself vendor-scoped -- neither
-    _resolve_concept_ranking nor _resolve_concept_count take a vendor
-    filter at all, so "vendor mikrotik and mimosa" is only prevented
-    from corrupting keyword discovery here, not actually honored as a
-    filter; that's a separate, not-yet-built capability."""
-    vendor_words: set[str] = set()
-    try:
-        options = await asyncio.to_thread(log_search_service.get_filter_options, ch_client)
-        vendor_words = {v.lower() for v in options.vendors if v}
-    except Exception:
-        log.exception("Concept discovery vendor lookup failed -- continuing without vendor-name stripping")
+    does NOT make the ranking/count itself vendor-scoped on its own --
+    _resolve_concept_ranking/_resolve_concept_count now DO apply a real
+    vendor NAME as an actual filter (see their own docstrings), but that's
+    a separate step from what this function does: this one only keeps a
+    known entity name from corrupting keyword discovery in the first
+    place.
+
+    A real vendor NAME is only stripped from the SEARCH PHRASE, not from
+    the final CANDIDATE pool below -- a distinction that matters for the
+    sibling fix this function also makes (see the next paragraph): a
+    vendor name is rarely also the natural word for describing a concept,
+    so removing it from what's searched is safe. Note this does NOT make
+    the ranking/count itself vendor-scoped on its own -- _resolve_concept_
+    ranking/_resolve_concept_count now DO apply a real vendor NAME as an
+    actual filter (see their own docstrings), but that's a separate step
+    from what this function does: this one only keeps a known entity name
+    from corrupting keyword discovery in the first place.
+
+    Also excludes any CANDIDATE keyword that's a case-insensitive
+    SUBSTRING of a real PROGRAM value (log_search_service.
+    get_filter_options again) -- confirmed live as a related, but
+    importantly DIFFERENT-shaped gap: "how many mimosa devices with
+    wireless disconnections" discovered keyword='mimosa' (zero real
+    matches) because "mimosa" isn't a real `vendor` value in this
+    dataset at all -- Mimosa-brand devices are tagged via program=
+    'Mimosa_C5x', not a vendor column value -- so the vendor-name
+    stripping above never touched it. This exclusion is applied to the
+    CANDIDATE POOL, not the search phrase, deliberately: an earlier
+    version of this fix stripped substring-matching words from the
+    search phrase the same way vendor names are, but "wireless" is
+    ALSO a substring of the real program value "wireless,info" --
+    stripping it would have thrown away a genuinely useful, correct
+    topic word for the ALREADY-WORKING "wireless disconnections" case
+    just to keep an unrelated brand name's fragment out, trading a
+    confirmed-working case for a different one. Filtering candidates
+    AFTER retrieval costs nothing on the already-proven-good cases
+    (their real candidate, e.g. 'disconnected', never matches a program
+    value anyway) while still refusing to let "mimosa" win regardless of
+    how often it recurs in the retrieved sample's own message text."""
+    real_vendors = await _real_vendor_names(ch_client)
+    vendor_words = {v.lower() for v in real_vendors}
     question_for_search = concept_question
     if vendor_words:
         kept = [w for w in concept_question.split() if w.strip(".,!?;:").lower() not in vendor_words]
@@ -2157,6 +2187,20 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
     candidates = _candidate_concept_tokens(sample_messages, min_count)
     if not candidates:
         return None
+    # Never let a known vendor/program-fragment win as the actual keyword
+    # -- see this function's own docstring for why this is a candidate-
+    # pool filter, not a search-phrase one. Falls back to the unfiltered
+    # candidates if filtering would discard every single one (nothing
+    # real left to offer is worse than risking an entity-name keyword).
+    program_values = await _real_program_names(ch_client)
+
+    def _is_known_entity(word: str) -> bool:
+        lowered = word.lower()
+        if lowered in vendor_words:
+            return True
+        return len(lowered) >= 3 and any(lowered in p.lower() for p in program_values)
+
+    candidates = [c for c in candidates if not _is_known_entity(c)] or candidates
     # A single clearly-dominant candidate needs no model call at all --
     # faster and strictly more reliable than asking the model to confirm
     # the only option.
@@ -2198,6 +2242,42 @@ def _vendors_mentioned_in(question: str, known_vendors: list[str]) -> list[str]:
     return [v for v in known_vendors if v.lower() not in _PLACEHOLDER_STRINGS and v.lower() in words]
 
 
+async def _real_program_names(ch_client) -> list[str]:
+    """The real, current program list (log_search_service.
+    get_filter_options) -- same dynamic, no-hardcoded-enum approach as
+    _real_vendor_names, and the same underlying data _resolve_program_fuzzy
+    already queries. Returns [] on failure (logged)."""
+    try:
+        options = await asyncio.to_thread(log_search_service.get_filter_options, ch_client)
+        return [p for p in options.programs if p]
+    except Exception:
+        log.exception("Program lookup failed -- continuing with no explicit program match")
+        return []
+
+
+def _programs_mentioned_in(question: str, known_programs: list[str]) -> list[str]:
+    """Which of the REAL, current program values (see _real_program_names)
+    this question names a FRAGMENT of -- e.g. "mimosa" -> ['Mimosa_C5x'].
+    Substring, not exact-word, matching: program values are often
+    compound, vendor-derived strings ('Mimosa_C5x', 'wireless,info'), so a
+    plain word a person would actually type is naturally a fragment of
+    the real value rather than an exact match (the same reasoning
+    _resolve_program_fuzzy's own substring matching already uses).
+    Candidate words come from _extract_concept (same generic-word/length
+    filtering used for keyword discovery), not a raw split, so short or
+    scaffolding words can't accidentally substring-match an unrelated
+    program value. Confirmed live as a real gap: "how many mimosa devices
+    with wireless disconnections" has no real `vendor` named 'mimosa' at
+    all (Mimosa-brand devices are tagged via program='Mimosa_C5x', not a
+    vendor column value), so nothing scoped the query to that real data
+    source even though the question's own wording names a fragment of
+    it."""
+    candidate_words = (_extract_concept(question) or "").split()
+    if not candidate_words:
+        return []
+    return [p for p in known_programs if any(w in p.lower() for w in candidate_words)]
+
+
 async def _resolve_concept_ranking(
     os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
 ) -> dict | None:
@@ -2217,6 +2297,18 @@ async def _resolve_concept_ranking(
     # events are counted isn't silently lost the way a single combined
     # query with the wrong assumptions could lose it).
     vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
+    # Confirmed live as a related gap: "how many mimosa devices with
+    # wireless disconnections" named no real `vendor` (Mimosa-brand
+    # devices are tagged via program='Mimosa_C5x', not a vendor column
+    # value -- see _programs_mentioned_in's docstring), so nothing told
+    # this query to actually include that real data source. A program the
+    # question names a fragment of is ADDED to whatever the semantic-
+    # search sample auto-discovered (union, not replace) -- the sample
+    # might already have found it on its own, or might have missed it
+    # the way it missed it live; either way, an explicit mention in the
+    # user's own words is strong enough evidence to include it regardless.
+    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
+    programs = list(dict.fromkeys((programs or []) + explicit_programs))
     group_key = "vendor" if is_vendor else "hostname"
     # One call PER significant program (never a single filtered call) --
     # see _significant_programs' docstring for the confirmed live incident
@@ -2296,6 +2388,9 @@ async def _resolve_concept_count(
     keyword, programs = discovered
     # Same vendor-filter reasoning as _resolve_concept_ranking.
     vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
+    # Same explicit-program-mention reasoning as _resolve_concept_ranking.
+    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
+    programs = list(dict.fromkeys((programs or []) + explicit_programs))
     # Sum across every significant program, same reasoning as
     # _resolve_concept_ranking. Sequential, not asyncio.gather -- same
     # confirmed-live ch_client concurrency restriction as there (this was
