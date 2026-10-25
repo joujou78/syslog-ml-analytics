@@ -1923,7 +1923,25 @@ def _unresolved_ranking_concept(question: str, history: list["ConversationTurn"]
     content of its own"; requiring its own concept-extraction to also come
     up empty is what actually distinguishes a true contentless follow-up
     ("ist the top", "nd the vendor") from a short but fully self-contained
-    question that simply isn't shaped like a ranking."""
+    question that simply isn't shaped like a ranking.
+
+    When the bare follow-up itself already carries a ranking marker (e.g.
+    "which vendor?"), the topic is inherited directly from the previous
+    turn's own text rather than recursing the whole function on it --
+    confirmed live as a real, reproduced gap: "which vendor?" right after
+    "how many mimosa devices with wireless disconnections you have" (a
+    COUNT question, not ranking-shaped at all) recursed into
+    _unresolved_ranking_concept on that previous text, which correctly
+    found no ranking marker there and returned None -- discarding the
+    CURRENT question's own unambiguous "which vendor" ranking intent
+    entirely, and the count path's own bare-followup inheritance then
+    answered with the exact same count as before, never addressing
+    "vendor" at all. The ranking intent is already established by the
+    CURRENT text; only the topic is missing, so only the topic needs
+    inheriting, regardless of whether the PREVIOUS turn was itself
+    ranking-shaped -- the plain recursive fallback below still handles
+    the opposite case ("nd the vendor", no ranking marker of its own,
+    after a turn that WAS ranking-shaped)."""
     if (
         _wants_ranking(question)
         and _detect_anomaly_reason(question, history) is None
@@ -1931,7 +1949,22 @@ def _unresolved_ranking_concept(question: str, history: list["ConversationTurn"]
     ):
         return question
     if history and _is_bare_followup(question) and not _extract_concept(question):
-        return _unresolved_ranking_concept(history[-1].question)
+        # The previous turn must ITSELF be count- or ranking-shaped, not
+        # just "has some non-generic-looking words" -- confirmed needed:
+        # without this, "which vendor?" after a plain "hello there" would
+        # have inherited "hello there" as if it were a real concept
+        # (neither word is in _GENERIC_QUESTION_WORDS, so bare
+        # _extract_concept truthiness alone isn't a strong enough
+        # signal that the previous turn was actually a topic worth
+        # inheriting).
+        prev = history[-1].question
+        if (
+            _wants_ranking(question)
+            and (_wants_count(prev) or _wants_ranking(prev))
+            and _extract_concept(prev)
+        ):
+            return prev
+        return _unresolved_ranking_concept(prev)
     return None
 
 
@@ -1961,7 +1994,15 @@ def _unresolved_count_concept(question: str, history: list["ConversationTurn"] |
     EMPTY, not just _is_bare_followup -- see _unresolved_ranking_concept's
     docstring for the confirmed live regression this closes (a 5-word,
     fully self-contained question is not "contentless" just because it's
-    short)."""
+    short).
+
+    Same fix as _unresolved_ranking_concept's for the symmetric gap: when
+    the bare follow-up itself already carries count language ("how many
+    now?" right after a RANKING turn, not a count-shaped one), the topic
+    is inherited directly from the previous turn's text instead of
+    recursing the whole function on it, which would otherwise find no
+    count marker there and give up -- even though the current text's own
+    wording already established that a count is wanted."""
     if (
         _wants_count(question)
         and not _wants_ranking(question)
@@ -1970,7 +2011,18 @@ def _unresolved_count_concept(question: str, history: list["ConversationTurn"] |
     ):
         return question
     if history and _is_bare_followup(question) and not _extract_concept(question):
-        return _unresolved_count_concept(history[-1].question)
+        # See _unresolved_ranking_concept's identical guard: the previous
+        # turn must itself be count- or ranking-shaped, not just "has
+        # some non-generic-looking words" (a plain greeting would
+        # otherwise false-positive as an inheritable concept).
+        prev = history[-1].question
+        if (
+            _wants_count(question) and not _wants_ranking(question)
+            and (_wants_count(prev) or _wants_ranking(prev))
+            and _extract_concept(prev)
+        ):
+            return prev
+        return _unresolved_count_concept(prev)
     return None
 
 
