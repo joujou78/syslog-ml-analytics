@@ -1668,7 +1668,24 @@ _ANOMALY_SUMMARY_ALL_TIME_CAVEAT = (
 # (not a bare substring like the original, since-fixed _wants_vendor_grouping)
 # -- deliberately built this way from the start for this new tool, rather
 # than needing a live incident to discover the same lesson a third time.
-_INCIDENT_MARKERS = ("incident", "root cause", "what caused", "correlated", "bigger issue", "cascade", "related anomal")
+#
+# Also covers vague, open-ended status phrasing ("what is happening
+# today") -- confirmed live as a real, reproduced gap: that exact
+# question has no ranking/count/log-rows marker of its own, so
+# enforce_count_tool's positive-signal gate only had _is_bare_followup
+# (4 words) left to go on, and answered "the count of events for the
+# whole network... is 179723" -- technically real, grounded data, but a
+# flat total completely misses what was actually asked (a status/
+# overview, not a literal count). This is the exact same underlying
+# lesson _wants_ranking's own exclusion from that gate already
+# established (see enforce_count_tool's own comment) -- a short question
+# can still have real, DIFFERENT intent of its own; it's just intent
+# this gate was never meant to serve. These phrasings route to the more
+# appropriate correlated_incidents tool instead.
+_INCIDENT_MARKERS = (
+    "incident", "root cause", "what caused", "correlated", "bigger issue", "cascade", "related anomal",
+    "what is happening", "what's happening", "whats happening", "what's going on", "whats going on",
+)
 
 
 def _wants_incidents(question: str) -> bool:
@@ -3439,10 +3456,20 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # otherwise have triggered it -- see _wants_ranking and the
     # _detect_anomaly_reason-based forcing mechanism below, which is the
     # actual right place for ranking intent to be handled.
+    #
+    # A fourth instance, confirmed live: "what is happening today" is 4
+    # words with no ranking/count/log-rows marker of its own, so bare
+    # word count was again the only signal left, and the answer was "the
+    # count of events for the whole network... is 179723" -- real,
+    # grounded, and a complete miss of what a vague status/overview
+    # question like this actually wants. Excluded the same way, for the
+    # same reason -- see _wants_incidents and the correlated_incidents
+    # force-resolve shortcut below, the actual right place for this intent.
     enforce_count_tool = bool(
         (comparison_periods or single_period)
         and not _wants_log_rows(query.question)
         and not _wants_ranking(query.question)
+        and not _wants_incidents(query.question)
         and (needs_multiple or _wants_count(query.question) or _is_bare_followup(query.question))
     )
     # Same idea as enforce_count_tool, for "which device/vendor has the most
