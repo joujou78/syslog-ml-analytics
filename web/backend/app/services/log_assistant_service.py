@@ -1707,24 +1707,39 @@ def _incidents_plain_answer(result: dict) -> str:
     incidents = result.get("incidents") or []
     if not incidents:
         return (
-            "No correlated incident found in this window -- either nothing anomalous happened, or the "
-            "anomalies that did happen were each isolated to a single device, not a cross-device event."
+            "No correlated incident found in this window -- device anomaly activity looked normal for "
+            "this time of day, or any anomalies that did happen were isolated to single devices rather "
+            "than a cross-device event."
         )
     parts = []
     for i in incidents:
         root = i["root_cause"]
         label = root.get("hostname") or root.get("source_ip")
-        devices = ", ".join(i["devices_affected"])
+        device_list = i["devices_affected"]
+        # Confirmed live as a real problem, not a hypothetical one: a
+        # genuine incident on this deployment can span hundreds of
+        # devices (one reported span touched 579) -- spelling out every
+        # single hostname made the answer an unreadable wall of text.
+        # Capped the same way a UI table would paginate, not silently
+        # losing the real total count.
+        devices = ", ".join(device_list[:15]) + (f", and {len(device_list) - 15} more" if len(device_list) > 15 else "")
         reasons = ", ".join(i["anomaly_reasons_seen"]) or "unspecified"
+        baseline = i.get("baseline_devices_per_bucket")
+        peak = i.get("peak_devices_in_a_single_bucket")
+        elevation = (
+            f"; peak of {peak} distinct devices in a single {incident_correlation_service.BUCKET_MINUTES}-minute "
+            f"window vs a normal baseline of ~{baseline} for this scope"
+            if baseline is not None and peak is not None else ""
+        )
         parts.append(
             f"{i['incident_start']} to {i['incident_end']}: {i['event_count']} events across "
-            f"{len(i['devices_affected'])} devices ({devices}); reasons seen: {reasons}; "
+            f"{len(device_list)} devices ({devices}); reasons seen: {reasons}{elevation}; "
             f"earliest/likely-root-cause device: {label}"
         )
     breakdown = " | ".join(parts)
     return (
-        f"Found {len(incidents)} correlated incident(s) (events grouped by time proximity across "
-        f"multiple devices): {breakdown}. "
+        f"Found {len(incidents)} correlated incident(s) (periods where distinct-device anomaly activity "
+        f"was elevated well above normal for that time window): {breakdown}. "
         "(Note: 'root cause' here is only the earliest event in each group -- there is no network "
         "topology data to verify actual causation, so treat it as a reasonable guess, not confirmed.)"
     )
