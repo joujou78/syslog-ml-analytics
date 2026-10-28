@@ -3349,7 +3349,19 @@ async def _execute_tool(
         return agg_result, []
 
     if name == "semantic_search":
-        phrase = arguments.get("phrase") or ""
+        # Confirmed live: "what about ethernet flapp[ing]" had the model
+        # call semantic_search with {'query': 'ethernet flapping', ...} --
+        # ignoring its own declared schema's required 'phrase' parameter
+        # name (see TOOL_DEFINITIONS above) in favor of the more generic
+        # "query" wording. arguments.get("phrase") then returned None,
+        # silently falling through to the "related logs" default below and
+        # searching for THAT instead of the user's real topic -- which
+        # explains the near-zero relevance scores (0.014-0.016) and
+        # generic, mostly-irrelevant "link up" hits actually returned.
+        # Falling back to "query" when "phrase" is absent costs nothing on
+        # the normal case (the model usually does use "phrase") and
+        # recovers the one wrong-key-name variant confirmed live so far.
+        phrase = arguments.get("phrase") or arguments.get("query") or ""
         sub_query = LogAssistantQuery(
             question=phrase[:1000] or "related logs",
             source_ip=arguments.get("source_ip"),
@@ -3902,6 +3914,28 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # to the model's own prose, unless it already said so itself.
             if interface_flapping_caveat_needed and "RouterOS Ethernet" not in answer:
                 answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
+            # Confirmed live: "what about ethernet flapp[ing]" called
+            # semantic_search, got back 10 real hits (logged, and shown to
+            # the user as "Cited log lines"), but the model's own follow-up
+            # text response -- message["content"] -- came back as an empty
+            # string. None of the shape-specific force-resolves above fire
+            # for this question (it's not anomaly-reason-shaped, not a
+            # count/period override, not a multi-period comparison), so
+            # `answer` reached this point still blank and was returned to
+            # the user as a literally empty "Answer" with nothing to explain
+            # why. A blank response is strictly worse than saying nothing
+            # useful was generated -- at minimum say so, and point at the
+            # cited log lines when there are any, rather than presenting an
+            # empty answer as if it were a deliberate "nothing found".
+            if not answer.strip():
+                answer = (
+                    "The assistant retrieved log data for this question but didn't produce a written "
+                    "summary of it -- see the cited log lines below for what was found; try rephrasing "
+                    "the question for a direct answer."
+                ) if sources else (
+                    "The assistant didn't produce an answer for this question -- try rephrasing it or "
+                    "being more specific."
+                )
             return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
 
         messages.append(message)
