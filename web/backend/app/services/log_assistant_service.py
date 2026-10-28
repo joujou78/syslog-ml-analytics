@@ -2456,7 +2456,7 @@ def _programs_mentioned_in(question: str, known_programs: list[str]) -> list[str
 
 
 async def _resolve_concept_ranking(
-    os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, now: datetime,
+    os_client: OpenSearch, ch_client, concept_question: str, is_vendor: bool, start: datetime, end: datetime,
 ) -> dict | None:
     discovered = await _discover_concept_keyword(os_client, ch_client, concept_question)
     if not discovered:
@@ -2504,10 +2504,20 @@ async def _resolve_concept_ranking(
     # ch_client's other concurrent-use site in _execute_tool). Every
     # program here shares this one ch_client, so they must run one at a
     # time regardless of how harmless concurrent reads might look.
+    # Confirmed live as a real, confirmed gap, not a hypothetical one:
+    # "top 10 devices with wireless disconnections today" silently ignored
+    # "today" entirely and answered with all-time cumulative totals (the
+    # answer text even said so -- "(cumulative, all-time)" -- truthfully
+    # describing the wrong thing it did). This function previously had no
+    # start/end parameters at all, unlike its sibling _resolve_concept_
+    # count, which already threaded a detected single period through
+    # correctly. start/end are now real caller-supplied bounds (ask()
+    # passes _detect_single_period's result when the question names one,
+    # _ALL_TIME_START/now otherwise) instead of a hardcoded all-time range.
     per_call_rows = [
         await asyncio.to_thread(
             log_search_service.aggregate_events, ch_client, group_by=[group_key], keyword=keyword,
-            program=p, vendor=v, start=_ALL_TIME_START, end=now, limit=log_search_service.AGGREGATE_MAX_LIMIT,
+            program=p, vendor=v, start=start, end=end, limit=log_search_service.AGGREGATE_MAX_LIMIT,
         )
         for p in (programs or [None])
         for v in (vendors or [None])
@@ -2524,7 +2534,10 @@ async def _resolve_concept_ranking(
     return {"rows": merged, "keyword": keyword, "programs": programs, "vendors": vendors}
 
 
-def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: str, programs: list[str], vendors: list[str] | None = None) -> str:
+def _concept_ranking_plain_answer(
+    rows: list[dict], is_vendor: bool, keyword: str, programs: list[str],
+    vendors: list[str] | None = None, period_label: str | None = None,
+) -> str:
     # `programs` (the internal syslog `program` field value(s) actually
     # queried, e.g. 'wireless,info') is deliberately NOT shown here --
     # confirmed live as genuinely confusing to a user asking a plain
@@ -2550,8 +2563,14 @@ def _concept_ranking_plain_answer(rows: list[dict], is_vendor: bool, keyword: st
     # nothing extra and answers both questions in one response instead of
     # requiring a second, differently-phrased round trip.
     breakdown = "; ".join(f"{(r.get('vendor') if is_vendor else r.get('hostname'))}: {r.get('event_count')}" for r in rows)
+    # Same period-label pattern as _concept_count_plain_answer -- confirmed
+    # live as necessary here too: a hardcoded "(cumulative, all-time)" was
+    # previously always printed regardless of whether the question named a
+    # time period, which was actively misleading once _resolve_concept_
+    # ranking started actually honoring one.
+    period = f" {period_label}" if period_label else " (cumulative, all-time)"
     return (
-        f"The top {kind} for {qualifier} is {label}, with {count} matching events (cumulative, all-time). "
+        f"The top {kind} for {qualifier} is {label}, with {count} matching events{period}. "
         f"Full breakdown by {kind} (busiest first): {breakdown}."
     )
 
@@ -3380,16 +3399,27 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # messages; otherwise (None) this falls through to the normal
     # tool-calling loop below exactly as if it had never run.
     concept_question = _unresolved_ranking_concept(query.question, query.history)
-    if concept_question:
+    # Confirmed live: "top 10 devices with wireless disconnections today"
+    # silently ignored "today" and answered all-time -- same single-period
+    # detection the count-concept path below already does, skipped here too
+    # if the question is a two-period COMPARISON (not supported by a single
+    # ranking call; falls through to the normal loop like count-concept does).
+    if concept_question and not _detect_comparison_periods(query.question, now):
         is_vendor = _wants_vendor_grouping(query.question)
-        resolved = await _resolve_concept_ranking(os_client, ch_client, concept_question, is_vendor, now)
+        single_period_for_ranking = _detect_single_period(query.question, now)
+        period_label, ranking_start, ranking_end = (
+            single_period_for_ranking if single_period_for_ranking else (None, _ALL_TIME_START, now)
+        )
+        resolved = await _resolve_concept_ranking(os_client, ch_client, concept_question, is_vendor, ranking_start, ranking_end)
         if resolved:
-            answer = _concept_ranking_plain_answer(resolved["rows"], is_vendor, resolved["keyword"], resolved["programs"], resolved["vendors"])
+            answer = _concept_ranking_plain_answer(
+                resolved["rows"], is_vendor, resolved["keyword"], resolved["programs"], resolved["vendors"], period_label,
+            )
             log.info(
                 "Log Assistant FORCE-RESOLVED a concept ranking via semantic-search discovery + a "
                 "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r "
-                "vendors=%r -> %s",
-                concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"],
+                "vendors=%r period=%r -> %s",
+                concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"], period_label,
                 _truncate(json.dumps(resolved["rows"]), 1000),
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
