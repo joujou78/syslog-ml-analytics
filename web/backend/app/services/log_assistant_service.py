@@ -1737,12 +1737,32 @@ def _incidents_plain_answer(result: dict) -> str:
             f"earliest/likely-root-cause device: {label}"
         )
     breakdown = " | ".join(parts)
-    return (
+    prefix = (
         f"Found {len(incidents)} correlated incident(s) (periods where distinct-device anomaly activity "
-        f"was elevated well above normal for that time window): {breakdown}. "
+        "was elevated well above normal for that time window): "
+    )
+    caveat = (
         "(Note: 'root cause' here is only the earliest event in each group -- there is no network "
         "topology data to verify actual causation, so treat it as a reasonable guess, not confirmed.)"
     )
+    # ConversationTurn.answer (app/schemas/log_assistant.py) caps a stored
+    # answer at 4000 characters, and the frontend resends the whole
+    # conversation history -- including this function's own past answers
+    # -- on every follow-up question. Confirmed live as a real failure,
+    # not hypothetical: an earlier, uncapped version of this answer (579
+    # devices spelled out per incident) exceeded that limit, and every
+    # subsequent question in that same conversation then failed request
+    # validation ("String should have at most 4000 characters") before
+    # any of this app's own code ever ran again -- a stuck conversation,
+    # not just one ugly answer. MAX_INCIDENTS and the 15-device cap above
+    # keep the common case well clear of 4000, but the breakdown is still
+    # the only truly unbounded part of this answer (it scales with how
+    # many incidents and how many devices/reasons each one has), so it's
+    # truncated here with a safe margin -- never the whole answer, so the
+    # causation caveat below stays intact and visible even when it is.
+    max_breakdown_chars = max(200, 3500 - len(prefix) - len(caveat))
+    breakdown = _truncate(breakdown, max_breakdown_chars)
+    return f"{prefix}{breakdown}. {caveat}"
 
 
 def _annotate_resolved_reason(reason: str, note: str | None) -> tuple[str, str | None]:

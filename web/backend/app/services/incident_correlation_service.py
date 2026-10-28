@@ -50,7 +50,19 @@ ELEVATION_MULTIPLIER = 3
 # surface.
 MIN_ABSOLUTE_DEVICES = 5
 
-MAX_INCIDENTS = 10
+# Confirmed live as a real constraint, not an arbitrary round number:
+# ConversationTurn.answer (app/schemas/log_assistant.py) caps a stored
+# answer at 4000 characters -- the frontend resends the whole
+# conversation history (including this tool's own past answers) on every
+# follow-up question, so an answer that exceeds that cap doesn't just
+# look bad once, it makes EVERY subsequent question in that same
+# conversation fail request validation ("String should have at most 4000
+# characters") before any of this app's own code ever runs. A lower
+# MAX_INCIDENTS keeps the common case well clear of that limit;
+# _incidents_plain_answer's own hard truncation (see log_assistant_
+# service.py) is the actual backstop guarantee, since even this many
+# incidents can still add up if each one lists many devices.
+MAX_INCIDENTS = 5
 MAX_EVENTS_PER_INCIDENT = 50
 
 
