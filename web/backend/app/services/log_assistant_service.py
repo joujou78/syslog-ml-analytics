@@ -36,7 +36,7 @@ from app.core.config import settings
 from app.schemas.log_assistant import AskResponse, ConversationTurn, LogAssistantQuery, LogHit
 from app.services import (
     alert_service, anomaly_summary_service, audit_service, device_service, device_silence_service,
-    log_search_service, relay_service,
+    incident_correlation_service, log_search_service, relay_service,
 )
 
 log = logging.getLogger("log_assistant_service")
@@ -770,6 +770,31 @@ TOOL_DEFINITIONS = [
                     "group_by": {"type": "string", "enum": ["device", "vendor"], "description": "'device' (default) or 'vendor'."},
                     "reason": {"type": "string", "description": "Optional: restrict to one anomaly type -- pass it in your own words ('ethernet flapping', 'volume spike'), it will be matched to the real category for you. When set, the result is already filtered AND sorted for just this type, so its first entry is the answer to 'which has the most'. If the concept isn't one of the 8 real categories, do NOT guess/pass it here (see this tool's own description for the real alternative)."},
                     "limit": {"type": "integer", "description": "Max rows to return per list. Default 10."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "correlated_incidents",
+            "description": (
+                "Groups anomalous events that happened close together in time across MULTIPLE devices "
+                "into a single likely incident, instead of listing them as unrelated per-device alerts. "
+                "Use for 'what caused this', 'is there a bigger issue', 'any incidents today', 'root "
+                "cause', or 'correlated/related anomalies' -- NOT for a single device's own anomaly "
+                "history (use anomaly_summary or count_events for that; a one-device cluster is never "
+                "returned here at all). IMPORTANT caveat to always relay: this groups events by TIME "
+                "PROXIMITY only -- there is no network topology data, so the 'root cause' returned is "
+                "just the EARLIEST event in the group, a reasonable guess, not a verified causal link. "
+                "Never state it as confirmed causation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "ISO 8601 UTC start. Omit for the last 24 hours."},
+                    "end": {"type": "string", "description": "ISO 8601 UTC end. Omit for now."},
+                    "vendor": {"type": "string", "description": "Optional: restrict to one vendor."},
                 },
             },
         },
@@ -1638,6 +1663,54 @@ _ANOMALY_SUMMARY_ALL_TIME_CAVEAT = (
     "Note: anomaly_summary has no time-scoping -- the number above is a cumulative, all-time "
     "total, not limited to the time period named in the question."
 )
+
+# Mirrors _RANKING_MARKERS/_COUNT_INTENT_MARKERS' own phrase-based approach
+# (not a bare substring like the original, since-fixed _wants_vendor_grouping)
+# -- deliberately built this way from the start for this new tool, rather
+# than needing a live incident to discover the same lesson a third time.
+_INCIDENT_MARKERS = ("incident", "root cause", "what caused", "correlated", "bigger issue", "cascade", "related anomal")
+
+
+def _wants_incidents(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _INCIDENT_MARKERS)
+
+
+def _incidents_plain_answer(result: dict) -> str:
+    """Builds the final answer directly from a resolved correlated_incidents
+    result, bypassing any further model call entirely -- same rationale as
+    _anomaly_summary_plain_answer (see its own docstring): once the real,
+    grouped data is known, asking the model to restate it adds no
+    information and risks the exact fabrication/misrepresentation failure
+    modes this file has repeatedly had to guard against after the fact.
+    Built this way from the start here instead, since incident_correlation_
+    service's own result is only a time-proximity heuristic (see its
+    docstring), not verified causation -- the caveat below is included
+    unconditionally rather than trusted to a model's memory of a tool note."""
+    incidents = result.get("incidents") or []
+    if not incidents:
+        return (
+            "No correlated incident found in this window -- either nothing anomalous happened, or the "
+            "anomalies that did happen were each isolated to a single device, not a cross-device event."
+        )
+    parts = []
+    for i in incidents:
+        root = i["root_cause"]
+        label = root.get("hostname") or root.get("source_ip")
+        devices = ", ".join(i["devices_affected"])
+        reasons = ", ".join(i["anomaly_reasons_seen"]) or "unspecified"
+        parts.append(
+            f"{i['incident_start']} to {i['incident_end']}: {i['event_count']} events across "
+            f"{len(i['devices_affected'])} devices ({devices}); reasons seen: {reasons}; "
+            f"earliest/likely-root-cause device: {label}"
+        )
+    breakdown = " | ".join(parts)
+    return (
+        f"Found {len(incidents)} correlated incident(s) (events grouped by time proximity across "
+        f"multiple devices): {breakdown}. "
+        "(Note: 'root cause' here is only the earliest event in each group -- there is no network "
+        "topology data to verify actual causation, so treat it as a reasonable guess, not confirmed.)"
+    )
 
 
 def _annotate_resolved_reason(reason: str, note: str | None) -> tuple[str, str | None]:
@@ -2986,6 +3059,37 @@ async def _execute_tool(
             "note": note,
         }, []
 
+    if name == "correlated_incidents":
+        end = _parse_tool_datetime(arguments.get("end")) or datetime.now(timezone.utc)
+        start = _parse_tool_datetime(arguments.get("start")) or (end - timedelta(hours=24))
+        vendor_filter = arguments.get("vendor")
+        if not _is_real_filter_value(vendor_filter):
+            vendor_filter = None
+        incidents = await asyncio.to_thread(
+            incident_correlation_service.correlate_incidents, ch_client, start=start, end=end, vendor=vendor_filter,
+        )
+        return {
+            "incidents": [
+                {
+                    "incident_start": i["incident_start"].isoformat(), "incident_end": i["incident_end"].isoformat(),
+                    "event_count": i["event_count"], "devices_affected": i["devices_affected"],
+                    "anomaly_reasons_seen": i["anomaly_reasons_seen"],
+                    "root_cause": {**i["root_cause"], "event_time": i["root_cause"]["event_time"].isoformat()},
+                    "related_events": [{**e, "event_time": e["event_time"].isoformat()} for e in i["related_events"]],
+                }
+                for i in incidents
+            ],
+            "note": (
+                "Root cause is only the EARLIEST event in each group (time proximity, no network "
+                "topology data) -- a reasonable guess, not a verified causal link. Say so, don't state "
+                "it as confirmed."
+                if incidents else
+                "No cross-device incident found in this window -- either nothing anomalous happened, or "
+                "the anomalies that did happen were isolated to single devices (not grouped here; see "
+                "anomaly_summary for those)."
+            ),
+        }, []
+
     if name == "alert_rules":
         name_filter = arguments.get("name")
         rules = await alert_service.list_rules(db)
@@ -3263,6 +3367,31 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 count_concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"], period_label, resolved["count"],
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+
+    # A new capability, not a bug-fix retrofit -- built deterministic from
+    # the start rather than waiting for a live incident to show the model
+    # mishandling its own tool result, the same lesson every other force-
+    # resolve shortcut in this file already learned the hard way.
+    if _wants_incidents(query.question):
+        single_period_for_incidents = _detect_single_period(query.question, now)
+        if single_period_for_incidents:
+            _, incident_start, incident_end = single_period_for_incidents
+        else:
+            incident_start, incident_end = now - timedelta(hours=24), now
+        incident_vendors = _vendors_mentioned_in(query.question, await _real_vendor_names(ch_client))
+        incident_args = {"start": incident_start.isoformat(), "end": incident_end.isoformat()}
+        if len(incident_vendors) == 1:
+            incident_args["vendor"] = incident_vendors[0]
+        result, _ = await _execute_tool(
+            "correlated_incidents", incident_args, os_client, ch_client, db, query.question,
+        )
+        answer = _incidents_plain_answer(result)
+        log.info(
+            "Log Assistant FORCE-RESOLVED correlated incidents, no full tool-calling round-trip: "
+            "start=%s end=%s vendors=%r -> %d incident(s)",
+            incident_start, incident_end, incident_vendors, len(result.get("incidents") or []),
+        )
+        return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
     history_block = _format_history(query.history)
     opening = (
