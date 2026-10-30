@@ -4006,6 +4006,37 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 arguments["start"] = period_start.strftime(fmt)
                 arguments["end"] = period_end.strftime(fmt)
 
+            # Confirmed live: an "Explain this anomaly" request (source_ip
+            # and a 25-minute start/end window pre-filled by the UI's
+            # explainLink(), see AnomalyWindows.tsx) had the model call
+            # semantic_search with NEITHER -- just a bare keyword and an
+            # invented, non-schema "description" argument. With no time or
+            # device scope at all, the search matched whatever best fit the
+            # keyword ANYWHERE in the whole index, returning log lines from
+            # unrelated devices three weeks earlier instead of anything
+            # from the actual flagged window. The opening prompt already
+            # tells the model about these filters (see `opening`'s own
+            # construction above), phrased as a hint ("...is appropriate")
+            # -- exactly the "prompting alone isn't enough" failure mode
+            # this file has had to fix deterministically everywhere else,
+            # now confirmed for this path too. Backfills only what the
+            # model's own call left out (never overrides a value the model
+            # DID choose to set itself, e.g. a legitimate different-device
+            # follow-up), same philosophy as _sanitize_equality_filters'
+            # device->hostname promotion. Scoped to the same tool names as
+            # the single_period override just above, for the same reason
+            # (count_events/aggregate_events already have their own,
+            # separate handling elsewhere).
+            if fn["name"] in ("search_logs", "semantic_search", "list_devices"):
+                if query.source_ip and not _is_real_filter_value(arguments.get("source_ip")):
+                    arguments["source_ip"] = query.source_ip
+                if query.vendor and not _is_real_filter_value(arguments.get("vendor")):
+                    arguments["vendor"] = query.vendor
+                if not arguments.get("start") and not arguments.get("end") and query.start and query.end:
+                    fmt = "%Y-%m-%dT%H:%M:%S"
+                    arguments["start"] = query.start.strftime(fmt)
+                    arguments["end"] = query.end.strftime(fmt)
+
             if forced_anomaly_reason and not anomaly_reason_resolved and fn["name"] != "anomaly_summary":
                 # Confirmed on net-flow: asked "which device has the most
                 # <anomaly type>", the model called list_devices with a
