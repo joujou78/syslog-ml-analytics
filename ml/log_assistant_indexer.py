@@ -142,11 +142,26 @@ INDEXER_ANOMALIES_ONLY = os.environ.get("INDEXER_ANOMALIES_ONLY", "false").lower
 # never made it into the index, because the indexer's own near-zero lag
 # meant it always fetched (and excluded) those rows before either
 # detector's own cycle (REFRESH_SECONDS=900 by default) got a chance to
-# tag them. 20 minutes covers each detector's worst case: a REFRESH_SECONDS
-# cycle just missing a just-closed window/transition, plus (for
-# template-mix specifically) up to WINDOW_MINUTES more before that window
-# even counts as closed.
-INDEXER_LAG_MINUTES = int(os.environ.get("INDEXER_LAG_MINUTES", "20"))
+# tag them. The original 20 minutes covered each detector's worst case
+# scheduling delay alone: a REFRESH_SECONDS cycle just missing a
+# just-closed window/transition, plus (for template-mix specifically) up
+# to WINDOW_MINUTES more before that window even counts as closed -- but
+# NOT the separate time ClickHouse itself then takes to actually APPLY
+# the mutation once issued, which isn't instantaneous. Confirmed on
+# net-flow as a real, live gap, not a hypothetical one: a device's
+# "Explain this anomaly" request for a specific unusual_template_mix
+# window came back with zero semantic-search hits despite 175 real
+# matching ClickHouse rows -- the window's own detector cycle didn't fire
+# until close to the 20-minute boundary itself (REFRESH_SECONDS's own
+# worst case), leaving ClickHouse's mutation-application time (non-
+# negligible under this host's sustained ClickHouse load -- confirmed
+# pegged near 100% CPU) no room at all before the indexer's checkpoint
+# swept past those exact rows. The retroactive tag DID eventually land
+# (confirmed directly in ClickHouse afterward), just too late for this
+# forward-only, never-re-reads-a-row indexer to ever see it. Doubled to
+# give real margin for that previously-unaccounted-for third factor, at
+# the cost of newly-logged events taking longer to become searchable.
+INDEXER_LAG_MINUTES = int(os.environ.get("INDEXER_LAG_MINUTES", "40"))
 
 # Opt-in, default off: during a large backfill (e.g. after a checkpoint
 # reset), run_cycle's inner while-loop below fetches and embeds batch after
