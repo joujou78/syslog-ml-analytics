@@ -58,6 +58,28 @@ class Settings(BaseSettings):
     # ~80-90s worst case at this hardware's measured decode speed, leaving
     # real margin under ollama_timeout_seconds even under some contention.
     ollama_num_predict: int = 400
+    # Confirmed live as a real gap the single-call timeout above doesn't
+    # close: ask()'s tool-calling loop can make up to MAX_TOOL_ITERATIONS
+    # (log_assistant_service.py) separate Ollama calls, each independently
+    # budgeted up to ollama_timeout_seconds -- so the loop's total worst
+    # case is MAX_TOOL_ITERATIONS * ollama_timeout_seconds, far beyond
+    # nginx's single 300s proxy_read_timeout for the whole HTTP request.
+    # A real question ("what was happening in its logs...") needed a
+    # second round after its first tool call (semantic_search) came back
+    # empty due to indexer lag -- the cumulative time crossed nginx's
+    # ceiling before the backend's own per-call timeout ever had a chance
+    # to fire, so nginx's blunt connection drop won the race instead of
+    # this app's own clean, explained error -- the exact "misread as down"
+    # failure ollama_timeout_seconds' own comment already describes
+    # avoiding for a single slow call, just via a path that guard didn't
+    # cover. ask() now tracks a wall-clock deadline across the WHOLE loop
+    # using this budget (not just per-call) and gives up cleanly, with its
+    # own explained message, before nginx's timeout can win that race.
+    # Deliberately leaves real margin under nginx's 300s on top of
+    # ollama_timeout_seconds' own margin, for tool-execution time
+    # (ClickHouse/OpenSearch queries) between model calls, which eats into
+    # the same 300s window but isn't itself bounded by ollama_timeout_seconds.
+    ask_total_timeout_seconds: float = 270.0
     # Caps how many CPU threads THIS call is allowed to use. Root-caused on
     # net-flow (8 cores): with no cap, each llama-server process (one per
     # loaded model -- the embed model AND the chat model are separate

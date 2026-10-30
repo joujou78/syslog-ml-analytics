@@ -23,6 +23,7 @@ import json
 import logging
 import pathlib
 import re
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -308,6 +309,15 @@ _NO_HITS_ANSWER = (
 # an unverifiable number gets a visible caveat instead of being presented
 # as fact.
 MAX_TOOL_ITERATIONS = 6
+
+# Below this much remaining wall-clock budget (see ask_total_timeout_seconds
+# in config.py), don't even start another Ollama call -- a call this starved
+# of time can't realistically produce a useful response anyway (num_predict
+# alone implies tens of seconds minimum at this hardware's measured decode
+# speed, per ollama_num_predict's own comment), so it's better to stop
+# cleanly now than let httpx's own timeout cut it off mid-generation with
+# nothing to show for the wait.
+_MIN_REMAINING_SECONDS_FOR_ANOTHER_CALL = 20.0
 
 _COMPARISON_MARKERS = (
     "compare", " vs ", " vs. ", "versus", "difference between",
@@ -3358,10 +3368,16 @@ async def _execute_tool(
         # searching for THAT instead of the user's real topic -- which
         # explains the near-zero relevance scores (0.014-0.016) and
         # generic, mostly-irrelevant "link up" hits actually returned.
-        # Falling back to "query" when "phrase" is absent costs nothing on
-        # the normal case (the model usually does use "phrase") and
-        # recovers the one wrong-key-name variant confirmed live so far.
-        phrase = arguments.get("phrase") or arguments.get("query") or ""
+        # Confirmed AGAIN live with a second re-ask of the same underlying
+        # question (a later, differently-worded "explain this anomaly
+        # window" request) using {'keyword': '...', ...} instead -- a
+        # THIRD synonym for the same declared parameter, not a one-off.
+        # Given the model has now used three different plausible-sounding
+        # names for the same thing, falling back across all of them costs
+        # nothing on the normal case (the model usually does use "phrase")
+        # and recovers every variant confirmed live so far, rather than
+        # patching one synonym at a time as each new one turns up.
+        phrase = arguments.get("phrase") or arguments.get("query") or arguments.get("keyword") or ""
         sub_query = LogAssistantQuery(
             question=phrase[:1000] or "related logs",
             source_ip=arguments.get("source_ip"),
@@ -3401,6 +3417,14 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # device has dominated event counts across the whole guessed range --
     # a time-relative question is not safe to trust without this anchor.
     now = datetime.now(timezone.utc)
+    # Confirmed live as a real gap: see ask_total_timeout_seconds' own
+    # comment in config.py for the full incident (a multi-round tool-
+    # calling exchange crossed nginx's 300s proxy_read_timeout even though
+    # no single Ollama call exceeded ITS OWN ollama_timeout_seconds budget,
+    # so nginx's blunt connection drop won the race instead of this app's
+    # own clean, explained message). This deadline is wall-clock across the
+    # WHOLE loop below, not reset per iteration.
+    loop_deadline = time.monotonic() + settings.ask_total_timeout_seconds
 
     # See _unresolved_ranking_concept's docstring for what this covers: ANY
     # "which device/vendor has the most <concept>" question not already
@@ -3630,6 +3654,25 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     attempted_filter_args: dict = {}
 
     for _ in range(MAX_TOOL_ITERATIONS):
+        # See loop_deadline's own comment: this caps the PER-CALL timeout to
+        # whatever's actually left of the whole-loop budget, and gives up
+        # cleanly -- our own explained message, not nginx's blunt drop --
+        # once there isn't enough left for another call to be worthwhile.
+        remaining_budget = loop_deadline - time.monotonic()
+        if remaining_budget < _MIN_REMAINING_SECONDS_FOR_ANOTHER_CALL:
+            log.info(
+                "Log Assistant ask() stopped before nginx's timeout could: %.1fs left of the %.0fs "
+                "total budget, not enough for another Ollama call.",
+                remaining_budget, settings.ask_total_timeout_seconds,
+            )
+            return AskResponse(
+                answer=(
+                    "This question needed more back-and-forth with the model than there was time "
+                    "for -- try a narrower or more specific question, or try again (the server may "
+                    "be under load right now)."
+                ),
+                sources=sources, model=settings.ollama_chat_model,
+            )
         body = await asyncio.to_thread(
             _post_chat_sync,
             f"{settings.ollama_url}/api/chat",
@@ -3646,7 +3689,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                     "num_thread": settings.ollama_chat_num_thread,
                 },
             },
-            settings.ollama_timeout_seconds,
+            min(settings.ollama_timeout_seconds, remaining_budget),
         )
         message = body["message"]
         tool_calls = message.get("tool_calls")
