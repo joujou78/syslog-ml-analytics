@@ -164,7 +164,7 @@ async def semantic_search(os_client: OpenSearch, query: LogAssistantQuery) -> li
     return [_hit_to_log_hit(hit) for hit in result["hits"]["hits"]]
 
 
-def _raw_data_exists(ch_client, query: LogAssistantQuery) -> int:
+def _raw_data_exists(ch_client, query: LogAssistantQuery) -> tuple[int, int]:
     """Cheap existence check against syslog_ml.events using the same
     structural filters as the OpenSearch query (source_ip/vendor/time
     range), ignoring the free-text question entirely -- ClickHouse does
@@ -177,13 +177,21 @@ def _raw_data_exists(ch_client, query: LogAssistantQuery) -> int:
     real use, where "No related log lines were found" looked identical
     for that case and for a genuinely quiet window.
 
+    Returns (total_count, anomalous_count) -- both needed since under
+    settings.indexer_anomalies_only (see its own comment) the indexer only
+    EVER embeds is_anomaly=1 rows, so total_count alone can't tell a
+    genuinely-not-indexed-yet anomalous row apart from an ordinary,
+    non-anomalous one that will never be indexed regardless of how long
+    this waits. anomalous_count mirrors exactly the indexer's own
+    `_anomaly_clause()` filter.
+
     Only runs when at least one narrow filter is present (source_ip, or a
     bounded start+end range) -- an unfiltered question with zero
     OpenSearch hits never triggers a full, unbounded table scan just to
     explain the empty result.
     """
     if not query.source_ip and not (query.start and query.end):
-        return 0
+        return 0, 0
 
     conditions = []
     params: dict = {}
@@ -200,26 +208,47 @@ def _raw_data_exists(ch_client, query: LogAssistantQuery) -> int:
     if query.end:
         conditions.append(f"event_time <= '{ch_literal(query.end)}'")
 
-    result = ch_client.query(f"SELECT count() FROM syslog_ml.events WHERE {' AND '.join(conditions)}", parameters=params)
-    return result.result_rows[0][0]
+    where = " AND ".join(conditions)
+    result = ch_client.query(
+        f"SELECT count(), countIf(is_anomaly = 1) FROM syslog_ml.events WHERE {where}", parameters=params,
+    )
+    total, anomalous = result.result_rows[0]
+    return total, anomalous
 
 
 async def build_coverage_note(ch_client, query: LogAssistantQuery, hits: list[LogHit]) -> str | None:
     if hits:
         return None
     try:
-        raw_count = await asyncio.to_thread(_raw_data_exists, ch_client, query)
+        total_count, anomalous_count = await asyncio.to_thread(_raw_data_exists, ch_client, query)
     except Exception:
         # Best-effort diagnostic only -- a ClickHouse hiccup here must
         # never break the actual search/ask response over a nice-to-have
         # explanation for why it came back empty.
         log.exception("Coverage-note ClickHouse check failed, omitting the note")
         return None
-    if raw_count == 0:
+    if total_count == 0:
         return None
+    # Confirmed live as a real, actively misleading gap, not just an
+    # inaccuracy: under indexer_anomalies_only, the indexer never embeds a
+    # non-anomalous row -- so a window's raw total_count (interface up/down
+    # chatter included) being nonzero says nothing about whether this
+    # window will EVER become searchable. A 30-row window with only 10
+    # is_anomaly=1 rows got the identical "haven't been indexed YET"
+    # wording a genuinely-about-to-catch-up window would, with nothing to
+    # tell a user "most of this will never show up here" apart from
+    # "give it a few more minutes".
+    if settings.indexer_anomalies_only and anomalous_count == 0:
+        return (
+            f"{total_count} matching log line(s) exist in ClickHouse for this filter, but none are "
+            "flagged anomalous -- this deployment only indexes anomalous events for semantic search "
+            "(INDEXER_ANOMALIES_ONLY), so ordinary, non-anomalous messages never appear here "
+            "regardless of how long you wait. Check Log Search for the raw data instead."
+        )
+    searchable_count = anomalous_count if settings.indexer_anomalies_only else total_count
     return (
-        f"{raw_count} matching log line(s) exist in ClickHouse for this filter, but haven't been "
-        "indexed for semantic search yet -- check Log Search for the raw data, or see README's "
+        f"{searchable_count} matching log line(s) exist in ClickHouse for this filter, but haven't "
+        "been indexed for semantic search yet -- check Log Search for the raw data, or see README's "
         "\"Log Assistant\" section on the indexer's checkpoint."
     )
 

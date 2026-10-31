@@ -22,6 +22,22 @@ class Settings(BaseSettings):
     # sides must agree on (see opensearch/setup_index.py).
     opensearch_url: str = "http://localhost:9200"
     opensearch_index: str = "syslog_ml_log_events"
+    # Must mirror ml/log_assistant_indexer.py's OWN identically-named env
+    # var exactly (bare INDEXER_ANOMALIES_ONLY, no SYSLOG_ML_ prefix --
+    # that script reads os.environ directly, not through this Settings
+    # class, so validation_alias is used to bypass the usual prefix here).
+    # Confirmed live as a real gap: build_coverage_note's "N matching log
+    # line(s) exist... but haven't been indexed for semantic search YET"
+    # note counted ALL rows matching the filter regardless of is_anomaly,
+    # which is actively misleading once this flag is on -- the
+    # overwhelming majority of a typical window's raw rows are ordinary,
+    # non-anomalous chatter the indexer will NEVER embed under this
+    # setting, not just "not yet". Confirmed live: a 30-row window with
+    # only 10 is_anomaly=1 rows (5 from two actually-flagged
+    # unusual_template_mix sub-windows) got the identical "not indexed
+    # yet" wording a genuinely quiet, fully-caught-up window would, with
+    # nothing to tell a user which case they're actually in.
+    indexer_anomalies_only: bool = Field(default=False, validation_alias="INDEXER_ANOMALIES_ONLY")
     ollama_url: str = "http://localhost:11434"
     # Must match ml/log_assistant_indexer.py's OLLAMA_EMBED_MODEL -- a
     # question is embedded with this model to kNN-search against vectors
