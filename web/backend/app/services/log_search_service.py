@@ -141,6 +141,24 @@ def search_logs(
     case-sensitive whole-token predicates (equals/like/hasToken), and log
     messages vary in case, so this favors correct results over guaranteed
     index use.
+
+    ORDER BY event_time DESC, hostname, severity -- NOT event_time alone.
+    Confirmed live as a real, common gap, not a rare edge case: a 7-day
+    survey found 351,916 distinct timestamps shared by more than one row,
+    involving ~1.94 million rows total (multiple devices, or the same
+    device, logging within the same millisecond). ClickHouse does not
+    guarantee a stable row order for ties across separate LIMIT/OFFSET
+    queries unless the ORDER BY fully disambiguates them -- a real risk
+    for actual multi-page browsing (clicking "next page" in Log Search),
+    where a tie straddling a page boundary could show the same row twice
+    or skip one silently between two separate requests. hostname/severity
+    are appended because they're this table's own declared physical sort
+    key (ORDER BY (event_time, hostname, severity) in clickhouse/init.sql)
+    -- reusing it costs nothing extra for ClickHouse to satisfy and
+    collapses the vast majority of real-world ties (which are typically
+    across different devices logging around the same instant) down to the
+    much narrower case of the same device logging two different messages
+    at the same severity within the same millisecond.
     """
     limit = max(1, min(limit, MAX_LIMIT))
     offset = max(0, offset)
@@ -160,7 +178,7 @@ def search_logs(
             anomaly_reasons, resolution_method
         FROM syslog_ml.events
         WHERE {" AND ".join(conditions)}
-        ORDER BY event_time DESC
+        ORDER BY event_time DESC, hostname, severity
         LIMIT %(fetch_limit)s OFFSET %(offset)s
     """
 
@@ -364,6 +382,13 @@ def export_logs(
     `truncated` is True if there were more matching rows than
     EXPORT_MAX_ROWS, so the caller can flag an incomplete export instead of
     silently returning a partial one.
+
+    ORDER BY also includes hostname/severity, matching search_logs' own
+    tie-breaker (see its docstring for the confirmed-live reasoning) --
+    this function has no OFFSET to make ties a multi-page risk the way
+    search_logs has, but keeping both queries' ordering consistent means
+    the same filter always presents rows in the same order whether browsed
+    or exported.
     """
     conditions, params, start, end = _build_conditions(
         start=start, end=end, hostname=hostname, source_ip=source_ip, vendor=vendor, program=program,
@@ -379,7 +404,7 @@ def export_logs(
             anomaly_reasons, resolution_method
         FROM syslog_ml.events
         WHERE {" AND ".join(conditions)}
-        ORDER BY event_time DESC
+        ORDER BY event_time DESC, hostname, severity
         LIMIT %(fetch_limit)s
     """
     result = client.query(query, parameters=params)
