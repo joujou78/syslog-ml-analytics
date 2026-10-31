@@ -3432,6 +3432,64 @@ async def _execute_tool(
     return {"error": f"unknown tool '{name}'"}, []
 
 
+def _semantic_search_hits_plain_answer(hits: list[LogHit]) -> str:
+    """Deterministic fallback summary built directly from semantic_search's
+    own retrieved hits -- same "don't trust the model to restate real data"
+    rationale as _anomaly_summary_plain_answer and friends, applied to the
+    one case those don't cover: an open-ended "explain this" question has
+    no single fixed-shape answer to force-resolve ahead of time, but once
+    the model's own follow-up summarization comes back blank (confirmed
+    live, repeatedly, as unreliable on this CPU-only hardware -- see the
+    blank-answer guard's own comment) despite the underlying hits being
+    real and relevant, there's no reason to only ever point at a table and
+    never actually say what's in it.
+
+    Groups by predicted_category ALONE -- a small, fixed set (AUTH,
+    NETWORK, HARDWARE, SECURITY, SYSTEM, APPLICATION, CONFIG, UNKNOWN, see
+    ml/labeling_rules.py's CATEGORIES) the classifier pipeline already
+    computes for exactly this purpose. Deliberately NOT `program` as well
+    (an earlier version of this function also grouped by program, on the
+    assumption it'd be a stable mnemonic like RouterOS's "interface,info")
+    -- confirmed live as wrong for Cisco devices specifically: their
+    `program` field holds the message's own raw per-event sequence number
+    (e.g. "257310", "257316"), not a shared tag, which silently defeated
+    the grouping entirely (two occurrences of the literal same condition,
+    "%PLATFORM_ENV-1-PWR_RPS: Redundant power supply faulty...", came out
+    as two separate one-off groups instead of being counted together).
+    Not grouping by raw message text either, for the same underlying
+    reason: Cisco/RouterOS syslog messages embed their own sequence number
+    and timestamp in the message body itself, so exact-text grouping has
+    the identical failure mode."""
+    if not hits:
+        return ""
+    groups: dict[str, dict] = {}
+    for h in hits:
+        key = h.predicted_category or "uncategorized"
+        g = groups.setdefault(key, {"count": 0, "example": h.message.strip(), "reasons": set(), "severities": set()})
+        g["count"] += 1
+        g["reasons"].update(h.anomaly_reasons)
+        g["severities"].add(h.severity)
+    ranked = sorted(groups.items(), key=lambda kv: kv[1]["count"], reverse=True)
+    parts = []
+    for category, g in ranked:
+        severities = "/".join(sorted(g["severities"]))
+        reasons = ", ".join(sorted(g["reasons"])) if g["reasons"] else "none"
+        parts.append(
+            f"{g['count']}x [{severities}] {category} -- e.g. \"{_truncate(g['example'], 200)}\" "
+            f"(flagged: {reasons})"
+        )
+    devices = sorted({h.hostname for h in hits})
+    device_label = devices[0] if len(devices) == 1 else f"{len(devices)} devices ({', '.join(devices[:5])}{', and more' if len(devices) > 5 else ''})"
+    times = sorted(h.event_time for h in hits)
+    breakdown = " | ".join(parts)
+    return (
+        f"Based on {len(hits)} retrieved log line(s) for {device_label} between {times[0].isoformat()} "
+        f"and {times[-1].isoformat()}, the distinct message types found were: {breakdown}. (Grounded "
+        "directly in the cited log lines below -- the model's own written summary wasn't available for "
+        "this question, so this breakdown stands in for it.)"
+    )
+
+
 async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: AsyncSession) -> AskResponse:
     # Folded into the one user message, not a separate system-role message
     # -- see _post_chat_sync's docstring: a system-role message hung this
@@ -4000,11 +4058,11 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # cited log lines when there are any, rather than presenting an
             # empty answer as if it were a deliberate "nothing found".
             if not answer.strip():
-                answer = (
-                    "The assistant retrieved log data for this question but didn't produce a written "
-                    "summary of it -- see the cited log lines below for what was found; try rephrasing "
-                    "the question for a direct answer."
-                ) if sources else (
+                # Builds a real, grounded summary directly from the hits
+                # already in hand -- see _semantic_search_hits_plain_
+                # answer's own docstring -- rather than only ever telling
+                # the user to go look at the cited log lines themselves.
+                answer = _semantic_search_hits_plain_answer(sources) or (
                     "The assistant didn't produce an answer for this question -- try rephrasing it or "
                     "being more specific."
                 )
