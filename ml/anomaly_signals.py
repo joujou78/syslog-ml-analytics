@@ -15,7 +15,22 @@ import re
 
 from labeling_rules import CATEGORY_RULES
 
-ALWAYS_ANOMALOUS_SEVERITIES = {"emerg", "alert", "crit"}
+# Confirmed via a live catalog of every distinct Cisco %FACILITY-SEVERITY-
+# MNEMONIC: message type actually seen in syslog_ml.events (user-requested
+# QA sweep, Oct/Nov 2026): "err" (rank 3, see labeling_rules.py's
+# SEVERITY_ORDER) was excluded here, and that specifically hurt detection
+# of common, genuinely concerning conditions that are too frequent for
+# rare_template to catch but one notch below "crit" -- confirmed examples:
+# %STORM_CONTROL-3-FILTERED (66,312 occurrences, a real broadcast storm,
+# only 14.6% flagged) and %ENVM-3-FAN_FAILED_ERR (5,393 occurrences, a
+# literal "Fan Failed" message, only 1% flagged). Adding "err" closes both.
+# Deliberate tradeoff, not a free lunch: this newly flags every "err"-level
+# event going forward (confirmed ~100K+ events in the historical data this
+# catalog covered), including some, like %LINK-3-UPDOWN, that were already
+# reasonably well covered by the statistical signals alone -- accepted
+# because "err" is still the device's own classification of something
+# having actually gone wrong, not routine telemetry.
+ALWAYS_ANOMALOUS_SEVERITIES = {"emerg", "alert", "crit", "err"}
 
 # Reused, not duplicated: the same SECURITY rule the category classifier's
 # weak-supervision already uses (see labeling_rules.py) -- tune it there,
