@@ -370,7 +370,17 @@ def _needs_multiple_data_points(question: str) -> bool:
 # the force-resolve backstop handed back a COUNT instead of the rows asked
 # for. A time phrase alone isn't enough to conclude "this wants
 # count_events"; this explicit negative signal is checked first.
-_LOG_ROWS_MARKERS = ("show me", "show the", "list the", "list all", "display", "which log", "log lines", "the logs", "these logs")
+_LOG_ROWS_MARKERS = (
+    "show me", "show the", "list the", "list all", "display", "which log", "log lines", "the logs", "these logs",
+    # Confirmed live: "what are the recent authentication failures" is the
+    # identical intent as "show me the recent authentication failures" --
+    # wants real matching rows back -- but used none of the markers above.
+    # Plural "what are"/"what were" specifically, not singular "what is"/
+    # "what's": those already belong to _wants_incidents (a vague status/
+    # overview question like "what is happening today"), a different
+    # intent this must not collide with.
+    "what are", "what were",
+)
 
 
 def _wants_log_rows(question: str) -> bool:
@@ -2190,6 +2200,51 @@ def _unresolved_count_concept(question: str, history: list["ConversationTurn"] |
     return None
 
 
+def _unresolved_listing_concept(question: str, history: list["ConversationTurn"] | None = None) -> str | None:
+    """Third sibling to _unresolved_ranking_concept/_unresolved_count_concept
+    (see the former's docstring for the shared reasoning on checking the
+    current question's text before any bare-follow-up inheritance): covers
+    a plain "what are/were the recent <concept>" listing request -- wants
+    the actual matching log ROWS back, not a ranking or a bare count.
+
+    Confirmed live as a real, distinct gap from both of those: "what are
+    the recent authentication failures" has the model call search_logs
+    with a literal keyword guess ('authentication failure', singular) that
+    never matches the real stored wording ('authentication ... failed'),
+    the exact same "prompting/guessing alone isn't reliable" failure mode
+    _resolve_concept_ranking/_resolve_concept_count already close for their
+    own question shapes via verified semantic-search keyword discovery --
+    just not yet extended to this third shape.
+
+    Gated on _wants_log_rows (now also covering "what are"/"what were",
+    see _LOG_ROWS_MARKERS) and explicitly excluding ranking/count/incidents
+    shapes (each already has its own, more specific resolver) and the 8
+    fixed anomaly_reason categories (already correctly handled via
+    anomaly_summary, not a keyword search)."""
+    if (
+        _wants_log_rows(question)
+        and not _wants_ranking(question)
+        and not _wants_count(question)
+        and not _wants_incidents(question)
+        and _resolve_anomaly_reason(question)[0] is None
+        and _extract_concept(question)
+    ):
+        return question
+    if history and _is_bare_followup(question) and not _extract_concept(question):
+        # Same guard as the other two: the previous turn must itself be a
+        # count/ranking/listing-shaped topic, not just "has some non-
+        # generic-looking words".
+        prev = history[-1].question
+        if (
+            _wants_log_rows(question) and not _wants_ranking(question) and not _wants_count(question)
+            and (_wants_log_rows(prev) or _wants_count(prev) or _wants_ranking(prev))
+            and _extract_concept(prev)
+        ):
+            return prev
+        return _unresolved_listing_concept(prev)
+    return None
+
+
 def _significant_programs(hits: list[LogHit], min_fraction: float = 0.2, max_programs: int = 3) -> list[str]:
     """Programs the retrieved hits meaningfully agree the concept lives
     under -- deliberately not just the single top ("majority") one.
@@ -2649,6 +2704,80 @@ def _concept_count_plain_answer(count: int, keyword: str, programs: list[str], p
         qualifier += f" (vendor: {', '.join(vendors)})"
     period = f" {period_label}" if period_label else " (cumulative, all-time)"
     return f"There have been {count} events matching {qualifier}{period}."
+
+
+# How many rows a listing concept answer shows, after merging every
+# (program, vendor) pair's own results -- capped the same way
+# _concept_ranking_plain_answer's breakdown is, for the same reason (an
+# answer with hundreds of individual log lines spelled out is an
+# unreadable wall of text, not to mention a 4000-char ConversationTurn
+# risk -- see _incidents_plain_answer's own confirmed-live incident).
+_LISTING_CONCEPT_MAX_ROWS = 10
+# Fetched per (program, vendor) pair before merging and re-capping to
+# _LISTING_CONCEPT_MAX_ROWS -- wider than the final display count so a
+# pair that individually ranks low still has a fair chance of contributing
+# its own most-recent rows to the final merged, re-sorted top N, the same
+# "don't bet everything on a single pair" reasoning _significant_programs'
+# own docstring explains for ranking/count.
+_LISTING_CONCEPT_FETCH_LIMIT = 30
+
+
+async def _resolve_concept_listing(
+    os_client: OpenSearch, ch_client, concept_question: str, start: datetime, end: datetime,
+) -> dict | None:
+    """Third sibling to _resolve_concept_ranking/_resolve_concept_count --
+    same discovery step (_discover_concept_keyword: semantic_search for
+    real examples, reduce to a verified recurring keyword), but returns the
+    actual matching log ROWS (via log_search_service.search_logs, which
+    already orders by event_time DESC -- "recent" is satisfied for free)
+    instead of an aggregate count or ranking. See _unresolved_listing_
+    concept's docstring for the confirmed live gap this closes."""
+    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question)
+    if not discovered:
+        return None
+    keyword, programs = discovered
+    # Same vendor/program-mention reasoning as _resolve_concept_ranking/
+    # _resolve_concept_count.
+    vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
+    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
+    programs = list(dict.fromkeys((programs or []) + explicit_programs))
+    # Sequential, not asyncio.gather -- same confirmed-live ch_client
+    # concurrency restriction as every other multi-call site in this file.
+    responses = [
+        await asyncio.to_thread(
+            log_search_service.search_logs, ch_client, keyword=keyword, program=p, vendor=v,
+            start=start, end=end, limit=_LISTING_CONCEPT_FETCH_LIMIT,
+        )
+        for p in (programs or [None])
+        for v in (vendors or [None])
+    ]
+    merged = sorted((item for r in responses for item in r.items), key=lambda i: i.event_time, reverse=True)
+    return {
+        "rows": merged[:_LISTING_CONCEPT_MAX_ROWS],
+        "truncated": len(merged) > _LISTING_CONCEPT_MAX_ROWS,
+        "keyword": keyword, "programs": programs, "vendors": vendors,
+    }
+
+
+def _concept_listing_plain_answer(
+    rows: list, keyword: str, programs: list[str], vendors: list[str] | None, period_label: str | None, truncated: bool,
+) -> str:
+    # Same qualifier/period/vendor-disclosure conventions as
+    # _concept_count_plain_answer -- `programs` logged by the caller, not
+    # shown here (confirmed confusing to a plain question, see _concept_
+    # ranking_plain_answer's own comment); `vendors` shown since the user
+    # named it explicitly.
+    qualifier = f"messages containing '{keyword}'"
+    if vendors:
+        qualifier += f" (vendor: {', '.join(vendors)})"
+    period = f" {period_label}" if period_label else " (cumulative, all-time)"
+    if not rows:
+        return f"No events matching {qualifier}{period}."
+    lines = [f"{r.event_time.isoformat()} {r.hostname}: {_truncate(r.message.strip(), 200)}" for r in rows]
+    more_note = " (more exist -- showing only the most recent)" if truncated else ""
+    return (
+        f"{len(rows)} most recent event(s) matching {qualifier}{period}{more_note}: " + " | ".join(lines)
+    )
 
 
 # Loose enough to catch a real dotted-quad before it's used as a literal
@@ -3570,6 +3699,32 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r "
                 "vendors=%r period=%r -> %s",
                 count_concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"], period_label, resolved["count"],
+            )
+            return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+
+    # Third sibling to the ranking/count concept force-resolves just above
+    # -- see _unresolved_listing_concept's own docstring for the confirmed
+    # live gap this closes ("what are the recent authentication failures"
+    # had the model guess a literal keyword, 'authentication failure', that
+    # never matches the real stored wording, 'authentication ... failed').
+    listing_concept_question = _unresolved_listing_concept(query.question, query.history)
+    if listing_concept_question and not _detect_comparison_periods(query.question, now):
+        single_period_for_listing = _detect_single_period(query.question, now)
+        listing_period_label, listing_start, listing_end = (
+            single_period_for_listing if single_period_for_listing else (None, _ALL_TIME_START, now)
+        )
+        resolved = await _resolve_concept_listing(os_client, ch_client, listing_concept_question, listing_start, listing_end)
+        if resolved:
+            answer = _concept_listing_plain_answer(
+                resolved["rows"], resolved["keyword"], resolved["programs"], resolved["vendors"],
+                listing_period_label, resolved["truncated"],
+            )
+            log.info(
+                "Log Assistant FORCE-RESOLVED a concept listing via semantic-search discovery + a "
+                "grounded keyword, no full tool-calling round-trip: concept=%r keyword=%r programs=%r "
+                "vendors=%r period=%r -> %d row(s)",
+                listing_concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"],
+                listing_period_label, len(resolved["rows"]),
             )
             return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
 
