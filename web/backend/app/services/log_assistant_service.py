@@ -2472,6 +2472,27 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
         return len(lowered) >= 3 and any(lowered in p.lower() for p in program_values)
 
     candidates = [c for c in candidates if not _is_known_entity(c)] or candidates
+    # Confirmed live: "what are the recent authentication failures"
+    # discovered keyword='login' -- a word shared across BOTH
+    # authentication successes AND failures in the retrieved sample,
+    # capturing none of the "failure" distinction the question was
+    # actually about. The retrieved sample for an "authentication"-shaped
+    # question is inherently mixed (successes and failures both mention
+    # "login"/"authentication"), so raw frequency across it is not a
+    # reliable signal of which candidate the question actually means --
+    # and _choose_concept_keyword's free model choice had no reliable way
+    # to prefer the more specific, correct one over the more frequent,
+    # generic one (the same "prompting/open-ended judgment isn't reliable"
+    # lesson this whole file keeps relearning). A candidate sharing a
+    # meaningful word-stem with a word literally IN THE QUESTION (e.g.
+    # 'failed' sharing 'fail' with the question's own 'failures') is far
+    # stronger, deterministic evidence of relevance -- narrow to those
+    # first, same "filter the candidate pool, fall back to unfiltered if
+    # that would discard everything" discipline _is_known_entity already
+    # uses just above.
+    question_stems = {w[:4] for w in re.findall(r"[a-z]+", concept_question.lower()) if len(w) >= 4}
+    stem_matched = [c for c in candidates if c[:4] in question_stems]
+    candidates = stem_matched or candidates
     # A single clearly-dominant candidate needs no model call at all --
     # faster and strictly more reliable than asking the model to confirm
     # the only option.
@@ -2778,6 +2799,27 @@ def _concept_listing_plain_answer(
     return (
         f"{len(rows)} most recent event(s) matching {qualifier}{period}{more_note}: " + " | ".join(lines)
     )
+
+
+def _log_entries_to_hits(entries: list) -> list[LogHit]:
+    """Converts log_search_service's LogEntry rows (an exact ClickHouse
+    filter match, no relevance ranking) into LogHit, so they can be
+    attached as this response's `sources` -- the UI's "Cited log lines"
+    table reads from `sources` regardless of which path produced them,
+    semantic_search's own ranked hits included. `score` is a LogHit-only
+    field semantic_search populates from OpenSearch's own relevance
+    ranking; set to 1.0 here since these rows are exact filter matches,
+    not similarity-ranked -- there's no real per-row score to report, and
+    1.0 reads as "fully relevant" rather than implying a comparison to a
+    ranking that was never computed."""
+    return [
+        LogHit(
+            event_time=e.event_time, source_ip=e.source_ip, hostname=e.hostname, vendor=e.vendor,
+            severity=e.severity, program=e.program, predicted_category=e.predicted_category,
+            message=e.message, is_anomaly=e.is_anomaly, anomaly_reasons=e.anomaly_reasons, score=1.0,
+        )
+        for e in entries
+    ]
 
 
 # Loose enough to catch a real dotted-quad before it's used as a literal
@@ -3726,7 +3768,14 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 listing_concept_question, resolved["keyword"], resolved["programs"], resolved["vendors"],
                 listing_period_label, len(resolved["rows"]),
             )
-            return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+            # Confirmed live: the UI's "Cited log lines" table showed "No
+            # related log lines were found" even though the answer text
+            # above lists real matching rows -- this force-resolve's own
+            # rows just never got attached as `sources` (every OTHER path
+            # that cites real log lines, semantic_search included, does).
+            # The whole point of a listing answer is for the cited table to
+            # show the same rows the text describes.
+            return AskResponse(answer=answer, sources=_log_entries_to_hits(resolved["rows"]), model=settings.ollama_chat_model)
 
     # A new capability, not a bug-fix retrofit -- built deterministic from
     # the start rather than waiting for a live incident to show the model
