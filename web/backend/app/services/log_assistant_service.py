@@ -2492,6 +2492,29 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
     # uses just above.
     question_stems = {w[:4] for w in re.findall(r"[a-z]+", concept_question.lower()) if len(w) >= 4}
     stem_matched = [c for c in candidates if c[:4] in question_stems]
+    if not stem_matched:
+        # Confirmed live, a SECOND time, with the stem-match fix above
+        # already deployed: "what are the recent authentication failures"
+        # still discovered keyword='login'. Root cause one layer deeper
+        # than the fix above reaches: 'failed'/'authentication' from the
+        # real PPTP-style failure messages never became CANDIDATES at all
+        # -- _significant_programs' own threshold for "this program is
+        # significant enough to include" (>=20% of the sample) is looser
+        # than min_count's threshold for "this word is frequent enough to
+        # even be offered" (~33% of the sample), so a real, significant-
+        # but-minority program's own distinctive vocabulary can be
+        # excluded from candidacy entirely while that very program is
+        # still being queried. The stem-match filter above can only narrow
+        # what's already offered -- it can't rescue a word that was never
+        # a candidate. Re-extracted at this function's own documented
+        # floor (min_count=2 -- still "recurs at least twice", the exact
+        # safety the stricter threshold exists for, not a single rare
+        # message) specifically to recover a stem-matched word a real
+        # minority program supports, without lowering the bar for every
+        # OTHER, non-question-matching candidate too.
+        low_bar_candidates = _candidate_concept_tokens(sample_messages, min_count=2)
+        low_bar_candidates = [c for c in low_bar_candidates if not _is_known_entity(c)] or low_bar_candidates
+        stem_matched = [c for c in low_bar_candidates if c[:4] in question_stems]
     candidates = stem_matched or candidates
     # A single clearly-dominant candidate needs no model call at all --
     # faster and strictly more reliable than asking the model to confirm
