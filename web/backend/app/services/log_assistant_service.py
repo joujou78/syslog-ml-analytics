@@ -2520,6 +2520,19 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
     # faster and strictly more reliable than asking the model to confirm
     # the only option.
     keyword = candidates[0] if len(candidates) == 1 else await _choose_concept_keyword(concept_question, candidates, sample_messages)
+    # Confirmed live, twice, that this mechanism can still land on an
+    # overly generic keyword ('login', then 'user') for a mixed-intent
+    # question even with both stem-match fixes above in place -- diagnosed
+    # each time from the final FORCE-RESOLVED log line alone, which only
+    # ever shows the WINNING keyword, never the candidate pool or sample
+    # composition that produced it. Logged at INFO (basicConfig's level,
+    # see app/main.py -- DEBUG would be silently dropped) so a third
+    # occurrence can be diagnosed directly from real data instead of
+    # reasoning backward from the final answer alone.
+    log.info(
+        "_discover_concept_keyword: sample programs=%r final candidates=%r stem_matched=%r -> keyword=%r",
+        Counter(h.program for h in hits).most_common(), candidates, bool(stem_matched), keyword,
+    )
     if not keyword:
         return None
     return keyword, _significant_programs(hits)
