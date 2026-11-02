@@ -2535,7 +2535,41 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
     )
     if not keyword:
         return None
-    return keyword, _significant_programs(hits)
+    programs = _significant_programs(hits)
+    # Confirmed live: "what are the recent authentication failures" added
+    # 'CSCOacs_Passed_Authentications' to the query purely because the
+    # question's own generic topic word "authentication" is a substring of
+    # that unrelated program's descriptive name (_programs_mentioned_in's
+    # plain substring match, built for a DIFFERENT case -- see its own
+    # docstring) -- confirmed via the diagnostic log just above that ZERO
+    # of the 15 real retrieved hits were actually from it (sample
+    # programs=[('pptp,ppp,error', 9), ...], no ACS program present at
+    # all). Merging it in anyway let its own much higher event volume
+    # swamp the rare, highly-relevant pptp,ppp,error rows once
+    # _resolve_concept_listing pools and re-sorts by recency across every
+    # queried program -- a "most recent" answer dominated by unrelated
+    # ACS "succeeded" rows regardless of which keyword won. Unlike the
+    # original "mimosa" case this mechanism exists for (semantic discovery
+    # found no clear program of its own at all, so trusting a textual
+    # mention was the only real signal available), a mention that
+    # contradicts a program the DATA itself already clearly, confidently
+    # pointed to (>=50% of the sample) is coincidental vocabulary overlap,
+    # not evidence -- reject only an explicit match with literally ZERO
+    # supporting hits in the sample when that's the case; still merged in
+    # unconditionally whenever semantic evidence is weak/absent, exactly
+    # as before.
+    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
+    if explicit_programs:
+        hit_program_counts = Counter(h.program for h in hits if h.program)
+        total_hits = sum(hit_program_counts.values())
+        has_dominant_alternative = any(
+            c / total_hits >= 0.5 and p not in explicit_programs
+            for p, c in hit_program_counts.items()
+        ) if total_hits else False
+        if has_dominant_alternative:
+            explicit_programs = [p for p in explicit_programs if hit_program_counts.get(p)]
+    programs = list(dict.fromkeys(programs + explicit_programs))
+    return keyword, programs
 
 
 async def _real_vendor_names(ch_client) -> list[str]:
@@ -2625,18 +2659,12 @@ async def _resolve_concept_ranking(
     # events are counted isn't silently lost the way a single combined
     # query with the wrong assumptions could lose it).
     vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
-    # Confirmed live as a related gap: "how many mimosa devices with
-    # wireless disconnections" named no real `vendor` (Mimosa-brand
-    # devices are tagged via program='Mimosa_C5x', not a vendor column
-    # value -- see _programs_mentioned_in's docstring), so nothing told
-    # this query to actually include that real data source. A program the
-    # question names a fragment of is ADDED to whatever the semantic-
-    # search sample auto-discovered (union, not replace) -- the sample
-    # might already have found it on its own, or might have missed it
-    # the way it missed it live; either way, an explicit mention in the
-    # user's own words is strong enough evidence to include it regardless.
-    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
-    programs = list(dict.fromkeys((programs or []) + explicit_programs))
+    # An explicitly-named program fragment (e.g. "mimosa" -> 'Mimosa_C5x')
+    # is already merged into `programs` by _discover_concept_keyword
+    # itself -- see its own docstring/comment for why that merge now also
+    # guards against a coincidental vocabulary match (a generic topic word
+    # substring-matching an unrelated, zero-evidence program's name)
+    # overriding data the sample already clearly pointed elsewhere.
     group_key = "vendor" if is_vendor else "hostname"
     # One call PER significant program (never a single filtered call) --
     # see _significant_programs' docstring for the confirmed live incident
@@ -2733,11 +2761,10 @@ async def _resolve_concept_count(
     if not discovered:
         return None
     keyword, programs = discovered
-    # Same vendor-filter reasoning as _resolve_concept_ranking.
+    # Same vendor-filter reasoning as _resolve_concept_ranking. The
+    # explicit-program-mention merge (same reasoning as _resolve_concept_
+    # ranking) now happens inside _discover_concept_keyword itself.
     vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
-    # Same explicit-program-mention reasoning as _resolve_concept_ranking.
-    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
-    programs = list(dict.fromkeys((programs or []) + explicit_programs))
     # Sum across every significant program, same reasoning as
     # _resolve_concept_ranking. Sequential, not asyncio.gather -- same
     # confirmed-live ch_client concurrency restriction as there (this was
@@ -2793,11 +2820,14 @@ async def _resolve_concept_listing(
     if not discovered:
         return None
     keyword, programs = discovered
-    # Same vendor/program-mention reasoning as _resolve_concept_ranking/
-    # _resolve_concept_count.
+    # Same vendor-filter reasoning as _resolve_concept_ranking/_resolve_
+    # concept_count. The explicit-program-mention merge now happens inside
+    # _discover_concept_keyword itself (see its own comment for the
+    # confirmed-live dominant-evidence guard this pathway specifically
+    # exposed, since pooling-by-recency across programs -- unlike ranking/
+    # count's own sum-across-programs -- lets one unrelated, high-volume
+    # program's rows silently crowd out a rare but correct one).
     vendors = _vendors_mentioned_in(concept_question, await _real_vendor_names(ch_client))
-    explicit_programs = _programs_mentioned_in(concept_question, await _real_program_names(ch_client))
-    programs = list(dict.fromkeys((programs or []) + explicit_programs))
     # Sequential, not asyncio.gather -- same confirmed-live ch_client
     # concurrency restriction as every other multi-call site in this file.
     responses = [
