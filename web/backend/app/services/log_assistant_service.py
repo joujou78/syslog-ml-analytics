@@ -4383,8 +4383,24 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # device->hostname promotion. Scoped to the same tool names as
             # the single_period override just above, for the same reason
             # (count_events/aggregate_events already have their own,
-            # separate handling elsewhere).
-            if fn["name"] in ("search_logs", "semantic_search", "list_devices"):
+            # separate handling elsewhere) -- EXCEPT that's only true for
+            # the single_period/comparison_periods override branches below,
+            # which detect a relative-time PHRASE in the question itself
+            # ("today", "yesterday"). Confirmed as a real, live gap for a
+            # question with NO such phrase (its start/end came from the
+            # UI's explicit filter instead): after a correctly
+            # source_ip-scoped semantic_search returned real hits, the
+            # model's own count_events follow-up (reusing a narrower
+            # start/end window copied from those real hit timestamps, for
+            # an "exact count" in its final answer) dropped source_ip
+            # entirely, fell through both override branches untouched, and
+            # reached _execute_tool's plain path with no backfill at all --
+            # silently counting the whole network (153) instead of the one
+            # device asked about (the correct count: 5), then stated in the
+            # final answer as if it specifically described that device.
+            # aggregate_events has no deterministic override of its own at
+            # all, so it had this same gap unconditionally. Both added here.
+            if fn["name"] in ("search_logs", "semantic_search", "list_devices", "count_events", "aggregate_events"):
                 if query.source_ip and not _is_real_filter_value(arguments.get("source_ip")):
                     arguments["source_ip"] = query.source_ip
                 if query.vendor and not _is_real_filter_value(arguments.get("vendor")):
