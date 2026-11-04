@@ -163,6 +163,23 @@ INDEXER_ANOMALIES_ONLY = os.environ.get("INDEXER_ANOMALIES_ONLY", "false").lower
 # the cost of newly-logged events taking longer to become searchable.
 INDEXER_LAG_MINUTES = int(os.environ.get("INDEXER_LAG_MINUTES", "40"))
 
+# Confirmed on net-flow: even 40 minutes isn't always enough margin for
+# ClickHouse's own mutation-APPLY latency under sustained load -- a second,
+# independent occurrence of the exact same race (retroactive tag already
+# correct in ClickHouse, indexer's checkpoint already swept past it, zero
+# hits in OpenSearch) recurred after the 20->40 doubling above. Rather than
+# guess at a third, larger fixed buffer (which only ever reduces the odds,
+# never eliminates the race, while making every new event take longer to
+# become searchable), _mutation_safe_cutoff below checks ClickHouse's own
+# system.mutations directly and holds back any row an in-flight mutation on
+# this table could still rewrite, regardless of how long that mutation ends
+# up taking. INDEXER_LAG_MINUTES stays in place alongside it -- it alone
+# covers the OTHER factor (a detector's own REFRESH_SECONDS/WINDOW_MINUTES
+# scheduling delay before a mutation is even submitted), which
+# system.mutations has no way to warn about in advance since no row for it
+# exists yet at that point.
+_last_mutation_hold_logged: datetime | None = None
+
 # Opt-in, default off: during a large backfill (e.g. after a checkpoint
 # reset), run_cycle's inner while-loop below fetches and embeds batch after
 # batch back-to-back with no pause between them -- POLL_SECONDS only applies
@@ -254,6 +271,32 @@ def _anomaly_clause() -> str:
     return " AND is_anomaly = 1" if INDEXER_ANOMALIES_ONLY else ""
 
 
+def _mutation_safe_cutoff(client) -> datetime | None:
+    """Earliest `create_time` among still-running (`is_done = 0`) mutations
+    on `syslog_ml.events`, or None if none are in flight right now. A
+    mutation only ever touches parts/rows that already existed at the
+    moment it was submitted -- it can't retroactively reach a row inserted
+    afterward -- so a row with `received_at` at or after this cutoff was
+    never in scope for the mutation and is already final; anything strictly
+    before it is still "possibly about to change" until that mutation
+    finishes applying. `database`/`table` are bound as ordinary query
+    parameters here (not embedded as literals) -- the known
+    clickhouse_connect binding issue (see `ch_literal` / this module's
+    `_fetch_batch` comment) is specifically about DateTime64(3) comparisons,
+    not plain string equality, so it doesn't apply to this query."""
+    query = """
+        SELECT min(create_time)
+        FROM system.mutations
+        WHERE database = %(database)s AND table = %(table)s AND is_done = 0
+    """
+    result = client.query(query, parameters={"database": "syslog_ml", "table": "events"})
+    # A plain aggregate with no GROUP BY always returns exactly one row --
+    # NULL (Python None) for min() over zero matching mutations, not zero
+    # rows -- but guard the shape anyway rather than assume it.
+    value = result.result_rows[0][0] if result.result_rows else None
+    return value if value else None
+
+
 def _fetch_batch(client, checkpoint: datetime | None) -> list[dict]:
     # +1: a lookahead row, purely to detect whether the LIMIT below cut off
     # in the middle of a group of rows sharing the exact same received_at
@@ -276,6 +319,22 @@ def _fetch_batch(client, checkpoint: datetime | None) -> list[dict]:
     # INDEXER_ANOMALIES_ONLY, permanently excluding) a row before
     # retroactive anomaly tagging has had time to land on it.
     condition += f" AND received_at <= now() - INTERVAL {INDEXER_LAG_MINUTES} MINUTE"
+
+    global _last_mutation_hold_logged
+    mutation_cutoff = _mutation_safe_cutoff(client)
+    if mutation_cutoff != _last_mutation_hold_logged:
+        if mutation_cutoff is not None:
+            log.info(
+                "Log Assistant indexer: holding back rows received_at >= %s -- an in-flight "
+                "ClickHouse mutation on syslog_ml.events (submitted %s) hasn't finished applying yet",
+                mutation_cutoff, mutation_cutoff,
+            )
+        else:
+            log.info("Log Assistant indexer: no in-flight mutation hold on syslog_ml.events, resuming normal fetch bound")
+        _last_mutation_hold_logged = mutation_cutoff
+    if mutation_cutoff is not None:
+        condition += f" AND received_at < '{ch_literal(mutation_cutoff)}'"
+
     condition += _anomaly_clause()
 
     query = f"""
