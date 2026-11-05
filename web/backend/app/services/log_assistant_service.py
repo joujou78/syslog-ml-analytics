@@ -3638,12 +3638,31 @@ async def _execute_tool(
         # question (a later, differently-worded "explain this anomaly
         # window" request) using {'keyword': '...', ...} instead -- a
         # THIRD synonym for the same declared parameter, not a one-off.
-        # Given the model has now used three different plausible-sounding
-        # names for the same thing, falling back across all of them costs
-        # nothing on the normal case (the model usually does use "phrase")
-        # and recovers every variant confirmed live so far, rather than
-        # patching one synonym at a time as each new one turns up.
+        # Confirmed a FOURTH time afterward, in a shape that makes clear
+        # synonym-chasing alone can't keep up: the real search text came
+        # back under a never-before-seen 'system' key, alongside literal
+        # fragments of the phrase parameter's OWN JSON schema ('type':
+        # 'string', 'description': 'What to search for, in plain
+        # language') echoed back as if they were argument values. With
+        # none of phrase/query/keyword present, this fell through to the
+        # generic "related logs" placeholder -- and since OpenSearch's
+        # hybrid query (both its keyword-match half and its vector half)
+        # searches for whatever text it's given, "related logs" against
+        # real log content about wireless scanning naturally came back
+        # empty, with nothing to distinguish that from the data genuinely
+        # not being indexed yet (confirmed live: semantic_search returned
+        # zero hits for a window directly confirmed, via a raw OpenSearch
+        # query, to have 208 real matching documents already indexed).
+        # Rather than add a fifth, sixth, ... named synonym every time the
+        # model invents a new one, fall back to the CURRENT TURN'S OWN
+        # question text once none of the known synonyms produced anything
+        # -- every semantic_search call exists to help answer that
+        # question in the first place, so it's always a meaningful search
+        # phrase, never a guess, regardless of what key name (or none at
+        # all) the model used to (fail to) restate it.
         phrase = arguments.get("phrase") or arguments.get("query") or arguments.get("keyword") or ""
+        if not phrase and question:
+            phrase = question
         sub_query = LogAssistantQuery(
             question=phrase[:1000] or "related logs",
             source_ip=arguments.get("source_ip"),
