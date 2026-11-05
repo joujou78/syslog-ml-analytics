@@ -110,15 +110,44 @@ def _build_query(vector: list[float], query: LogAssistantQuery) -> dict:
             time_range["lte"] = query.end.isoformat()
         filters.append({"range": {"event_time": time_range}})
 
-    knn_clause: dict = {"vector": vector, "k": query.limit}
     if filters:
-        # "Efficient filtering": the lucene engine applies these during the
-        # ANN graph traversal itself, not as a post-filter on the top-k --
-        # without it, a device/time filter on a narrow slice of the index
-        # could come back empty even when matching documents exist, simply
-        # because none of them happened to be in the unfiltered top-k.
-        knn_clause["filter"] = {"bool": {"filter": filters}}
-    knn_query: dict = {"knn": {"embedding": knn_clause}}
+        # Confirmed live as a real, reproducible OpenSearch limitation, not
+        # a one-off: even with "efficient filtering" (the lucene engine
+        # applying a filter during the ANN graph traversal itself, not as a
+        # post-filter on the top-k -- the ORIGINAL fix for a device/time
+        # filter on a narrow slice of the index coming back empty), the
+        # approximate `knn` query clause can STILL silently return ZERO
+        # hits for a filter this narrow -- exactly this project's own
+        # common case, since "Explain this anomaly" always scopes to one
+        # device plus a short window. Confirmed directly: one device's 110
+        # real, correctly-embedded documents for its own 25-minute window
+        # came back empty through the plain `knn` clause, indistinguishable
+        # from a genuine empty result or an indexing-lag gap -- and raising
+        # `index.knn.advanced.filtered_exact_search_threshold` well above
+        # the candidate count made no difference, meaning that setting
+        # isn't honored the same way by this index's `lucene` engine as by
+        # the faiss/nmslib engines it's normally documented for. An EXACT
+        # k-NN via script_score's `knn_score` function -- real cosine
+        # similarity computed only over the already-filtered candidates,
+        # with no approximate graph traversal at all -- returned the
+        # correct 110 hits immediately against the identical filter,
+        # confirmed through this exact hybrid+RRF pipeline. Scoped to the
+        # filtered case only: an unfiltered query scans the WHOLE index,
+        # where scoring every single document exactly would be far slower
+        # than approximate search, and the narrow-subset failure mode this
+        # works around doesn't exist in the first place without a filter.
+        knn_query: dict = {
+            "script_score": {
+                "query": {"bool": {"filter": filters}},
+                "script": {
+                    "source": "knn_score",
+                    "lang": "knn",
+                    "params": {"field": "embedding", "query_value": vector, "space_type": "cosinesimil"},
+                },
+            }
+        }
+    else:
+        knn_query = {"knn": {"embedding": {"vector": vector, "k": query.limit}}}
 
     # Vector search alone is weak on the things network logs are full of and
     # embeddings represent poorly -- exact IPs, hostnames, error codes,
