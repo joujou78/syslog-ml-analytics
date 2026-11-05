@@ -1079,6 +1079,20 @@ and neither is a bug to chase:
   7-day cold-start backfill of anomalies-only traffic at that host's
   measured rate takes on the order of ~2 days to fully catch up, then
   tracks new anomalies close to real-time indefinitely after that.
+  **Set it on BOTH the indexer and web-api services, not just the
+  indexer.** `app/core/config.py`'s `indexer_anomalies_only` setting reads
+  this same bare (no `SYSLOG_ML_` prefix) env var independently in the web
+  backend process, purely to pick the right wording for the "ask"
+  endpoint's coverage note (whether a zero-hit window just hasn't been
+  indexed yet vs. will never be indexed because none of its rows are
+  anomalous). Confirmed live as a real gap, not hypothetical: with the
+  var set only on the indexer service's systemd drop-in, the web backend's
+  own `settings.indexer_anomalies_only` silently defaulted to `False`,
+  so the coverage note's "N matching log line(s)" always showed the raw
+  total count instead of the anomalous one (e.g. "950" instead of the
+  real, correctly-scoped anomalous count of 110 for the same filter) --
+  numerically wrong, though the underlying indexing-lag diagnosis it was
+  trying to convey was still directionally correct.
 
 None of this applies if your CPU has AVX2/FMA (most anything from 2014
 onward) — indexing every event and getting fast chat responses should
