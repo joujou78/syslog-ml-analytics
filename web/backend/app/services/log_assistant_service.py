@@ -4720,6 +4720,36 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 # the model's own correct choice -- there's no reason to
                 # trust the model's restatement in one case and not the
                 # other once the real data is already in hand either way.
+                #
+                # EXCEPT when real hits from an earlier tool call THIS turn
+                # are already in `sources` and this isn't actually a
+                # ranking question -- confirmed live as a real, reproduced
+                # bug: an open-ended "explain this anomaly" question
+                # (source_ip + a narrow window from the UI, no "most"/
+                # "top"/"which device" language at all) got a real,
+                # correctly window-scoped semantic_search result back
+                # first, then the model ALSO called anomaly_summary with
+                # reason=<...> plus invented, non-schema hostname/start
+                # arguments (this tool's own declared schema -- see
+                # TOOL_DEFINITIONS above -- has no hostname/start/end
+                # parameters at all; it is unconditionally cumulative/
+                # all-time by design, exactly as its own description and
+                # result "note" field both already say). This bypass fired
+                # unconditionally on success anyway, discarding the real,
+                # correct, window-scoped hits already in hand and answering
+                # instead with an irrelevant all-time, whole-network device
+                # ranking that happened to coincidentally put the same
+                # device on top ("PTP_Ksara_to_Chams_Anjar, with 53398
+                # events (cumulative, all-time)...") for a question about
+                # one specific 25-minute window. When this fires, answer
+                # from the real hits already in hand instead -- never from
+                # an all-time aggregate the question never asked for.
+                if sources and not forced_anomaly_reason and not _wants_ranking(query.question):
+                    answer = _semantic_search_hits_plain_answer(sources) or (
+                        "Real anomaly data was found for this window, but a clear summary couldn't be "
+                        "generated -- see the cited log lines below."
+                    )
+                    return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
                 answer = _anomaly_summary_plain_answer(result)
                 if result.get("reason") == "interface_flapping":
                     answer += f"\n\n({_INTERFACE_FLAPPING_CAVEAT})"
