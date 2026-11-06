@@ -26,6 +26,7 @@ import re
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 
 import httpx
 from clickhouse_connect.driver.client import Client
@@ -1225,6 +1226,44 @@ def _parse_n_days_ago(question: str, now: datetime) -> tuple[str, datetime, date
         return None
     day_start = (now - timedelta(days=n)).replace(hour=0, minute=0, second=0, microsecond=0)
     return f"{n} day(s) ago", day_start, day_start + timedelta(days=1)
+
+
+def _detect_relative_day_shift(question: str) -> int | None:
+    """How many days to shift an ALREADY-EXPLICIT source_ip+start+end
+    window back for a bare "same time but for <relative day>" follow-up --
+    e.g. "give me the same time but for yesterday" after an "Explain this
+    anomaly" question means keep the exact device and exact time-of-day
+    span, just move the date back a day. This is a different meaning than
+    _detect_single_period's "yesterday" (a full midnight-to-midnight day,
+    correct for a bare count/ranking question with no window of its own
+    already in hand) -- so this is its own, separate detector, not a reuse
+    of that one's absolute day boundaries. Only consulted by ask() when an
+    explicit source_ip+start+end is already present; harmless no-op
+    otherwise since there's no existing window for it to shift.
+
+    Typo-tolerant on purpose: confirmed live as a real, not hypothetical,
+    need -- "give me same time but for yeterafy" (a garbled "yesterday", no
+    shared prefix for a simple startswith/regex check to catch) got treated
+    as a literal, meaningless search keyword instead of a day-shift
+    request, with the explicit UI filter's own date silently left
+    unchanged. A plain exact-substring check (same style as
+    _PERIOD_PHRASE_ALIASES) can't recover a typo this garbled; a
+    similarity-ratio check against the real word can, without needing to
+    enumerate every possible misspelling by hand."""
+    n_days_ago = _N_DAYS_AGO_RE.search(question.lower())
+    if n_days_ago:
+        raw = n_days_ago.group(1)
+        n = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
+        if 1 <= n <= _MAX_N_DAYS_AGO:
+            return n
+    for word in re.findall(r"[a-z]+", question.lower()):
+        # Length-gated so a short, common word (e.g. "yet", "fry") can't
+        # drift into a false-positive match purely by being short enough
+        # for the ratio to tolerate -- "yesterday" is 9 letters, so this
+        # only even considers words in roughly the same ballpark.
+        if len(word) >= 6 and SequenceMatcher(None, word, "yesterday").ratio() >= 0.75:
+            return 1
+    return None
 
 
 def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, datetime, datetime]] | None:
@@ -3789,6 +3828,28 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # device has dominated event counts across the whole guessed range --
     # a time-relative question is not safe to trust without this anchor.
     now = datetime.now(timezone.utc)
+    # Confirmed live: "give me same time but for yesterday" (a follow-up to
+    # an "Explain this anomaly" question, source_ip + a narrow start/end
+    # already set by the UI) silently left that explicit window unchanged
+    # -- nothing downstream ever re-examines query.start/end against the
+    # question's own text once they're set, so a day-shift request like
+    # this had no path to take effect at all. Shifting here, once, before
+    # anything else reads query.start/end, means every deterministic path
+    # below (and the plain backfill-from-query.start/end for an open-ended
+    # "explain this" question, which has no period-override of its own)
+    # transparently sees the shifted window with no further changes needed
+    # anywhere else. Gated on source_ip+start+end already being explicitly
+    # set -- there's no existing window to shift otherwise, and a bare
+    # count/ranking/listing question's OWN _detect_single_period-driven
+    # override (which means something different for "yesterday": the full
+    # midnight-to-midnight day, not a same-time-of-day shift) computes its
+    # own absolute boundary independently of query.start/end regardless, so
+    # this never conflicts with it.
+    if query.source_ip and query.start and query.end:
+        day_shift = _detect_relative_day_shift(query.question)
+        if day_shift:
+            shift = timedelta(days=day_shift)
+            query = query.model_copy(update={"start": query.start - shift, "end": query.end - shift})
     # Confirmed live as a real gap: see ask_total_timeout_seconds' own
     # comment in config.py for the full incident (a multi-round tool-
     # calling exchange crossed nginx's 300s proxy_read_timeout even though
