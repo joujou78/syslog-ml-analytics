@@ -3768,38 +3768,56 @@ def _semantic_search_hits_plain_answer(hits: list[LogHit]) -> str:
     real and relevant, there's no reason to only ever point at a table and
     never actually say what's in it.
 
-    Groups by predicted_category ALONE -- a small, fixed set (AUTH,
+    Primary grouping is by predicted_category -- a small, fixed set (AUTH,
     NETWORK, HARDWARE, SECURITY, SYSTEM, APPLICATION, CONFIG, UNKNOWN, see
     ml/labeling_rules.py's CATEGORIES) the classifier pipeline already
-    computes for exactly this purpose. Deliberately NOT `program` as well
-    (an earlier version of this function also grouped by program, on the
-    assumption it'd be a stable mnemonic like RouterOS's "interface,info")
-    -- confirmed live as wrong for Cisco devices specifically: their
-    `program` field holds the message's own raw per-event sequence number
-    (e.g. "257310", "257316"), not a shared tag, which silently defeated
-    the grouping entirely (two occurrences of the literal same condition,
-    "%PLATFORM_ENV-1-PWR_RPS: Redundant power supply faulty...", came out
-    as two separate one-off groups instead of being counted together).
-    Not grouping by raw message text either, for the same underlying
-    reason: Cisco/RouterOS syslog messages embed their own sequence number
-    and timestamp in the message body itself, so exact-text grouping has
-    the identical failure mode."""
+    computes for exactly this purpose. Deliberately NOT `program` as the
+    PRIMARY grouping (an earlier version of this function grouped by
+    program directly, on the assumption it'd be a stable mnemonic like
+    RouterOS's "interface,info") -- confirmed live as wrong for Cisco
+    devices specifically: their `program` field holds the message's own
+    raw per-event sequence number (e.g. "257310", "257316"), not a shared
+    tag, which silently defeated the grouping entirely (two occurrences of
+    the literal same condition, "%PLATFORM_ENV-1-PWR_RPS: Redundant power
+    supply faulty...", came out as two separate one-off groups instead of
+    being counted together). Not grouping by raw message text either, for
+    the same underlying reason: Cisco/RouterOS syslog messages embed their
+    own sequence number and timestamp in the message body itself, so
+    exact-text grouping has the identical failure mode.
+
+    A per-category secondary breakdown by `program` IS included (confirmed
+    live as worth having: a bare category name like "UNKNOWN" tells a
+    reader much less than knowing it's specifically "wireless,debug"
+    chatter) -- but only for values that don't look like one of those raw
+    per-event numbers (a plain digit string), so the original confirmed
+    failure mode stays closed; a device whose `program` IS one of those
+    numbers just gets no program breakdown for that group, same as before
+    this addition."""
     if not hits:
         return ""
     groups: dict[str, dict] = {}
     for h in hits:
         key = h.predicted_category or "uncategorized"
-        g = groups.setdefault(key, {"count": 0, "example": h.message.strip(), "reasons": set(), "severities": set()})
+        g = groups.setdefault(
+            key,
+            {"count": 0, "example": h.message.strip(), "reasons": set(), "severities": set(), "programs": Counter()},
+        )
         g["count"] += 1
         g["reasons"].update(h.anomaly_reasons)
         g["severities"].add(h.severity)
+        if h.program and not h.program.strip().isdigit():
+            g["programs"][h.program.strip()] += 1
     ranked = sorted(groups.items(), key=lambda kv: kv[1]["count"], reverse=True)
     parts = []
     for category, g in ranked:
         severities = "/".join(sorted(g["severities"]))
         reasons = ", ".join(sorted(g["reasons"])) if g["reasons"] else "none"
+        programs_note = ""
+        if g["programs"]:
+            top_programs = ", ".join(f"{p} x{c}" for p, c in g["programs"].most_common(3))
+            programs_note = f" [{top_programs}]"
         parts.append(
-            f"{g['count']}x [{severities}] {category} -- e.g. \"{_truncate(g['example'], 200)}\" "
+            f"{g['count']}x [{severities}] {category}{programs_note} -- e.g. \"{_truncate(g['example'], 200)}\" "
             f"(flagged: {reasons})"
         )
     devices = sorted({h.hostname for h in hits})
@@ -4753,6 +4771,41 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             }
             sources.extend(hits)
             messages.append({"role": "tool", "content": json.dumps(result)})
+            if (
+                fn["name"] == "semantic_search" and hits
+                and query.source_ip and query.start and query.end
+                and not _wants_ranking(query.question) and not _wants_count(query.question)
+                and not _wants_log_rows(query.question) and not _wants_incidents(query.question)
+            ):
+                # Confirmed live, twice, as a real pattern worth closing
+                # deterministically rather than just patching each
+                # individual offender: an open-ended "explain this anomaly"
+                # question (source_ip + a narrow window from the UI's
+                # "Explain this anomaly" link -- none of the other four
+                # established question shapes) already got a real,
+                # correctly window-scoped semantic_search result back --
+                # then the model made a FURTHER tool call anyway (first
+                # anomaly_summary with invented, ignored arguments and a
+                # misleading all-time result -- see the dedicated bypass
+                # guard above; then, separately, a correctly-scoped but
+                # needlessly terse aggregate_events call, "the program with
+                # the most events is wireless,debug with 192 events"
+                # instead of ever describing what's actually in the real
+                # retrieved log lines) and answered from THAT instead.
+                # Nothing about this question shape ever needs a second
+                # tool call: semantic_search already found what the
+                # question asked for. Stopping here and building the
+                # answer directly from these hits removes the model's
+                # chance to wander into a further call, whatever shape its
+                # own next guess takes, exactly the same "don't trust the
+                # model's downstream judgment once real grounding data is
+                # already in hand" rationale as every other deterministic
+                # bypass in this file.
+                answer = _semantic_search_hits_plain_answer(hits) or (
+                    "Real anomaly data was found for this window, but a clear summary couldn't be "
+                    "generated -- see the cited log lines below."
+                )
+                return AskResponse(answer=answer, sources=sources, model=settings.ollama_chat_model)
             if fn["name"] == "anomaly_summary" and "error" not in result:
                 # Same reasoning as the tool-less force-resolve path above
                 # (see _anomaly_summary_plain_answer's docstring): the model
