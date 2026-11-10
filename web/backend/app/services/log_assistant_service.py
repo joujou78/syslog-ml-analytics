@@ -4157,25 +4157,55 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 ),
                 sources=sources, model=settings.ollama_chat_model,
             )
-        body = await asyncio.to_thread(
-            _post_chat_sync,
-            f"{settings.ollama_url}/api/chat",
-            {
-                "model": settings.ollama_chat_model,
-                "messages": messages,
-                "tools": TOOL_DEFINITIONS,
-                "stream": False,
-                # Bounds worst-case generation time -- see config.py's
-                # ollama_num_predict comment for why this matters on
-                # CPU-only hardware independent of any other contention.
-                "options": {
-                    "num_predict": settings.ollama_num_predict,
-                    "num_thread": settings.ollama_chat_num_thread,
+        try:
+            body = await asyncio.to_thread(
+                _post_chat_sync,
+                f"{settings.ollama_url}/api/chat",
+                {
+                    "model": settings.ollama_chat_model,
+                    "messages": messages,
+                    "tools": TOOL_DEFINITIONS,
+                    "stream": False,
+                    # Bounds worst-case generation time -- see config.py's
+                    # ollama_num_predict comment for why this matters on
+                    # CPU-only hardware independent of any other contention.
+                    "options": {
+                        "num_predict": settings.ollama_num_predict,
+                        "num_thread": settings.ollama_chat_num_thread,
+                    },
                 },
-            },
-            min(settings.ollama_timeout_seconds, remaining_budget),
-        )
-        message = body["message"]
+                min(settings.ollama_timeout_seconds, remaining_budget),
+            )
+            message = body["message"]
+        except (httpx.HTTPError, KeyError, ValueError):
+            # Confirmed live as a real gap: two upstream 502s ~19s apart,
+            # both raised from this exact call with no try/except around
+            # it at all -- unlike _choose_concept_keyword's OWN call to
+            # _post_chat_sync (see its try/except just above in this
+            # file), which already degrades gracefully instead of letting
+            # a real Ollama-side failure propagate. The loop_deadline
+            # check just above this handles only "not enough budget left
+            # to even TRY another call" with a clean, explained message;
+            # an actual per-call failure (a genuine httpx timeout/connect
+            # error hitting `min(ollama_timeout_seconds, remaining_budget)`,
+            # or a malformed/non-JSON response -- KeyError/ValueError,
+            # same exception set the API route's own _UPSTREAM_ERRORS
+            # catches) had no equivalent handling here at all, so it
+            # propagated straight out of ask() into the route's generic
+            # 502 -- a bare "Log Assistant backend error: " with
+            # potentially no message at all (httpx timeouts often
+            # construct with an empty string), instead of the same kind
+            # of friendly, actionable message the budget-exhausted case
+            # already gives.
+            log.exception("Log Assistant: Ollama chat call failed, giving up cleanly for this request")
+            return AskResponse(
+                answer=(
+                    "The model backend didn't respond in time or returned something unexpected -- "
+                    "try again in a moment (the server may be briefly overloaded), or try a narrower "
+                    "question."
+                ),
+                sources=sources, model=settings.ollama_chat_model,
+            )
         tool_calls = message.get("tool_calls")
         if not tool_calls:
             answer = message["content"]
