@@ -473,6 +473,23 @@ def _wants_ranking(question: str) -> bool:
     return any(marker in lowered for marker in _RANKING_MARKERS)
 
 
+# Confirmed live as a real gap in the fully-deterministic explain-anomaly
+# force-resolve below: "break down this device's anomalies by program"
+# has source_ip+start+end set (same as any "Explain this anomaly" link)
+# but isn't actually an open-ended explain question at all -- it's
+# explicitly asking for the grouped-count breakdown aggregate_events
+# exists for (see that tool's own description, which uses this exact
+# phrasing as its example), not a description of what's in the raw log
+# content. Phrased the same way that tool's own docs are, so a question
+# using this wording is confidently NOT the explain-anomaly shape.
+_BREAKDOWN_MARKERS = ("break down", "breakdown", "broken down", "split of")
+
+
+def _wants_breakdown(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _BREAKDOWN_MARKERS)
+
+
 # Confirmed as a real, reproduced bug on net-flow: "top n devices with
 # wireless disconnections vendor mikrotik and mimosa" explicitly asks for
 # a per-DEVICE ranking ("devices"), but a bare "vendor" IN question was
@@ -3970,6 +3987,50 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # show the same rows the text describes.
             return AskResponse(answer=answer, sources=_log_entries_to_hits(resolved["rows"]), model=settings.ollama_chat_model)
 
+    # Fully deterministic "explain this anomaly" path -- no model call at
+    # all. User's own explicit choice, after asking directly why the Log
+    # Assistant isn't consistent across every request: a small, CPU-only,
+    # quantized model's own tool-routing judgment is the actual source of
+    # the variance this whole file has been closing gaps in all session
+    # (an invented argument name, an unnecessary extra tool call, a wrong
+    # choice of which result to answer from) -- removing that judgment
+    # entirely for this one well-defined, extremely common question shape
+    # (source_ip + a narrow window from the UI's own "Explain this
+    # anomaly" link -- never a ranking/count/listing/incidents question,
+    # each of which has its own, different, already-deterministic
+    # resolver above) guarantees the exact same reliable behavior on every
+    # single request, not just "usually" once the model happens to choose
+    # the right first tool call. Calls semantic_search directly with the
+    # question's own text as the phrase (see _execute_tool's semantic_search
+    # branch for why that's always a meaningful phrase, never a guess) and
+    # builds the answer the identical way the force-resolve above (for a
+    # model-INITIATED semantic_search call) already does -- the only
+    # difference is skipping the round-trip to the model to get there.
+    if (
+        query.source_ip and query.start and query.end
+        and not _wants_ranking(query.question) and not _wants_count(query.question)
+        and not _wants_log_rows(query.question) and not _wants_incidents(query.question)
+        and not _wants_breakdown(query.question)
+    ):
+        explain_sub_query = LogAssistantQuery(
+            question=query.question[:1000], source_ip=query.source_ip, vendor=query.vendor,
+            start=query.start, end=query.end, limit=10,
+        )
+        explain_hits = await semantic_search(os_client, explain_sub_query)
+        if explain_hits:
+            answer = _semantic_search_hits_plain_answer(explain_hits) or (
+                "Real anomaly data was found for this window, but a clear summary couldn't be "
+                "generated -- see the cited log lines below."
+            )
+            log.info(
+                "Log Assistant FORCE-RESOLVED an explain-anomaly question via semantic_search "
+                "directly, no model call at all: source_ip=%r window=%s..%s -> %d hit(s)",
+                query.source_ip, query.start, query.end, len(explain_hits),
+            )
+            return AskResponse(answer=answer, sources=explain_hits, model=settings.ollama_chat_model)
+        note = await build_coverage_note(ch_client, explain_sub_query, explain_hits)
+        return AskResponse(answer=note or "No related log lines were found.", sources=[], model=settings.ollama_chat_model)
+
     # A new capability, not a bug-fix retrofit -- built deterministic from
     # the start rather than waiting for a live incident to show the model
     # mishandling its own tool result, the same lesson every other force-
@@ -4806,6 +4867,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 and query.source_ip and query.start and query.end
                 and not _wants_ranking(query.question) and not _wants_count(query.question)
                 and not _wants_log_rows(query.question) and not _wants_incidents(query.question)
+                and not _wants_breakdown(query.question)
             ):
                 # Confirmed live, twice, as a real pattern worth closing
                 # deterministically rather than just patching each
