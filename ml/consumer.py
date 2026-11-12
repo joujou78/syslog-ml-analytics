@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import re
+import statistics
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import clickhouse_connect
@@ -130,6 +132,79 @@ RELAY_LIST_REFRESH_SECONDS = float(os.environ.get("RELAY_LIST_REFRESH_SECONDS", 
 # events already inserted before this was added.
 RELAY_TIMEZONE_OFFSET_HOURS = float(os.environ.get("RELAY_TIMEZONE_OFFSET_HOURS", "3"))
 RELAY_TIMEZONE_FUTURE_TOLERANCE_MINUTES = float(os.environ.get("RELAY_TIMEZONE_FUTURE_TOLERANCE_MINUTES", "30"))
+
+# Confirmed on net-flow as a separate, real device-clock problem, not
+# covered by the relay-timezone fix above: PTP_Ksara_to_Chams_Anjar
+# (172.20.17.68) reports event_time a consistent ~62 minutes BEHIND real
+# time -- not a clean whole-hour timezone offset (the relay fix's own
+# assumption), not limited to a specifically listed relay, and not a
+# future-pointing drift (the only direction that fix ever corrects).
+# Net-flow's own server clock was confirmed correct first (`timedatectl`:
+# synchronized, NTP active) -- ruling out a server-side cause -- before
+# concluding this is the device's own wrong clock. Generalizes the same
+# underlying idea (compare a message's self-reported timestamp against
+# real processing time, which the relay fix above already does) to ANY
+# device, ANY direction, ANY magnitude, instead of one hardcoded case.
+#
+# Deliberately NOT based on querying stored event_time/received_at history
+# from ClickHouse: once correction is applied, newly-corrected rows would
+# show ~zero skew, which would pollute any later recomputation of "this
+# device's skew" from stored data and cause the detection to oscillate
+# (stop correcting once enough corrected rows dilute the lookback window,
+# drift back, start correcting again). DeviceClockSkewTracker below
+# instead compares each record's own RAW (pre-correction) event_time
+# against real `now()` live, as each message arrives, keeping a short
+# rolling window per device -- so it keeps watching reality continuously
+# and naturally de-escalates if a device's clock is later fixed, with no
+# self-referential pollution possible.
+#
+# Conservative by design, same spirit as the relay fix's own double-check
+# before trusting a correction: requires both a LARGE average disagreement
+# (not ordinary jitter or a one-off backlog) AND a LOW standard deviation
+# (confirms a stable clock error, not noisy, variable latency) before
+# ever correcting anything, and only ever shifts event_time FORWARD never
+# alters already-stored historical rows.
+CLOCK_SKEW_SAMPLE_WINDOW = int(os.environ.get("CLOCK_SKEW_SAMPLE_WINDOW", "50"))
+CLOCK_SKEW_MIN_SAMPLES = int(os.environ.get("CLOCK_SKEW_MIN_SAMPLES", "30"))
+CLOCK_SKEW_MIN_SECONDS_TO_CORRECT = float(os.environ.get("CLOCK_SKEW_MIN_SECONDS_TO_CORRECT", "300"))
+CLOCK_SKEW_MAX_STDDEV_SECONDS = float(os.environ.get("CLOCK_SKEW_MAX_STDDEV_SECONDS", "120"))
+
+
+class DeviceClockSkewTracker:
+    """Per-device rolling window of (now() - event_time) observations, in
+    memory only -- not persisted across a consumer.py restart, same
+    accepted tradeoff as AcsMultipartReassembler's own in-memory state
+    (a few minutes of fresh traffic re-establishes a confirmed skew after
+    a restart; acceptable for something that only ever nudges a timestamp
+    estimate, never blocks or drops data).
+
+    now_fn is injected (defaults to the real clock) purely so tests can
+    supply a fixed reference instant instead of racing the wall clock."""
+
+    def __init__(self, now_fn=lambda: datetime.now(timezone.utc)):
+        self._now_fn = now_fn
+        self._samples: dict[str, deque] = {}
+        self._confirmed_skew: dict[str, float] = {}
+
+    def observe_and_correct(self, source_ip: str, event_time: datetime) -> datetime:
+        now = self._now_fn()
+        diff_seconds = (now - event_time).total_seconds()
+        samples = self._samples.setdefault(source_ip, deque(maxlen=CLOCK_SKEW_SAMPLE_WINDOW))
+        samples.append(diff_seconds)
+        if len(samples) >= CLOCK_SKEW_MIN_SAMPLES:
+            mean = statistics.mean(samples)
+            stdev = statistics.pstdev(samples)
+            if abs(mean) >= CLOCK_SKEW_MIN_SECONDS_TO_CORRECT and stdev <= CLOCK_SKEW_MAX_STDDEV_SECONDS:
+                self._confirmed_skew[source_ip] = mean
+            elif source_ip in self._confirmed_skew and abs(mean) < CLOCK_SKEW_MIN_SECONDS_TO_CORRECT / 2:
+                # The skew has genuinely resolved (e.g. the device's own
+                # NTP got fixed) -- stop correcting rather than keep
+                # applying a now-stale offset.
+                del self._confirmed_skew[source_ip]
+        skew = self._confirmed_skew.get(source_ip)
+        if skew:
+            return event_time + timedelta(seconds=skew)
+        return event_time
 
 INSERT_COLUMNS = [
     "event_time", "source_ip", "hostname", "reported_hostname", "relayed_via", "vendor", "vendor_source", "model",
@@ -660,7 +735,7 @@ def resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved):
     return source_ip, hostname, reported_hostname, relayed_via, detected_vendor, "", resolution_method, vendor_source
 
 
-def to_row(record, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved):
+def to_row(record, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved, clock_skew):
     message = record.get("message", "")
     cluster = miner.add_log_message(message)
     timestamp = record.get("timestamp")
@@ -674,6 +749,13 @@ def to_row(record, miner, model, inventory, relay_ips, baselines, interface_flap
             candidate = event_time - timedelta(hours=RELAY_TIMEZONE_OFFSET_HOURS)
             if abs((candidate - now).total_seconds()) < abs((event_time - now).total_seconds()):
                 event_time = candidate
+    # Independent of the relay-timezone check above (a different problem:
+    # any device, not just a listed relay; any direction/magnitude, not a
+    # fixed future-pointing 3h offset) -- see DeviceClockSkewTracker's own
+    # comment for why this observes the ALREADY-relay-corrected value
+    # (near-zero further correction when that check already fixed it) but
+    # otherwise detects and corrects independently.
+    event_time = clock_skew.observe_and_correct(record.get("source_ip"), event_time)
 
     category, confidence = classify(model, message)
     severity = record.get("severity", "info")
@@ -747,6 +829,7 @@ def main():
     sequence_anomaly = SequenceAnomalyDetector(ch_client)
     interface_flap = InterfaceFlapDetector()
     acs_reassembler = AcsMultipartReassembler()
+    clock_skew = DeviceClockSkewTracker()
 
     tailer = FileTailer(LOG_FILE, OFFSET_FILE)
 
@@ -768,10 +851,10 @@ def main():
             if record is None:
                 continue
             for ready in acs_reassembler.feed(record):
-                batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved))
+                batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved, clock_skew))
 
         for ready in acs_reassembler.flush_stale():
-            batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved))
+            batch.append(to_row(ready, miner, model, inventory, relay_ips, baselines, interface_flap, state_conn, seen_unresolved, clock_skew))
 
         should_flush = len(batch) >= BATCH_SIZE or (time.monotonic() - last_flush) >= BATCH_FLUSH_SECONDS
         if should_flush and batch:
