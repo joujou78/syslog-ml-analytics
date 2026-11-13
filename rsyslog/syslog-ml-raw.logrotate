@@ -1,0 +1,35 @@
+# Drop into /etc/logrotate.d/ on the box running 60-syslog-ml.conf's
+# ruleset, as e.g. /etc/logrotate.d/syslog-ml-raw.
+#
+# Confirmed missing in production on net-flow: /var/log/syslog-ml/raw.jsonl
+# had NO rotation policy at all and grew unbounded (8.3GB and counting)
+# until it was a meaningful contributor to the root filesystem crossing
+# OpenSearch's disk-usage flood-stage watermark, which blocks ALL writes to
+# the Log Assistant's search index -- see ml/log_assistant_indexer.py's
+# _is_systemic_failure for the other half of this incident's fix (the
+# indexer no longer silently discards data during an outage like that one,
+# but the fix here is what keeps the disk from filling up in the first
+# place).
+#
+# Safe to rotate with the default (non-copytruncate) strategy specifically
+# because consumer.py's own FileTailer is built to detect exactly this
+# (tracks the file's inode, reopens at the same path on a mismatch -- see
+# its _rotated()/readlines() docstrings) -- do NOT add `copytruncate` here,
+# it would silently break that detection (same inode, so FileTailer would
+# never notice the file was truncated underneath it).
+/var/log/syslog-ml/raw.jsonl {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 syslog adm
+    postrotate
+        # rsyslog keeps its own file descriptor open to the pre-rotation
+        # inode until told otherwise -- HUP makes it reopen at the
+        # original path, where the `create` directive above has already
+        # put a fresh empty file in place.
+        systemctl kill -s HUP rsyslog >/dev/null 2>&1 || true
+    endscript
+}

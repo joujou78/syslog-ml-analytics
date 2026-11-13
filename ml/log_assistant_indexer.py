@@ -441,6 +441,28 @@ def _index_batch(os_client: OpenSearch, rows: list[dict]) -> datetime:
         })
     _, errors = helpers.bulk(os_client, actions, raise_on_error=False)
     if errors:
+        if _is_systemic_failure(errors):
+            # Confirmed live on net-flow: OpenSearch's disk crossed its
+            # flood-stage watermark, blocking ALL writes to this index
+            # with cluster_block_exception/429 -- every single document in
+            # every batch failed, continuously, for over 20 minutes
+            # straight. The "log and move on" handling below exists for an
+            # ISOLATED malformed document (so one bad row doesn't block
+            # everything behind it) -- it is the wrong response to a
+            # systemic failure like this, where NOTHING in the batch
+            # actually made it into the index: returning a checkpoint value
+            # regardless meant the caller saved it anyway, permanently
+            # excluding every one of these rows from the search index
+            # forever, for the entire duration of the outage, with no way
+            # to ever retry them. Raising instead makes this look like
+            # _embed_batch's own failure mode -- run_cycle's existing
+            # except-and-break already never saves a checkpoint on an
+            # exception, so the exact same batch is retried next cycle
+            # once the underlying problem (here, disk space) clears.
+            raise RuntimeError(
+                f"Systemic indexing failure: {len(errors)} of {len(rows)} document(s) failed with a "
+                f"cluster/capacity-level error (not an isolated bad document) -- first: {errors[0]}"
+            )
         # A single malformed document (e.g. an embedding whose length
         # somehow doesn't match the index's configured dimension) would
         # otherwise raise BulkIndexError (helpers.bulk's default) and abort
@@ -455,6 +477,29 @@ def _index_batch(os_client: OpenSearch, rows: list[dict]) -> datetime:
             len(errors), len(rows), errors[:3],
         )
     return max(row["received_at"] for row in rows)
+
+
+# Status codes / error types that mean "the cluster or index itself is
+# refusing writes right now" -- a condition affecting every document in the
+# batch equally, not something specific to any one document's own content.
+# 429 covers both OpenSearch's disk-watermark block (confirmed live: see
+# this function's own comment above) and a generic too-many-requests/
+# circuit-breaker rejection; 503 covers the node/shard being temporarily
+# unavailable. Matched on EITHER the HTTP-like status OR the named
+# exception type, since different OpenSearch failure paths surface one but
+# not always both.
+_SYSTEMIC_FAILURE_STATUSES = {429, 503}
+_SYSTEMIC_FAILURE_TYPES = {"cluster_block_exception", "circuit_breaking_exception", "es_rejected_execution_exception"}
+
+
+def _is_systemic_failure(errors: list[dict]) -> bool:
+    for err in errors:
+        detail = next(iter(err.values()), {}) if isinstance(err, dict) else {}
+        status = detail.get("status")
+        err_type = (detail.get("error") or {}).get("type")
+        if status in _SYSTEMIC_FAILURE_STATUSES or err_type in _SYSTEMIC_FAILURE_TYPES:
+            return True
+    return False
 
 
 def run_cycle(ch_client, os_client: OpenSearch, checkpoint: datetime | None) -> datetime | None:
