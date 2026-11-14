@@ -3841,11 +3841,17 @@ def _semantic_search_hits_plain_answer(hits: list[LogHit]) -> str:
     device_label = devices[0] if len(devices) == 1 else f"{len(devices)} devices ({', '.join(devices[:5])}{', and more' if len(devices) > 5 else ''})"
     times = sorted(h.event_time for h in hits)
     breakdown = " | ".join(parts)
+    # A single retrieved hit (routine, not an edge case -- OpenSearch only
+    # ever indexes the ANOMALOUS lines within a window, not the whole
+    # window's traffic) makes times[0] == times[-1]; confirmed live as
+    # rendering the nonsensical "between 2026-...19:00:14 and
+    # 2026-...19:00:14" otherwise, which reads as a glitch even though the
+    # underlying single-line data is correct.
+    when = f"at {times[0].isoformat()}" if times[0] == times[-1] else f"between {times[0].isoformat()} and {times[-1].isoformat()}"
     return (
-        f"Based on {len(hits)} retrieved log line(s) for {device_label} between {times[0].isoformat()} "
-        f"and {times[-1].isoformat()}, the distinct message types found were: {breakdown}. (Grounded "
-        "directly in the cited log lines below -- the model's own written summary wasn't available for "
-        "this question, so this breakdown stands in for it.)"
+        f"Based on {len(hits)} retrieved log line(s) for {device_label} {when}, the distinct message "
+        f"types found were: {breakdown}. (Grounded directly in the cited log lines below -- the model's "
+        "own written summary wasn't available for this question, so this breakdown stands in for it.)"
     )
 
 
