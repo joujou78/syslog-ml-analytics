@@ -183,13 +183,59 @@ def _hit_to_log_hit(hit: dict) -> LogHit:
         message=source["message"],
         is_anomaly=source["is_anomaly"],
         anomaly_reasons=source["anomaly_reasons"],
-        score=hit["_score"],
+        # A plain filter-only query (see _fetch_window_hits) sorts by
+        # event_time, not relevance, so OpenSearch returns `_score: null`
+        # -- confirmed directly against the real index. `score` has no
+        # ranking meaning there anyway, so 0.0 stands in rather than
+        # failing LogHit's `score: float` validation.
+        score=hit["_score"] if hit["_score"] is not None else 0.0,
     )
 
 
 async def semantic_search(os_client: OpenSearch, query: LogAssistantQuery) -> list[LogHit]:
     vector = await _embed(query.question)
     body = _build_query(vector, query)
+    result = await asyncio.to_thread(os_client.search, index=settings.opensearch_index, body=body)
+    return [_hit_to_log_hit(hit) for hit in result["hits"]["hits"]]
+
+
+async def _fetch_window_hits(os_client: OpenSearch, query: LogAssistantQuery) -> list[LogHit]:
+    """Deterministic, non-ranked fetch of every indexed log line matching
+    query's structural filters (source_ip/vendor/event_time range) --
+    confirmed live as necessary, not just tidier, for the "explain this
+    anomaly" force-resolve below: semantic_search's hybrid query fuses an
+    exact filtered k-NN with a BM25 `match` clause on the question's own
+    literal text via RRF, and that fusion is sensitive to the question's
+    wording even when the filters alone already narrow the candidate set
+    to a handful of real documents. Confirmed directly on
+    Dist_Holcim_IDU/MKT-NOKNOK[AIN_SAADE]: two differently-worded questions
+    about the IDENTICAL device+window (172.20.22.13, 2026-11-13
+    18:40-19:05 UTC) returned 3 vs 4 real hits -- one question's wording
+    happened to have zero term overlap with one matching document's own
+    `message` text ("sntp change time ..."), dropping it from the BM25
+    sub-list and tipping the RRF fusion enough to cut it from the final
+    top-N entirely. Verified against a direct, unranked OpenSearch filter
+    query for that exact source_ip+window: the true count is 4, matching
+    neither force-resolve answer reliably since each used a different
+    question string. A fixed anomaly window's explanation must be complete
+    and stable regardless of question phrasing -- filters alone (no
+    ranking, no dependency on question text at all) are enough here, since
+    this is only ever called with source_ip+start+end already narrowing
+    the result to one device's short window.
+    """
+    filters = []
+    if query.source_ip:
+        filters.append({"term": {"source_ip": query.source_ip}})
+    if query.vendor:
+        filters.append({"term": {"vendor": query.vendor}})
+    if query.start or query.end:
+        time_range = {}
+        if query.start:
+            time_range["gte"] = query.start.isoformat()
+        if query.end:
+            time_range["lte"] = query.end.isoformat()
+        filters.append({"range": {"event_time": time_range}})
+    body = {"size": query.limit, "sort": [{"event_time": "asc"}], "query": {"bool": {"filter": filters}}}
     result = await asyncio.to_thread(os_client.search, index=settings.opensearch_index, body=body)
     return [_hit_to_log_hit(hit) for hit in result["hits"]["hits"]]
 
@@ -4006,12 +4052,16 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # each of which has its own, different, already-deterministic
     # resolver above) guarantees the exact same reliable behavior on every
     # single request, not just "usually" once the model happens to choose
-    # the right first tool call. Calls semantic_search directly with the
-    # question's own text as the phrase (see _execute_tool's semantic_search
-    # branch for why that's always a meaningful phrase, never a guess) and
-    # builds the answer the identical way the force-resolve above (for a
-    # model-INITIATED semantic_search call) already does -- the only
-    # difference is skipping the round-trip to the model to get there.
+    # the right first tool call. Fetches via _fetch_window_hits (a plain
+    # filter on source_ip/vendor/event_time, no ranking at all) rather
+    # than semantic_search -- confirmed live as necessary, not optional:
+    # semantic_search's hybrid relevance ranking is sensitive to the
+    # question's exact wording even for this fixed window, and silently
+    # dropped a real, relevant log line depending on phrasing alone (see
+    # _fetch_window_hits's own comment for the confirmed live case). This
+    # path's whole point is a deterministic explanation of a FIXED window
+    # -- that means every real line in it, every time, regardless of how
+    # the question happens to be worded.
     if (
         query.source_ip and query.start and query.end
         and not _wants_ranking(query.question) and not _wants_count(query.question)
@@ -4022,15 +4072,16 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             question=query.question[:1000], source_ip=query.source_ip, vendor=query.vendor,
             start=query.start, end=query.end, limit=10,
         )
-        explain_hits = await semantic_search(os_client, explain_sub_query)
+        explain_hits = await _fetch_window_hits(os_client, explain_sub_query)
         if explain_hits:
             answer = _semantic_search_hits_plain_answer(explain_hits) or (
                 "Real anomaly data was found for this window, but a clear summary couldn't be "
                 "generated -- see the cited log lines below."
             )
             log.info(
-                "Log Assistant FORCE-RESOLVED an explain-anomaly question via semantic_search "
-                "directly, no model call at all: source_ip=%r window=%s..%s -> %d hit(s)",
+                "Log Assistant FORCE-RESOLVED an explain-anomaly question via a deterministic "
+                "window fetch, no model call and no relevance ranking at all: source_ip=%r "
+                "window=%s..%s -> %d hit(s)",
                 query.source_ip, query.start, query.end, len(explain_hits),
             )
             return AskResponse(answer=answer, sources=explain_hits, model=settings.ollama_chat_model)
