@@ -283,18 +283,34 @@ def _mutation_safe_cutoff(client) -> datetime | None:
     parameters here (not embedded as literals) -- the known
     clickhouse_connect binding issue (see `ch_literal` / this module's
     `_fetch_batch` comment) is specifically about DateTime64(3) comparisons,
-    not plain string equality, so it doesn't apply to this query."""
+    not plain string equality, so it doesn't apply to this query.
+
+    Selects count() alongside min(create_time) and checks the COUNT, not
+    the datetime value's truthiness -- confirmed live on net-flow as a
+    severe, not hypothetical, bug: `min(create_time)` over ZERO matching
+    rows returns 1970-01-01 00:00:00 (the DateTime64 column's own zero/
+    default value) in this ClickHouse setup, not SQL NULL as the original
+    version of this function assumed -- and a Python datetime is always
+    truthy regardless of its actual value, so `value if value else None`
+    never caught it. The indexer treated that epoch-zero sentinel as a
+    genuine in-flight mutation's create_time, holding back every row
+    whose received_at is ">= 1970-01-01" -- which is ALL of them --
+    indefinitely, any time zero mutations happened to be in flight at the
+    exact polling moment (the normal, common state): confirmed stuck for
+    12+ straight hours, zero rows indexed, with the real underlying
+    disk-space issue from the prior incident already fully resolved.
+    count() makes "did anything actually match" unambiguous regardless of
+    what a bare aggregate happens to return for an empty set."""
     query = """
-        SELECT min(create_time)
+        SELECT count(), min(create_time)
         FROM system.mutations
         WHERE database = %(database)s AND table = %(table)s AND is_done = 0
     """
     result = client.query(query, parameters={"database": "syslog_ml", "table": "events"})
-    # A plain aggregate with no GROUP BY always returns exactly one row --
-    # NULL (Python None) for min() over zero matching mutations, not zero
-    # rows -- but guard the shape anyway rather than assume it.
-    value = result.result_rows[0][0] if result.result_rows else None
-    return value if value else None
+    if not result.result_rows:
+        return None
+    count, min_create_time = result.result_rows[0]
+    return min_create_time if count else None
 
 
 def _fetch_batch(client, checkpoint: datetime | None) -> list[dict]:
