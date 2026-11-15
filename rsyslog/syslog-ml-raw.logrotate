@@ -17,6 +17,23 @@
 # its _rotated()/readlines() docstrings) -- do NOT add `copytruncate` here,
 # it would silently break that detection (same inode, so FileTailer would
 # never notice the file was truncated underneath it).
+#
+# Confirmed live as a real, severe regression this directive itself
+# caused: /var/log/syslog-ml is root:syslog-ml, mode 2770 -- the setgid
+# bit means any file plain rsyslog creates in there automatically inherits
+# group syslog-ml, which is exactly the group syslog-ml-classifier.service
+# runs as (see its own User=/Group=syslog-ml). This `create` line
+# overrides that inheritance and hardcodes group `adm` instead, which the
+# classifier's dedicated syslog-ml service account was never a member of
+# -- the very first rotation under this policy locked the classifier out
+# of its own input file entirely (PermissionError, 20000+ crash-restart
+# loop, 37+ hours of zero events ingested, confirmed live on net-flow).
+# `adm` is the conventional group for *humans* reading /var/log by hand;
+# it was never the group the classifier itself needed. syslog-ml matches
+# what the directory's own setgid bit already does automatically for
+# every OTHER file creation in this directory, so this restores the
+# invariant that quietly held before this policy existed, rather than
+# introducing a new one.
 /var/log/syslog-ml/raw.jsonl {
     daily
     rotate 7
@@ -24,7 +41,7 @@
     delaycompress
     missingok
     notifempty
-    create 0640 syslog adm
+    create 0640 syslog syslog-ml
     postrotate
         # rsyslog keeps its own file descriptor open to the pre-rotation
         # inode until told otherwise -- HUP makes it reopen at the
