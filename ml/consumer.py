@@ -749,13 +749,34 @@ def to_row(record, miner, model, inventory, relay_ips, baselines, interface_flap
             candidate = event_time - timedelta(hours=RELAY_TIMEZONE_OFFSET_HOURS)
             if abs((candidate - now).total_seconds()) < abs((event_time - now).total_seconds()):
                 event_time = candidate
+
+    # Resolved BEFORE the clock-skew correction below -- confirmed live as
+    # a severe, not hypothetical, ordering bug: a relay-tunneled record's
+    # own `source_ip` field is the RELAY's IP (e.g. "192.168.255.33"), not
+    # the real device's -- the real device only shows up via
+    # reported_hostname until resolve_identity() maps it back. With only 2
+    # relay IPs total, calling clock_skew.observe_and_correct() on the raw,
+    # unresolved record["source_ip"] pooled EVERY device tunneled through
+    # either relay into ONE shared tracker entry -- confirmed live as the
+    # cause of ~100 unrelated devices across the whole network (different
+    # vendors, different sites) all getting the IDENTICAL ~315-day future
+    # shift at once: one device's genuinely bad clock (or even a single
+    # bad sample) got "confirmed" under the shared relay key and then
+    # applied to every other device sharing it, the opposite of this
+    # tracker's own per-device design goal.
+    source_ip, hostname, reported_hostname, relayed_via, vendor, dev_model, resolution_method, vendor_source = (
+        resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved)
+    )
+
     # Independent of the relay-timezone check above (a different problem:
     # any device, not just a listed relay; any direction/magnitude, not a
     # fixed future-pointing 3h offset) -- see DeviceClockSkewTracker's own
     # comment for why this observes the ALREADY-relay-corrected value
     # (near-zero further correction when that check already fixed it) but
-    # otherwise detects and corrects independently.
-    event_time = clock_skew.observe_and_correct(record.get("source_ip"), event_time)
+    # otherwise detects and corrects independently. Keyed on the RESOLVED
+    # source_ip above, not record.get("source_ip") -- see this function's
+    # comment just above for why that distinction is the whole fix.
+    event_time = clock_skew.observe_and_correct(source_ip, event_time)
 
     category, confidence = classify(model, message)
     severity = record.get("severity", "info")
@@ -766,9 +787,6 @@ def to_row(record, miner, model, inventory, relay_ips, baselines, interface_flap
     except (TypeError, ValueError):
         pid = None
 
-    source_ip, hostname, reported_hostname, relayed_via, vendor, dev_model, resolution_method, vendor_source = (
-        resolve_identity(record, inventory, relay_ips, state_conn, seen_unresolved)
-    )
     severity_num = severity_rank(severity)
 
     reasons = []
