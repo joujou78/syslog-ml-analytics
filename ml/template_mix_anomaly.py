@@ -50,7 +50,31 @@ from ch_time import ch_literal
 log = logging.getLogger("template_mix_anomaly")
 
 WINDOW_MINUTES = int(os.environ.get("TEMPLATE_MIX_WINDOW_MINUTES", "5"))
-LOOKBACK_DAYS = int(os.environ.get("TEMPLATE_MIX_LOOKBACK_DAYS", "7"))
+# Confirmed live on PTP_Ksara_to_Chams_Anjar (172.20.17.68), 2026-11-16: it
+# got flagged in nearly every consecutive 5-minute window for about an
+# hour straight, despite logging the exact same homogeneous wireless-scan
+# content at a perfectly normal event rate. Root cause: the full training
+# population (both device and vendor models) is rebuilt from scratch every
+# cycle from a LOOKBACK_DAYS rolling window of raw per-window template_id
+# counts, and `template_id` is NOT a stable category over that window --
+# confirmed directly against real data: template_id 137 meant a "no SSID"
+# AP-scan line on 2026-11-10 but a "yes SSID" AP-scan line on 2026-11-16
+# (Drain3 generalizes a cluster's stored template in place as it sees
+# enough similar variants -- the cluster_id never changes, but what it
+# represents can drift). Once a genuine shift in template proportions
+# happens (whichever triggers it), every recent window following the NEW
+# pattern is a small minority against days of history still dominated by
+# the OLD one, and TEMPLATE_MIX_CONTAMINATION (0.01) means IsolationForest
+# is tuned to treat exactly that kind of rare minority as anomalous -- so
+# it keeps flagging the (by now real, ordinary) new pattern for as long as
+# the old one remains the bulk of a 7-day window. A shorter lookback is
+# the standard mitigation for this kind of concept drift: at
+# MIN_WINDOWS_FOR_DEVICE/VENDOR=30 and WINDOW_MINUTES=5, even 2 days
+# (~576 windows) is comfortably enough history for any device active
+# enough to need its own model, while letting a genuine recent shift
+# become the majority of its own training population in hours instead of
+# days.
+LOOKBACK_DAYS = int(os.environ.get("TEMPLATE_MIX_LOOKBACK_DAYS", "2"))
 REFRESH_SECONDS = float(os.environ.get("TEMPLATE_MIX_REFRESH_SECONDS", "900"))
 TOP_K_TEMPLATES = int(os.environ.get("TEMPLATE_MIX_TOP_K_TEMPLATES", "50"))
 # Below this many of its own windows, a device isn't scored against its own

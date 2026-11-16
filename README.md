@@ -395,8 +395,20 @@ run continuously on live traffic.
 15 min):
 
 1. Bucket each device's recent events (last `TEMPLATE_MIX_LOOKBACK_DAYS`,
-   default 7) into `TEMPLATE_MIX_WINDOW_MINUTES` (default 5) windows, and
+   default 2) into `TEMPLATE_MIX_WINDOW_MINUTES` (default 5) windows, and
    count how many times each Drain3 template occurred in each window.
+   Deliberately short, not just for cost (see the caveat below): a
+   Drain3 template's `template_id` isn't a stable category forever --
+   Drain3 generalizes a cluster's stored template in place as it sees
+   enough similar variants (the `cluster_id` never changes, but what it
+   matches can drift) -- confirmed live as the cause of a device getting
+   flagged in nearly every window for about an hour: once a genuine
+   shift in template proportions happens, it's a small minority against
+   a longer window still dominated by the old pattern, and
+   `TEMPLATE_MIX_CONTAMINATION`'s low rate treats exactly that kind of
+   rare minority as anomalous. A shorter lookback lets a real recent
+   shift become the majority of its own training population in hours
+   instead of days.
 2. Project each window into a fixed-size vector: the count of that
    device's `TEMPLATE_MIX_TOP_K_TEMPLATES` (default 50) most frequent
    templates, plus one "other" bucket for everything else — bounded
