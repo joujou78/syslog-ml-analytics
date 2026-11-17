@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,3 +64,21 @@ async def list_history(
     limit: int = Query(default=100, ge=1, le=500),
 ):
     return await alert_service.list_events(db, rule_id=rule_id, limit=limit)
+
+
+@router.get("/export")
+async def export_events(
+    format: str,
+    rule_id: uuid.UUID | None = None,
+    _user=_authenticated,
+    db: AsyncSession = Depends(get_db),
+):
+    if format not in ("csv", "xml"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="format must be csv or xml")
+    rows = await alert_service.list_events_for_export(db, rule_id=rule_id)
+    content = alert_service.export_events_csv(rows) if format == "csv" else alert_service.export_events_xml(rows)
+    content_type = "text/csv" if format == "csv" else "application/xml"
+    return Response(
+        content=content, media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="alert_events.{format}"'},
+    )

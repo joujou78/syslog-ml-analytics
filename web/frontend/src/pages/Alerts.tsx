@@ -50,6 +50,7 @@ export function Alerts() {
   const [form, setForm] = useState<AlertRuleInput>(EMPTY_FORM)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [exporting, setExporting] = useState(false)
   // Longest-silent (most overdue) devices first by default, not whatever
   // order the API happens to return -- the whole point of this table is
   // to surface the devices needing attention, not bury them wherever
@@ -119,6 +120,14 @@ export function Alerts() {
   }
 
   const ruleName = (ruleId: string) => rules?.find((r) => r.id === ruleId)?.name ?? ruleId
+
+  function handleExportEvents(format: 'csv' | 'xml') {
+    setExporting(true)
+    alertsApi
+      .export(format)
+      .catch(() => setError('Could not export the alert history'))
+      .finally(() => setExporting(false))
+  }
 
   // Silence duration is computed fresh from last_seen_at on every render
   // (see the comment at its render site below), so sorting by it here
@@ -332,6 +341,14 @@ export function Alerts() {
       </table>
 
       <h3>Recent triggers</h3>
+      <div className="form-actions">
+        <button type="button" disabled={exporting} onClick={() => handleExportEvents('csv')}>
+          {exporting ? 'Exporting…' : 'Export CSV'}
+        </button>
+        <button type="button" disabled={exporting} onClick={() => handleExportEvents('xml')}>
+          {exporting ? 'Exporting…' : 'Export XML'}
+        </button>
+      </div>
       <table className="data-table">
         <thead>
           <tr>
