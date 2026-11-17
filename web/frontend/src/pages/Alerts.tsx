@@ -171,55 +171,6 @@ export function Alerts() {
         match any value for that field.
       </p>
 
-      <h3>Currently silent devices</h3>
-      <p className="page-hint">
-        A device flagged here has gone quiet for far longer than its own historical logging pattern would predict
-        (not a fixed timeout — a chatty device and a quiet one have very different normal gaps). This can mean it
-        crashed, lost connectivity, or was tampered with. It clears automatically once the device logs again.
-      </p>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th className="sortable" onClick={() => toggleSilentSort('device')}>
-              Device{silentSortIndicator('device')}
-            </th>
-            <th className="sortable" onClick={() => toggleSilentSort('silentFor')}>
-              Silent for{silentSortIndicator('silentFor')}
-            </th>
-            <th className="sortable" onClick={() => toggleSilentSort('interval')}>
-              Normally logs every{silentSortIndicator('interval')}
-            </th>
-            <th className="sortable" onClick={() => toggleSilentSort('lastSeen')}>
-              Last seen{silentSortIndicator('lastSeen')}
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {sortedSilentDevices?.map((d) => {
-            // Every row here is currently silent by definition (see
-            // DeviceSilenceRead's backing table docstring) -- silence
-            // duration is just "how long since last_seen_at", computed
-            // client-side so it keeps ticking up between page loads
-            // rather than freezing at whatever it was when the backend
-            // last responded.
-            const silenceMinutes = (Date.now() - new Date(d.last_seen_at).getTime()) / 60_000
-            return (
-              <tr key={d.source_ip}>
-                <td>{d.hostname ?? d.source_ip}</td>
-                <td className="mono">{formatDurationMinutes(silenceMinutes)}</td>
-                <td className="mono">{formatDurationMinutes(d.expected_interval_minutes)}</td>
-                <td className="mono">{formatBeirutDateTime(d.last_seen_at)}</td>
-              </tr>
-            )
-          })}
-          {silentDevices?.length === 0 && (
-            <tr>
-              <td colSpan={4}>No devices are currently silent.</td>
-            </tr>
-          )}
-        </tbody>
-      </table>
-
       {canManage && (
         <form className="credential-form" onSubmit={handleSubmit}>
           <h3>{editingId ? 'Edit rule' : 'Add rule'}</h3>
@@ -406,6 +357,55 @@ export function Alerts() {
           {history?.length === 0 && (
             <tr>
               <td colSpan={6}>No alerts have fired yet.</td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+
+      <h3>Currently silent devices</h3>
+      <p className="page-hint">
+        A device flagged here has gone quiet for far longer than its own historical logging pattern would predict
+        (not a fixed timeout — a chatty device and a quiet one have very different normal gaps). This can mean it
+        crashed, lost connectivity, or was tampered with. It clears automatically once the device logs again.
+      </p>
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th className="sortable" onClick={() => toggleSilentSort('device')}>
+              Device{silentSortIndicator('device')}
+            </th>
+            <th className="sortable" onClick={() => toggleSilentSort('silentFor')}>
+              Silent for{silentSortIndicator('silentFor')}
+            </th>
+            <th className="sortable" onClick={() => toggleSilentSort('interval')}>
+              Normally logs every{silentSortIndicator('interval')}
+            </th>
+            <th className="sortable" onClick={() => toggleSilentSort('lastSeen')}>
+              Last seen{silentSortIndicator('lastSeen')}
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {sortedSilentDevices?.map((d) => {
+            // Every row here is currently silent by definition (see
+            // DeviceSilenceRead's backing table docstring) -- silence
+            // duration is just "how long since last_seen_at", computed
+            // client-side so it keeps ticking up between page loads
+            // rather than freezing at whatever it was when the backend
+            // last responded.
+            const silenceMinutes = (Date.now() - new Date(d.last_seen_at).getTime()) / 60_000
+            return (
+              <tr key={d.source_ip}>
+                <td>{d.hostname ?? d.source_ip}</td>
+                <td className="mono">{formatDurationMinutes(silenceMinutes)}</td>
+                <td className="mono">{formatDurationMinutes(d.expected_interval_minutes)}</td>
+                <td className="mono">{formatBeirutDateTime(d.last_seen_at)}</td>
+              </tr>
+            )
+          })}
+          {silentDevices?.length === 0 && (
+            <tr>
+              <td colSpan={4}>No devices are currently silent.</td>
             </tr>
           )}
         </tbody>
