@@ -110,27 +110,31 @@ label {
 
 .app-shell {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   min-height: 100vh;
 }
 
-.app-header {
+.app-sidebar {
+  width: 240px;
+  flex-shrink: 0;
   display: flex;
-  align-items: center;
-  gap: 24px;
-  padding: 12px 24px;
-  border-bottom: 1px solid var(--border);
+  flex-direction: column;
+  gap: 20px;
+  padding: 20px 16px;
+  border-right: 1px solid var(--border);
   background: var(--surface);
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+  box-shadow: 1px 0 2px rgba(16, 24, 40, 0.04);
 }
 
 .app-title {
   font-weight: 600;
+  padding: 0 8px;
 }
 
 .app-nav {
   display: flex;
-  gap: 16px;
+  flex-direction: column;
+  gap: 2px;
   flex: 1;
 }
 
@@ -138,19 +142,29 @@ label {
   color: var(--text-dim);
   text-decoration: none;
   font-size: 14px;
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+
+.app-nav a:hover {
+  background: var(--bg);
+  color: var(--text);
 }
 
 .app-nav a.active {
-  color: var(--text);
+  color: var(--accent);
   font-weight: 600;
+  background: rgba(47, 95, 214, 0.08);
 }
 
 .app-user {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  gap: 10px;
   font-size: 13px;
   color: var(--text-dim);
+  padding: 14px 8px 0;
+  border-top: 1px solid var(--border);
 }
 
 .role-badge {
@@ -164,6 +178,8 @@ label {
 .app-content {
   padding: 24px;
   flex: 1;
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .data-table {

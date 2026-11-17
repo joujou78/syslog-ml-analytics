@@ -6,7 +6,7 @@ export function Layout() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
+      <aside className="app-sidebar">
         <span className="app-title">Syslog ML Analytics</span>
         <nav className="app-nav">
           <NavLink to="/" end>
@@ -28,7 +28,7 @@ export function Layout() {
           </span>
           <button onClick={logout}>Log out</button>
         </div>
-      </header>
+      </aside>
       <main className="app-content">
         <Outlet />
       </main>
