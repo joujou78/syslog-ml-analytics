@@ -203,6 +203,21 @@ label {
   text-transform: uppercase;
 }
 
+.data-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.data-table th.sortable:hover {
+  color: var(--text);
+}
+
+.sort-arrow {
+  color: var(--accent);
+  font-size: 10px;
+}
+
 .mono {
   font-family: ui-monospace, monospace;
 }

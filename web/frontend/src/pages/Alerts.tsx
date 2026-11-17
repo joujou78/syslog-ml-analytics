@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { alertsApi } from '../api/alerts'
 import { deviceSilenceApi } from '../api/deviceSilence'
 import { useAuth } from '../auth/AuthContext'
@@ -7,6 +7,9 @@ import { extractErrorMessage } from '../utils/errors'
 import { formatBeirutDateTime, formatDurationMinutes } from '../utils/time'
 
 const SEVERITY_OPTIONS = ['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug']
+
+type SilentSortKey = 'device' | 'silentFor' | 'interval' | 'lastSeen'
+type SortDir = 'asc' | 'desc'
 
 const EMPTY_FORM: AlertRuleInput = {
   name: '',
@@ -47,6 +50,7 @@ export function Alerts() {
   const [form, setForm] = useState<AlertRuleInput>(EMPTY_FORM)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [silentSort, setSilentSort] = useState<{ key: SilentSortKey; dir: SortDir } | null>(null)
 
   const load = () => {
     alertsApi.listRules().then(setRules).catch(() => setError('Could not load alert rules'))
@@ -109,6 +113,48 @@ export function Alerts() {
 
   const ruleName = (ruleId: string) => rules?.find((r) => r.id === ruleId)?.name ?? ruleId
 
+  // Silence duration is computed fresh from last_seen_at on every render
+  // (see the comment at its render site below), so sorting by it here
+  // rather than on whatever stale value the API last returned keeps it
+  // consistent with what's actually displayed.
+  const sortedSilentDevices = useMemo(() => {
+    if (!silentDevices) return silentDevices
+    if (!silentSort) return silentDevices
+    const { key, dir } = silentSort
+    const sign = dir === 'asc' ? 1 : -1
+    const valueOf = (d: DeviceSilence) => {
+      switch (key) {
+        case 'device':
+          return (d.hostname ?? d.source_ip).toLowerCase()
+        case 'silentFor':
+          return Date.now() - new Date(d.last_seen_at).getTime()
+        case 'interval':
+          return d.expected_interval_minutes
+        case 'lastSeen':
+          return new Date(d.last_seen_at).getTime()
+      }
+    }
+    return [...silentDevices].sort((a, b) => {
+      const av = valueOf(a)
+      const bv = valueOf(b)
+      if (av < bv) return -1 * sign
+      if (av > bv) return 1 * sign
+      return 0
+    })
+  }, [silentDevices, silentSort])
+
+  const toggleSilentSort = (key: SilentSortKey) => {
+    setSilentSort((prev) => {
+      if (prev?.key !== key) return { key, dir: 'asc' }
+      return { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+    })
+  }
+
+  const silentSortIndicator = (key: SilentSortKey) => {
+    if (silentSort?.key !== key) return null
+    return <span className="sort-arrow">{silentSort.dir === 'asc' ? ' ▲' : ' ▼'}</span>
+  }
+
   return (
     <div>
       <h2>Alerts</h2>
@@ -127,14 +173,22 @@ export function Alerts() {
       <table className="data-table">
         <thead>
           <tr>
-            <th>Device</th>
-            <th>Silent for</th>
-            <th>Normally logs every</th>
-            <th>Last seen</th>
+            <th className="sortable" onClick={() => toggleSilentSort('device')}>
+              Device{silentSortIndicator('device')}
+            </th>
+            <th className="sortable" onClick={() => toggleSilentSort('silentFor')}>
+              Silent for{silentSortIndicator('silentFor')}
+            </th>
+            <th className="sortable" onClick={() => toggleSilentSort('interval')}>
+              Normally logs every{silentSortIndicator('interval')}
+            </th>
+            <th className="sortable" onClick={() => toggleSilentSort('lastSeen')}>
+              Last seen{silentSortIndicator('lastSeen')}
+            </th>
           </tr>
         </thead>
         <tbody>
-          {silentDevices?.map((d) => {
+          {sortedSilentDevices?.map((d) => {
             // Every row here is currently silent by definition (see
             // DeviceSilenceRead's backing table docstring) -- silence
             // duration is just "how long since last_seen_at", computed
