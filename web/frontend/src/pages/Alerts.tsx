@@ -50,7 +50,14 @@ export function Alerts() {
   const [form, setForm] = useState<AlertRuleInput>(EMPTY_FORM)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [silentSort, setSilentSort] = useState<{ key: SilentSortKey; dir: SortDir } | null>(null)
+  // Longest-silent (most overdue) devices first by default, not whatever
+  // order the API happens to return -- the whole point of this table is
+  // to surface the devices needing attention, not bury them wherever
+  // they land until someone thinks to click the header.
+  const [silentSort, setSilentSort] = useState<{ key: SilentSortKey; dir: SortDir } | null>({
+    key: 'silentFor',
+    dir: 'desc',
+  })
 
   const load = () => {
     alertsApi.listRules().then(setRules).catch(() => setError('Could not load alert rules'))
