@@ -536,6 +536,92 @@ def _wants_breakdown(question: str) -> bool:
     return any(marker in lowered for marker in _BREAKDOWN_MARKERS)
 
 
+# Confirmed live, twice in the same conversation, as a real gap: "give me
+# the other devices with the same behavior" and "other devices" (a
+# follow-up to an "Explain this anomaly" question) both have
+# source_ip+start+end still set from the UI's own link, aren't ranking/
+# count/log-rows/incidents/breakdown-shaped, and so fell straight into
+# the fully-deterministic single-window explain-anomaly force-resolve
+# below -- which ignores the question's own text BY DESIGN (that's the
+# whole point of making it deterministic) and so just kept re-explaining
+# the SAME device/window instead of searching for others. Needs its own
+# marker set and its own force-resolve (see _dominant_reason_from_answer
+# and the "other devices" block in ask()) rather than just an exclusion,
+# since answering this well requires NEW machinery this file didn't have
+# yet: recovering the anomaly reason being asked about from a previous
+# ANSWER's text, never done before (every other inheritance case in this
+# file -- see _detect_anomaly_reason, _unresolved_ranking_concept --
+# only ever looks at a previous QUESTION's text).
+_OTHER_DEVICES_MARKERS = (
+    "other device", "other devices", "similar device", "similar devices",
+    "same behavior", "same behaviour", "same issue", "same problem", "elsewhere",
+)
+
+
+def _wants_other_devices(question: str) -> bool:
+    lowered = question.lower()
+    return any(marker in lowered for marker in _OTHER_DEVICES_MARKERS)
+
+
+# Matches the two (and only two) places in this file that ever name a
+# real anomaly_reason value inside an answer's own text:
+#   - _semantic_search_hits_plain_answer: "<N>x [...] ... (flagged: a, b)",
+#     one clause per predicted_category group, possibly several per answer.
+#   - _anomaly_summary_plain_answer: "anomaly_reason='<reason>'", exactly
+#     one, no per-clause count to weigh it by.
+# Anchored on the literal "(flagged: " / "anomaly_reason='" text, not on
+# surrounding structure (category name, severity, example message) --
+# confirmed necessary: an example log message quoted earlier in the same
+# clause can itself contain a literal "(", e.g. "ether1 link up (speed
+# 100M, full duplex)" (seen live this session), which would break a
+# regex that tried to bound the match between the count prefix and the
+# flagged clause.
+_FLAGGED_CLAUSE_RE = re.compile(r"\(flagged:\s*([a-z_]+(?:\s*,\s*[a-z_]+)*)\)")
+_ANOMALY_REASON_EQ_RE = re.compile(r"anomaly_reason='([a-z_]+)'")
+
+
+def _dominant_reason_from_answer(answer: str) -> str | None:
+    """Recovers the anomaly_reason a previous turn's answer was actually
+    about, from its plain-text answer string -- this backend is fully
+    stateless (see ConversationTurn's own docstring: only question/answer
+    TEXT survives between turns, nothing structured like sources or
+    anomaly_reasons), so parsing the answer's own text is the only way
+    "the same behavior" in a follow-up question can ever be resolved.
+    When more than one distinct reason is cited (confirmed real, not
+    hypothetical: a single explain-anomaly answer can cite e.g. both
+    unusual_template_mix AND unusual_transition across different
+    category groups), picks whichever reason is cited the most times
+    across all clauses -- a reasonable proxy for "the dominant behavior"
+    without needing to also parse and weigh each clause's own event
+    count, which the "(flagged: ...)" anchoring above already has to
+    stay robust against arbitrary characters in a quoted example message."""
+    counts: Counter[str] = Counter()
+    for clause in _FLAGGED_CLAUSE_RE.findall(answer):
+        for reason in clause.split(","):
+            reason = reason.strip()
+            if reason and reason != "none":
+                counts[reason] += 1
+    if counts:
+        return counts.most_common(1)[0][0]
+    match = _ANOMALY_REASON_EQ_RE.search(answer)
+    return match.group(1) if match else None
+
+
+def _other_devices_plain_answer(reason: str, rows: list[dict], excluded_label: str) -> str:
+    if not rows:
+        return (
+            f"No OTHER devices (besides {excluded_label}) have ever been flagged for "
+            f"anomaly_reason='{reason}' (cumulative, all-time)."
+        )
+    breakdown = "; ".join(f"{r['hostname']}: {r['event_count']}" for r in rows)
+    top = rows[0]
+    return (
+        f"Besides {excluded_label}, the device most flagged for anomaly_reason='{reason}' "
+        f"(cumulative, all-time) is {top['hostname']}, with {top['event_count']} events. "
+        f"Full breakdown (busiest first): {breakdown}."
+    )
+
+
 # Confirmed as a real, reproduced bug on net-flow: "top n devices with
 # wireless disconnections vendor mikrotik and mimosa" explicitly asks for
 # a per-DEVICE ranking ("devices"), but a bare "vendor" IN question was
@@ -3946,6 +4032,33 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
     # WHOLE loop below, not reset per iteration.
     loop_deadline = time.monotonic() + settings.ask_total_timeout_seconds
 
+    # "Other devices with the same behavior" (or "similar devices"/"same
+    # issue"/"elsewhere") -- see _wants_other_devices and
+    # _dominant_reason_from_answer's own comments for the confirmed-live
+    # gap this closes. Needs a previous turn to refer back to at all;
+    # with none, there's nothing to resolve "the same" against, so this
+    # falls through to the normal loop exactly as if it had never run.
+    if query.history and _wants_other_devices(query.question):
+        reason = _dominant_reason_from_answer(query.history[-1].answer)
+        if reason:
+            all_rows = await asyncio.to_thread(anomaly_summary_service.list_device_summary, ch_client)
+            excluded_ip = query.source_ip
+            excluded_label = next(
+                (r["hostname"] for r in all_rows if r["source_ip"] == excluded_ip), excluded_ip or "the original device",
+            )
+            other_rows = sorted(
+                (r for r in all_rows if r["anomaly_reason"] == reason and r["source_ip"] != excluded_ip),
+                key=lambda r: r["event_count"], reverse=True,
+            )[:10]
+            answer = _other_devices_plain_answer(reason, other_rows, excluded_label)
+            log.info(
+                "Log Assistant FORCE-RESOLVED an 'other devices' follow-up by parsing the previous "
+                "answer's own text for the cited anomaly_reason, no model call at all: "
+                "reason=%r excluded=%r -> %d other device(s)",
+                reason, excluded_label, len(other_rows),
+            )
+            return AskResponse(answer=answer, sources=[], model=settings.ollama_chat_model)
+
     # See _unresolved_ranking_concept's docstring for what this covers: ANY
     # "which device/vendor has the most <concept>" question not already
     # handled by one of the 8 fixed anomaly_reason categories -- general by
@@ -4066,7 +4179,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         query.source_ip and query.start and query.end
         and not _wants_ranking(query.question) and not _wants_count(query.question)
         and not _wants_log_rows(query.question) and not _wants_incidents(query.question)
-        and not _wants_breakdown(query.question)
+        and not _wants_breakdown(query.question) and not _wants_other_devices(query.question)
     ):
         explain_sub_query = LogAssistantQuery(
             question=query.question[:1000], source_ip=query.source_ip, vendor=query.vendor,
@@ -4924,7 +5037,7 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
                 and query.source_ip and query.start and query.end
                 and not _wants_ranking(query.question) and not _wants_count(query.question)
                 and not _wants_log_rows(query.question) and not _wants_incidents(query.question)
-                and not _wants_breakdown(query.question)
+                and not _wants_breakdown(query.question) and not _wants_other_devices(query.question)
             ):
                 # Confirmed live, twice, as a real pattern worth closing
                 # deterministically rather than just patching each
