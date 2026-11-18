@@ -511,7 +511,17 @@ def _is_bare_followup(question: str) -> bool:
 # enforce_count_tool above) -- so this question shape gets the same
 # treatment: detected deterministically and the correct tool forced,
 # instead of trusted to the model's own tool choice.
-_RANKING_MARKERS = ("most", "top", "which device", "which vendor", "highest", "worst")
+_RANKING_MARKERS = (
+    "most", "top", "which device", "which vendor", "highest", "worst",
+    # Confirmed live on net-flow: "more devices with wireless disconnection"
+    # fell through to the old single-window explain-anomaly path (re-explaining
+    # the SAME device/window from history) instead of the general concept-ranking
+    # machinery below, because "more device(s)" wasn't recognized as a ranking
+    # marker even though the question names its own topic ("wireless
+    # disconnection") -- unlike "other devices", which has no topic of its own
+    # and needs the separate previous-answer-based mechanism instead.
+    "more device", "more vendor",
+)
 
 
 def _wants_ranking(question: str) -> bool:
