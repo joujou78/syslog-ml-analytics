@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { anomalyWindowsApi } from '../api/anomalyWindows'
 import type { AnomalyWindow, AnomalyWindowFilters } from '../types'
@@ -24,6 +24,9 @@ function explainLink(w: AnomalyWindow) {
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 500]
 const EMPTY_FILTERS: AnomalyWindowFilters = { only_anomalies: true }
 
+type WindowSortKey = 'windowStart' | 'hostname' | 'sourceIp' | 'vendor' | 'model' | 'score' | 'eventCount'
+type SortDir = 'asc' | 'desc'
+
 const SCOPE_LABEL: Record<string, string> = {
   device: 'Device-specific',
   vendor: 'Vendor baseline',
@@ -42,6 +45,11 @@ export function AnomalyWindows() {
   const [hasMore, setHasMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  // Sorts only the currently-loaded page -- the server still decides
+  // which rows make up "page 2" etc. (ordered by window_start, see
+  // anomaly_window_service.py), this just lets you reorder what's
+  // already on screen without changing what Next/Previous fetch.
+  const [sort, setSort] = useState<{ key: WindowSortKey; dir: SortDir } | null>(null)
 
   useEffect(() => {
     setLoading(true)
@@ -75,6 +83,49 @@ export function AnomalyWindows() {
   function changePageSize(size: number) {
     setPageSize(size)
     setOffset(0)
+  }
+
+  const sortedItems = useMemo(() => {
+    if (!items || !sort) return items
+    const { key, dir } = sort
+    const sign = dir === 'asc' ? 1 : -1
+    const valueOf = (w: AnomalyWindow) => {
+      switch (key) {
+        case 'windowStart':
+          return new Date(w.window_start).getTime()
+        case 'hostname':
+          return w.hostname.toLowerCase()
+        case 'sourceIp':
+          return w.source_ip
+        case 'vendor':
+          return w.vendor.toLowerCase()
+        case 'model':
+          return w.model_scope
+        case 'score':
+          return w.anomaly_score
+        case 'eventCount':
+          return w.event_count
+      }
+    }
+    return [...items].sort((a, b) => {
+      const av = valueOf(a)
+      const bv = valueOf(b)
+      if (av < bv) return -1 * sign
+      if (av > bv) return 1 * sign
+      return 0
+    })
+  }, [items, sort])
+
+  function toggleSort(key: WindowSortKey) {
+    setSort((prev) => {
+      if (prev?.key !== key) return { key, dir: 'asc' }
+      return { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+    })
+  }
+
+  function sortIndicator(key: WindowSortKey) {
+    if (sort?.key !== key) return null
+    return <span className="sort-arrow">{sort.dir === 'asc' ? ' ▲' : ' ▼'}</span>
   }
 
   return (
@@ -159,18 +210,32 @@ export function AnomalyWindows() {
       <table className="data-table">
         <thead>
           <tr>
-            <th>Window start</th>
-            <th>Hostname</th>
-            <th>Source IP</th>
-            <th>Vendor</th>
-            <th>Model</th>
-            <th>Score</th>
-            <th>Events in window</th>
+            <th className="sortable" onClick={() => toggleSort('windowStart')}>
+              Window start{sortIndicator('windowStart')}
+            </th>
+            <th className="sortable" onClick={() => toggleSort('hostname')}>
+              Hostname{sortIndicator('hostname')}
+            </th>
+            <th className="sortable" onClick={() => toggleSort('sourceIp')}>
+              Source IP{sortIndicator('sourceIp')}
+            </th>
+            <th className="sortable" onClick={() => toggleSort('vendor')}>
+              Vendor{sortIndicator('vendor')}
+            </th>
+            <th className="sortable" onClick={() => toggleSort('model')}>
+              Model{sortIndicator('model')}
+            </th>
+            <th className="sortable" onClick={() => toggleSort('score')}>
+              Score{sortIndicator('score')}
+            </th>
+            <th className="sortable" onClick={() => toggleSort('eventCount')}>
+              Events in window{sortIndicator('eventCount')}
+            </th>
             <th></th>
           </tr>
         </thead>
         <tbody>
-          {items?.map((w, i) => (
+          {sortedItems?.map((w, i) => (
             <tr key={`${w.source_ip}-${w.window_start}-${i}`}>
               <td className="mono">{formatBeirutDateTime(w.window_start)}</td>
               <td>{w.hostname}</td>
