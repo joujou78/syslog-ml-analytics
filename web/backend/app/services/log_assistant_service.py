@@ -565,6 +565,18 @@ def _wants_breakdown(question: str) -> bool:
 _OTHER_DEVICES_MARKERS = (
     "other device", "other devices", "similar device", "similar devices",
     "same behavior", "same behaviour", "same issue", "same problem", "elsewhere",
+    # Confirmed live as a real, reproduced gap: "same log but different
+    # devices" -- a natural enough phrasing of the identical intent as
+    # "other devices with the same behavior" (same event, different
+    # device), just built from "different" instead of "other"/"similar" --
+    # matched none of the markers above, so it fell through every
+    # deterministic path (including _unresolved_ranking_concept's own
+    # bare-follow-up inheritance, which _extract_concept's non-empty
+    # "different" blocked, same failure mode _GENERIC_QUESTION_WORDS'
+    # own "same"/"before" fix closed elsewhere) all the way down to the
+    # single-window explain-anomaly force-resolve, re-explaining the exact
+    # same original anomaly window again.
+    "different device", "different devices",
 )
 
 
@@ -586,7 +598,19 @@ def _wants_other_devices(question: str) -> bool:
 # 100M, full duplex)" (seen live this session), which would break a
 # regex that tried to bound the match between the count prefix and the
 # flagged clause.
-_FLAGGED_CLAUSE_RE = re.compile(r"\(flagged:\s*([a-z_]+(?:\s*,\s*[a-z_]+)*)\)")
+# Matches both the OLD inline "(flagged: reason)" shape AND the current
+# "Flagged as: reason" shape _semantic_search_hits_plain_answer/
+# _log_listing_plain_answer now write (see their own readability rework) --
+# confirmed live as a real regression: that rework changed the literal
+# text this regex anchored on without updating this regex too, which
+# silently broke _dominant_reason_from_answer for every answer generated
+# after it, in turn silently breaking the "other devices"/"different
+# devices" follow-up mechanism built on top of it (it just fell through to
+# the normal loop with no error, since this function only ever returns
+# None on no match -- there was no exception to surface the break). The
+# capture group itself doesn't need to care about a trailing ")": [a-z_]+
+# already stops there on its own.
+_FLAGGED_CLAUSE_RE = re.compile(r"(?i:flagged(?:\s+as)?):\s*([a-z_]+(?:\s*,\s*[a-z_]+)*)")
 _ANOMALY_REASON_EQ_RE = re.compile(r"anomaly_reason='([a-z_]+)'")
 
 
