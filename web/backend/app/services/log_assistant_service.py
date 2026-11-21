@@ -1425,6 +1425,96 @@ def _detect_relative_day_shift(question: str) -> int | None:
     return None
 
 
+# D[D]-M[M]-YYYY or D[D]/M[M]/YYYY -- confirmed live as this user's own
+# typed convention ("20-11-2026" for November 20th), distinct from the
+# UI's own date/time pickers (which display month-first, "11/20/2026").
+# Day-first whenever the first number can't possibly be a month (>12);
+# when genuinely ambiguous (both <=12), day-first is still assumed, since
+# that's this user's demonstrated convention and a silent wrong guess
+# either way is equally possible -- there's no principled way to resolve
+# "03-04-2026" from the text alone, so this picks the convention actually
+# confirmed in live use rather than the UI's own, different one.
+_EXPLICIT_DATE_RE = re.compile(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b")
+
+
+def _parse_explicit_date(text: str) -> datetime | None:
+    match = _EXPLICIT_DATE_RE.search(text)
+    if not match:
+        return None
+    a, b, year = (int(g) for g in match.groups())
+    day, month = (a, b) if a > 12 else (b, a) if b > 12 else (a, b)
+    try:
+        return datetime(year, month, day, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+# Same units as _N_DAYS_AGO_RE, but naming an EXPLICIT anchor ("one week
+# before 20-11-2026") or the conversation's own already-active window
+# ("one week before this date"/"this day") -- a different question shape
+# than _detect_relative_day_shift's "same time but for <relative day>"
+# (which shifts an existing window relative to itself, no anchor phrase at
+# all). "week" is a genuinely distinct unit here (not just "days" spelled
+# differently), since _N_DAYS_AGO_RE never matches "week" at all.
+# "befor(e)?" tolerates the exact live typo confirmed in this session's own
+# transcript ("one week befor this date") -- same typo-tolerance precedent
+# as _detect_relative_day_shift's own fuzzy "yesterday" match, just via a
+# plain regex alternation here since the targeted word is short enough
+# that a stray dropped letter is simple to enumerate directly.
+_N_UNITS_BEFORE_RE = re.compile(
+    r"\b(\d{1,4}|" + "|".join(_NUMBER_WORDS) + r")\s+(day|week)s?\s+(?:ago|back|befor(?:e)?)\b",
+    re.IGNORECASE,
+)
+_THIS_DATE_RE = re.compile(r"\b(?:this|that)\s+dat?e?\b", re.IGNORECASE)
+
+
+def _resolve_log_listing_date_filter(
+    question: str, now: datetime, existing_start: datetime | None, existing_end: datetime | None,
+) -> tuple[str, datetime, datetime] | None:
+    """Deterministic date-range resolution for a plain, KEYWORD-LESS "give
+    me the logs <date qualifier>" request -- see the new force-resolve
+    block in ask() that calls this for the confirmed live gap this closes.
+    Deliberately separate from _detect_single_period/_detect_named_periods
+    (which only know a small fixed set of relative phrases -- today/
+    yesterday/this week/N days ago, all anchored to `now`) and from
+    _detect_relative_day_shift (anchored to the window's OWN existing
+    start, with no explicit date in the question at all): this handles an
+    EXPLICIT date or an explicit anchor phrase instead, in either
+    direction (before/after), which neither of those cover.
+
+    Returns (label, start, end) or None if the question names no
+    resolvable date qualifier at all -- callers fall through to whatever
+    they'd otherwise do (the general model loop) in that case, exactly as
+    if this had never run."""
+    lowered = question.lower()
+    explicit = _parse_explicit_date(question)
+    if explicit:
+        if "before" in lowered or "befor" in lowered:
+            return f"before {explicit.date().isoformat()}", _ALL_TIME_START, explicit
+        if "after" in lowered:
+            return f"after {explicit.date().isoformat()}", explicit, now
+        # A bare date mention with neither before/after is too ambiguous to
+        # act on deterministically (does it mean "on that day", "up to
+        # it", "from it"?) -- falls through below rather than guessing.
+    shift_match = _N_UNITS_BEFORE_RE.search(lowered)
+    if shift_match:
+        raw, unit = shift_match.groups()
+        n = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
+        if not 1 <= n <= _MAX_N_DAYS_AGO:
+            return None
+        days = n * 7 if unit.lower() == "week" else n
+        if explicit:
+            anchor_midnight = explicit
+        elif _THIS_DATE_RE.search(lowered):
+            anchor = existing_start or now
+            anchor_midnight = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            return None
+        shifted = anchor_midnight - timedelta(days=days)
+        return f"{n} {unit.lower()}(s) before {anchor_midnight.date().isoformat()}", shifted, anchor_midnight
+    return None
+
+
 def _detect_comparison_periods(question: str, now: datetime) -> list[tuple[str, datetime, datetime]] | None:
     """If the question names (at least) two of today/yesterday/this week,
     returns their exact boundaries so ask() can fetch both deterministically
@@ -2264,6 +2354,22 @@ _GENERIC_QUESTION_WORDS = frozenset({
     # These words pad a question without ever naming its actual topic.
     "right", "now", "currently", "presently", "actually", "really", "just",
     "simply", "basically", "immediately", "still", "please", "overall",
+    # Confirmed live as a real, not theoretical, gap: "for the same device"
+    # (a follow-up meant to re-scope the PREVIOUS turn's request to the
+    # currently-filtered device, nothing more) left "same" as the sole
+    # surviving word -- a real dictionary word, long enough to pass the
+    # len>=4 floor, but naming no topic of its own. Being wrongly treated
+    # as a real concept blocked this question from ever being recognized
+    # as the topic-less bare follow-up it actually is (see
+    # _resolve_log_listing_date_filter's own bare-follow-up inheritance,
+    # which depends on _extract_concept being empty to even consider
+    # inheriting from the previous turn). Same story for "before"/"after"/
+    # "date"/"dates": "give me the logs before 20-11-2026" left "before" as
+    # the only survivor, which _discover_concept_keyword then ran a
+    # semantic search on as if it were a real topic -- it isn't one, it's a
+    # date-range qualifier (see _resolve_log_listing_date_filter, which
+    # parses it properly instead).
+    "same", "before", "after", "date", "dates",
 })
 
 
@@ -2582,7 +2688,9 @@ async def _choose_concept_keyword(concept_question: str, candidates: list[str], 
     return raw if raw in candidates else None
 
 
-async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_question: str) -> tuple[str, list[str]] | None:
+async def _discover_concept_keyword(
+    os_client: OpenSearch, ch_client, concept_question: str, source_ip: str | None = None,
+) -> tuple[str, list[str]] | None:
     """The shared discovery step behind both _resolve_concept_ranking and
     _resolve_concept_count: semantic_search for real examples, reduce to
     candidates that actually recur, then a narrow constrained choice if
@@ -2666,7 +2774,22 @@ async def _discover_concept_keyword(os_client: OpenSearch, ch_client, concept_qu
             question_for_search = " ".join(kept)
     search_phrase = _extract_concept(question_for_search) or _extract_concept(concept_question) or concept_question
     try:
-        hits = await semantic_search(os_client, LogAssistantQuery(question=search_phrase[:1000], limit=15))
+        # source_ip threaded through when the conversation already has an
+        # active device filter (see _resolve_concept_count/_resolve_concept_
+        # listing's own callers) -- confirmed needed, not just tidy: without
+        # it, discovery searches the WHOLE fleet's messages regardless of
+        # which device the user is actually asking about, so the keyword it
+        # settles on can be real and recurring fleet-wide while being
+        # completely absent from the filtered device's own logs (e.g.
+        # "sntp" winning for a question asked about one specific device
+        # that never logged anything SNTP-related in the window in
+        # question). Deliberately NOT applied to _resolve_concept_ranking's
+        # own call to this function -- ranking groups BY hostname/vendor,
+        # so scoping discovery to one fixed device first would be
+        # self-defeating for the very dimension it's trying to rank.
+        hits = await semantic_search(
+            os_client, LogAssistantQuery(question=search_phrase[:1000], source_ip=source_ip, limit=15),
+        )
     except Exception:
         log.exception("Concept discovery semantic_search failed -- falling back to the normal agent loop")
         return None
@@ -2983,8 +3106,17 @@ def _concept_ranking_plain_answer(
 
 async def _resolve_concept_count(
     os_client: OpenSearch, ch_client, concept_question: str, start: datetime, end: datetime,
+    source_ip: str | None = None,
 ) -> dict | None:
-    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question)
+    # source_ip threaded through to both discovery and the actual count --
+    # confirmed live as a real gap (see _discover_concept_keyword's own
+    # comment): an active device filter was previously silently dropped,
+    # so a count question asked while the conversation is scoped to one
+    # device answered fleet-wide instead. Unlike _resolve_concept_ranking
+    # (which groups BY hostname/vendor and would be self-defeating to
+    # scope to one fixed device), a count has no such conflict -- "how many
+    # X for this device" is a perfectly coherent question.
+    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question, source_ip=source_ip)
     if not discovered:
         return None
     keyword, programs = discovered
@@ -2998,7 +3130,10 @@ async def _resolve_concept_count(
     # in fact the exact call that raised the 500 in production the one
     # time this ran concurrently).
     counts = [
-        await asyncio.to_thread(log_search_service.count_events, ch_client, keyword=keyword, program=p, vendor=v, start=start, end=end)
+        await asyncio.to_thread(
+            log_search_service.count_events, ch_client, keyword=keyword, program=p, vendor=v,
+            source_ip=source_ip, start=start, end=end,
+        )
         for p in (programs or [None])
         for v in (vendors or [None])
     ]
@@ -3035,6 +3170,7 @@ _LISTING_CONCEPT_FETCH_LIMIT = 30
 
 async def _resolve_concept_listing(
     os_client: OpenSearch, ch_client, concept_question: str, start: datetime, end: datetime,
+    source_ip: str | None = None,
 ) -> dict | None:
     """Third sibling to _resolve_concept_ranking/_resolve_concept_count --
     same discovery step (_discover_concept_keyword: semantic_search for
@@ -3042,8 +3178,14 @@ async def _resolve_concept_listing(
     actual matching log ROWS (via log_search_service.search_logs, which
     already orders by event_time DESC -- "recent" is satisfied for free)
     instead of an aggregate count or ranking. See _unresolved_listing_
-    concept's docstring for the confirmed live gap this closes."""
-    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question)
+    concept's docstring for the confirmed live gap this closes.
+
+    source_ip, same reasoning as _resolve_concept_count: threaded through
+    to both discovery and the actual row fetch, so an active device filter
+    is respected instead of silently dropped (confirmed live as a real,
+    not theoretical gap -- a listing question asked about one specific
+    device came back with OTHER devices' unrelated log lines instead)."""
+    discovered = await _discover_concept_keyword(os_client, ch_client, concept_question, source_ip=source_ip)
     if not discovered:
         return None
     keyword, programs = discovered
@@ -3060,7 +3202,7 @@ async def _resolve_concept_listing(
     responses = [
         await asyncio.to_thread(
             log_search_service.search_logs, ch_client, keyword=keyword, program=p, vendor=v,
-            start=start, end=end, limit=_LISTING_CONCEPT_FETCH_LIMIT,
+            source_ip=source_ip, start=start, end=end, limit=_LISTING_CONCEPT_FETCH_LIMIT,
         )
         for p in (programs or [None])
         for v in (vendors or [None])
@@ -3092,6 +3234,25 @@ def _concept_listing_plain_answer(
     return (
         f"{len(rows)} most recent event(s) matching {qualifier}{period}{more_note}: " + " | ".join(lines)
     )
+
+
+# How many rows a plain device log listing shows -- same cap/fetch-limit
+# split and same reasoning as _LISTING_CONCEPT_MAX_ROWS/_LISTING_CONCEPT_
+# FETCH_LIMIT just above, reused directly rather than duplicated since this
+# is the identical "don't dump hundreds of log lines into one answer"
+# concern, just for a keyword-less fetch instead of a keyword-grounded one.
+def _log_listing_plain_answer(rows: list, device_label: str, label: str, truncated: bool) -> str:
+    """Plain-language answer for the keyword-less device log listing (see
+    the new force-resolve block in ask() that calls this), formatted the
+    same multi-line way as _semantic_search_hits_plain_answer -- one line
+    per log row rather than a single run-on sentence, same readability
+    fix and same reasoning (the frontend's `.chat-bubble-text` already
+    preserves "\n")."""
+    if not rows:
+        return f"No log lines found for {device_label}, {label}."
+    lines = [f"- {r.event_time.isoformat()} [{r.severity}] {r.program}: {_truncate(r.message.strip(), 200)}" for r in rows]
+    more_note = " (more exist -- showing only the most recent)" if truncated else ""
+    return f"{len(rows)} log line(s) for {device_label}, {label}{more_note}:\n\n" + "\n".join(lines)
 
 
 def _log_entries_to_hits(entries: list) -> list[LogHit]:
@@ -4136,7 +4297,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         period_label, concept_start, concept_end = (
             single_period_for_concept if single_period_for_concept else (None, _ALL_TIME_START, now)
         )
-        resolved = await _resolve_concept_count(os_client, ch_client, count_concept_question, concept_start, concept_end)
+        resolved = await _resolve_concept_count(
+            os_client, ch_client, count_concept_question, concept_start, concept_end, source_ip=query.source_ip,
+        )
         if resolved:
             answer = _concept_count_plain_answer(resolved["count"], resolved["keyword"], resolved["programs"], period_label, resolved["vendors"])
             log.info(
@@ -4158,7 +4321,9 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
         listing_period_label, listing_start, listing_end = (
             single_period_for_listing if single_period_for_listing else (None, _ALL_TIME_START, now)
         )
-        resolved = await _resolve_concept_listing(os_client, ch_client, listing_concept_question, listing_start, listing_end)
+        resolved = await _resolve_concept_listing(
+            os_client, ch_client, listing_concept_question, listing_start, listing_end, source_ip=query.source_ip,
+        )
         if resolved:
             answer = _concept_listing_plain_answer(
                 resolved["rows"], resolved["keyword"], resolved["programs"], resolved["vendors"],
@@ -4179,6 +4344,67 @@ async def ask(os_client: OpenSearch, ch_client, query: LogAssistantQuery, db: As
             # The whole point of a listing answer is for the cited table to
             # show the same rows the text describes.
             return AskResponse(answer=answer, sources=_log_entries_to_hits(resolved["rows"]), model=settings.ollama_chat_model)
+
+    # Plain "give me the logs <date qualifier>" with NO real topic/keyword
+    # of its own -- confirmed live as a DIFFERENT, simpler shape than
+    # _unresolved_listing_concept's "what are the recent <concept>" just
+    # above: there's no keyword to discover via semantic search at all,
+    # just a device + an explicit date-range qualifier (see
+    # _resolve_log_listing_date_filter). Routing a keyword-less request
+    # through _discover_concept_keyword's semantic search instead finds
+    # whatever's merely common/recent FLEET-WIDE (confirmed live: 'sntp
+    # change time', the single most common message type in this
+    # deployment), not because it's relevant to the question -- there was
+    # never a real topic to ground discovery against in the first place.
+    #
+    # Also handles a bare follow-up with no date qualifier OF ITS OWN (e.g.
+    # "for the same device") by inheriting the PREVIOUS turn's date
+    # qualifier -- same bare-follow-up-inherits-the-conversation's-existing-
+    # intent pattern as every other force-resolve in this file, just
+    # carrying forward a date filter instead of a ranking/count/listing
+    # concept. query.source_ip itself never needs inheriting this way: the
+    # frontend always sends the thread's currently-active filters on every
+    # request, so it's already correct on THIS turn without looking at
+    # history at all -- confirmed live as the actual missing piece: the
+    # device filter was already being sent, just silently ignored.
+    # Gated on an actual, successfully-PARSED date filter (either on this
+    # question directly, or inherited from the previous turn's text) --
+    # NOT on _wants_log_rows/_is_bare_followup word-count heuristics.
+    # Confirmed live as necessary: "the same device one week befor this
+    # date" is 8 words (over _is_bare_followup's <=5 threshold) and matches
+    # none of _LOG_ROWS_MARKERS, yet it's exactly as clearly a date-scoped
+    # listing request as the shorter ones -- a successfully-resolved,
+    # unambiguous date pattern (an explicit DD-MM-YYYY date, or "N day(s)/
+    # week(s) before/ago/back") is itself specific enough evidence of
+    # intent, without needing either heuristic on top of it.
+    date_filter = None
+    if query.source_ip and not _wants_ranking(query.question) and not _wants_count(query.question):
+        date_filter = _resolve_log_listing_date_filter(query.question, now, query.start, query.end)
+        if (
+            not date_filter and query.history and not _extract_concept(query.question)
+            and not _wants_other_devices(query.question)
+        ):
+            prev = query.history[-1].question
+            if not _wants_ranking(prev) and not _wants_count(prev):
+                date_filter = _resolve_log_listing_date_filter(prev, now, query.start, query.end)
+        if date_filter:
+            listing_label, listing_date_start, listing_date_end = date_filter
+            listing_response = await asyncio.to_thread(
+                log_search_service.search_logs, ch_client, source_ip=query.source_ip,
+                start=listing_date_start, end=listing_date_end, limit=_LISTING_CONCEPT_MAX_ROWS,
+            )
+            device_label = listing_response.items[0].hostname if listing_response.items else query.source_ip
+            answer = _log_listing_plain_answer(
+                listing_response.items, device_label, listing_label, listing_response.has_more,
+            )
+            log.info(
+                "Log Assistant FORCE-RESOLVED a plain device log listing via an explicit date-range "
+                "filter, no keyword discovery and no model call: source_ip=%r label=%r -> %d row(s)",
+                query.source_ip, listing_label, len(listing_response.items),
+            )
+            return AskResponse(
+                answer=answer, sources=_log_entries_to_hits(listing_response.items), model=settings.ollama_chat_model,
+            )
 
     # Fully deterministic "explain this anomaly" path -- no model call at
     # all. User's own explicit choice, after asking directly why the Log
