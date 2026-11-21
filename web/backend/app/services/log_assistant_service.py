@@ -3967,33 +3967,51 @@ def _semantic_search_hits_plain_answer(hits: list[LogHit]) -> str:
         if h.program and not h.program.strip().isdigit():
             g["programs"][h.program.strip()] += 1
     ranked = sorted(groups.items(), key=lambda kv: kv[1]["count"], reverse=True)
+    # Confirmed live as hard to read: the original version packed every
+    # category into one run-on sentence, joined by " | ", with severity/
+    # category/program all crammed into adjacent bracket pairs (e.g. "10x
+    # [notice] UNKNOWN [wireless,debug x6, system,info x4]"). This renders
+    # each category as its own short paragraph instead -- the frontend's
+    # `.chat-bubble-text` already has `white-space: pre-wrap` set (see
+    # index.css), so plain "\n"/"\n\n" here renders as real line breaks,
+    # no frontend change needed.
     parts = []
     for category, g in ranked:
         severities = "/".join(sorted(g["severities"]))
-        reasons = ", ".join(sorted(g["reasons"])) if g["reasons"] else "none"
-        programs_note = ""
+        header = f"- {g['count']} {severities}-level {category} message(s)"
         if g["programs"]:
             top_programs = ", ".join(f"{p} x{c}" for p, c in g["programs"].most_common(3))
-            programs_note = f" [{top_programs}]"
-        parts.append(
-            f"{g['count']}x [{severities}] {category}{programs_note} -- e.g. \"{_truncate(g['example'], 200)}\" "
-            f"(flagged: {reasons})"
-        )
+            header += f" (program: {top_programs})"
+        lines = [header, f"  e.g. \"{_truncate(g['example'], 200)}\""]
+        if g["reasons"]:
+            lines.append(f"  Flagged as: {', '.join(sorted(g['reasons']))}")
+        parts.append("\n".join(lines))
     devices = sorted({h.hostname for h in hits})
     device_label = devices[0] if len(devices) == 1 else f"{len(devices)} devices ({', '.join(devices[:5])}{', and more' if len(devices) > 5 else ''})"
     times = sorted(h.event_time for h in hits)
-    breakdown = " | ".join(parts)
+
+    def _fmt_ts(dt: datetime) -> str:
+        # Drops the microseconds a raw .isoformat() would show (e.g.
+        # "20:36:43.583000") -- confirmed live as noise a reader has to
+        # visually filter out to find the actual time. These datetimes are
+        # always UTC throughout this file (see the ClickHouse/OpenSearch
+        # clients' own conventions), so labeling it explicitly here is
+        # accurate, not an assumption.
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
     # A single retrieved hit (routine, not an edge case -- OpenSearch only
     # ever indexes the ANOMALOUS lines within a window, not the whole
     # window's traffic) makes times[0] == times[-1]; confirmed live as
     # rendering the nonsensical "between 2026-...19:00:14 and
     # 2026-...19:00:14" otherwise, which reads as a glitch even though the
     # underlying single-line data is correct.
-    when = f"at {times[0].isoformat()}" if times[0] == times[-1] else f"between {times[0].isoformat()} and {times[-1].isoformat()}"
+    when = f"at {_fmt_ts(times[0])}" if times[0] == times[-1] else f"between {_fmt_ts(times[0])} and {_fmt_ts(times[-1])}"
+    breakdown = "\n\n".join(parts)
     return (
-        f"Based on {len(hits)} retrieved log line(s) for {device_label} {when}, the distinct message "
-        f"types found were: {breakdown}. (Grounded directly in the cited log lines below -- the model's "
-        "own written summary wasn't available for this question, so this breakdown stands in for it.)"
+        f"Looked at {len(hits)} log line(s) for {device_label}, {when}.\n\n"
+        f"{breakdown}\n\n"
+        "Note: the on-device model didn't return a written explanation for this question, so this is a "
+        "direct, fact-based summary built from the matching log lines below instead."
     )
 
 
